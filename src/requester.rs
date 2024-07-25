@@ -34,7 +34,7 @@ impl IntervalGenerator {
 ///
 /// `request_rate`: how many requests per second
 pub fn create_gamma_interval_generator(request_rate: f64, cv: f64) -> IntervalGenerator {
-    let mean = 1.0 / request_rate;
+    let mean = 1000.0 / request_rate;
     let distribution = crate::distribution::gamma::Gamma::new(mean, cv);
     IntervalGenerator::new(distribution)
 }
@@ -111,4 +111,7 @@ mod tests {
         let line = serde_json::to_string(&map).unwrap();
         println!("{}", line);
     }
+
+    #[tokio::test]
+    async fn generate_trace() {}
 }

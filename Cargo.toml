@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+name = "trace_generator"
+path = "src/trace_generator.rs"
+
 [dependencies]
 rand = "0.8.5"
 rand_distr = "0.4.3"

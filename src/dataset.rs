@@ -13,9 +13,9 @@ pub struct Dataset {
 }
 
 impl Dataset {
-    pub fn load_mooncake_trace_jsonl(path: &str) -> Self {
+    pub fn load_mooncake_jsonl(path: &str) -> Self {
         #[derive(serde::Deserialize)]
-        pub struct MooncakeLine {
+        pub struct MooncakeRecord {
             pub timestamp: u64,
             pub input_length: u64,
             pub output_length: u64,
@@ -26,8 +26,33 @@ impl Dataset {
 
         let file = File::open(path).unwrap();
         for line in BufReader::new(file).lines() {
-            let line: MooncakeLine = serde_json::from_str(line.unwrap().as_str()).unwrap();
-            requests.push((line.input_length, line.output_length));
+            let record: MooncakeRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
+            requests.push((record.input_length, record.output_length));
+        }
+
+        requests.shuffle(&mut rand::thread_rng());
+
+        Self {
+            dataset_size: requests.len(),
+            requests,
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn load_burstgpt_csv(path: &str) -> Self {
+        let mut requests = Vec::new();
+        let mut reader = BufReader::new(File::open(path).unwrap());
+        let mut header = String::new();
+        reader.read_line(&mut header).unwrap();
+        for line in reader.lines() {
+            let parts = line
+                .unwrap()
+                .split(',')
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            let input_length = parts[2].parse().unwrap();
+            let output_length = parts[3].parse().unwrap();
+            requests.push((input_length, output_length));
         }
 
         requests.shuffle(&mut rand::thread_rng());
@@ -53,7 +78,7 @@ mod tests {
 
     #[test]
     fn test_load_mooncake() {
-        let dataset = Dataset::load_mooncake_trace_jsonl("mooncake_trace.jsonl");
+        let dataset = Dataset::load_mooncake_jsonl("mooncake_trace.jsonl");
         for _ in 0..10 {
             let (input_length, output_length) = dataset.next_request();
             println!(
