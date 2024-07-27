@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn test_load_mooncake() {
-        let dataset = Dataset::load_mooncake_jsonl("mooncake_trace.jsonl");
+        let dataset = Dataset::load_mooncake_jsonl("/nvme/wht/dataset/mooncake_trace.jsonl");
         for _ in 0..10 {
             let (input_length, output_length) = dataset.next_request();
             println!(
