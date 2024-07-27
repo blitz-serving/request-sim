@@ -1,8 +1,7 @@
 use std::io::Write;
 
 use clap::Parser;
-use open_loop::{dataset, requester::create_gamma_interval_generator};
-use serde::Serialize;
+use rs_test_proxy::{dataset, requester::create_gamma_interval_generator};
 
 fn main() {
     let args: Args = Args::parse();
@@ -12,7 +11,7 @@ fn main() {
         _ => panic!("Invalid dataset name"),
     };
     let inverval_generator = create_gamma_interval_generator(args.request_rate, args.cv);
-    let mut current_timestamp = 0;
+    let mut current_timestamp = 0.0;
     let file = std::fs::File::create(args.output_path).unwrap();
     let mut writer = std::io::BufWriter::new(file);
 
@@ -23,10 +22,10 @@ fn main() {
         let (input_token_length, output_token_length) = dataset.next_request();
         let record = format!(
             "{},{},{}\n",
-            current_timestamp, input_token_length, output_token_length
+            current_timestamp as u64, input_token_length, output_token_length
         );
         writer.write(record.as_bytes()).unwrap();
-        current_timestamp += inverval_generator.interval_in_millis() as u64;
+        current_timestamp += inverval_generator.interval_in_millis();
     }
 
     writer.flush().unwrap();
@@ -57,11 +56,4 @@ pub struct Args {
     /// Number of output lines
     #[clap(long)]
     output_lines: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Record {
-    timestamp: u64,
-    input_token_length: u64,
-    output_token_length: u64,
 }
