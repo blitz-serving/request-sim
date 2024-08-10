@@ -78,13 +78,14 @@ mod tests {
 
     #[test]
     fn test_load_mooncake() {
-        let dataset = Dataset::load_mooncake_jsonl("/nvme/wht/dataset/mooncake_trace.jsonl");
-        for _ in 0..10 {
-            let (input_length, output_length) = dataset.next_request();
-            println!(
-                "input_length: {}, output_length: {}",
-                input_length, output_length
-            );
+        let dataset_path = std::path::Path::new("./data/mooncake_trace.jsonl");
+        if dataset_path.exists() {
+            let dataset = Dataset::load_mooncake_jsonl(dataset_path.to_str().unwrap());
+            for _ in 0..10 {
+                println!("(input, output): {:?}", dataset.next_request());
+            }
+        } else {
+            eprintln!("Dataset not found");
         }
     }
 }

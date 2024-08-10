@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use clap::Parser;
-use rs_test_proxy::{dataset, requester::create_gamma_interval_generator};
+use request_sim::{dataset, requester::create_gamma_interval_generator};
 
 fn main() {
     let args: Args = Args::parse();

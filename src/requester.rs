@@ -9,10 +9,12 @@ use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
     spawn,
+    sync::oneshot,
+    task::JoinHandle,
     time::sleep,
 };
 
-use crate::{dataset::Dataset, distribution::Distribution, protocol::Protocol};
+use crate::{dataset::Dataset, distribution::Distribution, protocols::Protocol};
 
 pub struct IntervalGenerator {
     distribution: Box<dyn Distribution>,
@@ -39,7 +41,7 @@ pub fn create_gamma_interval_generator(request_rate: f64, cv: f64) -> IntervalGe
     IntervalGenerator::new(distribution)
 }
 
-pub async fn request(endpoint: &str, json_body: String) -> Response {
+async fn request(endpoint: &str, json_body: String) -> Response {
     reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -52,37 +54,69 @@ pub async fn request(endpoint: &str, json_body: String) -> Response {
         .unwrap()
 }
 
-pub async fn request_loop<P: Protocol>(
+/// Send requests in the open loop way.
+///
+/// Note:
+/// - Intervals between requests are randomly generated.
+/// - Use [`request_loop_with_timestamp`] instead if you want to control the intervals.
+///
+/// Await on the returned handle to wait for the loop to finish.
+pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     endpoint: String,
     dataset: Dataset,
     protocol: P,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
-) -> ! {
+    mut stopped: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
+        while let Ok(handle) = response_receiver.recv_async().await {
+            handle.await.unwrap();
+        }
+    }
+
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     BASETIME.get_or_init(|| Instant::now());
 
-    loop {
-        let endpoint = endpoint.clone();
-        let (input_length, output_length) = dataset.next_request();
-        let json_body = protocol.request_json_body(input_length, output_length);
-        let response_sender = response_sender.clone();
-        let _handle = spawn(async move {
-            let s_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
-            let response = request(endpoint.as_str(), json_body.to_string()).await;
-            let e_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
+    let (tx, rx) = flume::unbounded();
+    let handle = spawn(wait_all(rx));
 
-            let mut metrics = P::parse_response(response);
-            metrics.insert("s_time".to_string(), s_time.to_string());
-            metrics.insert("e_time".to_string(), e_time.to_string());
+    spawn(async move {
+        loop {
+            if stopped.try_recv().is_ok() {
+                break;
+            }
+            let endpoint = endpoint.clone();
+            let (input_length, output_length) = dataset.next_request();
+            let json_body = protocol.request_json_body(input_length, output_length);
+            let response_sender = response_sender.clone();
+            let request_handle = spawn(async move {
+                let s_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
+                let response = request(endpoint.as_str(), json_body.to_string()).await;
+                let e_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
 
-            response_sender.send(metrics).unwrap();
-        });
-        let interval = interval_generator.interval_in_millis() as u64;
-        sleep(Duration::from_millis(interval)).await;
-    }
+                let mut metrics = P::parse_response(response);
+                metrics.insert("s_time".to_string(), s_time.to_string());
+                metrics.insert("e_time".to_string(), e_time.to_string());
+
+                response_sender.send(metrics).unwrap();
+            });
+            tx.send_async(request_handle).await.unwrap();
+            let interval = interval_generator.interval_in_millis() as u64;
+            sleep(Duration::from_millis(interval)).await;
+        }
+    });
+
+    handle
 }
 
+pub async fn request_loop_with_timestamp<P: Protocol>() {
+    unimplemented!("request_loop_with_timestamp");
+}
+
+/// The report loop writes the metrics to a file in JSONL format.
+///
+/// Report loop exits when the response receiver is closed.
 pub async fn report_loop(
     mut output_jsonl_file: File,
     response_receiver: flume::Receiver<BTreeMap<String, String>>,
@@ -111,7 +145,4 @@ mod tests {
         let line = serde_json::to_string(&map).unwrap();
         println!("{}", line);
     }
-
-    #[tokio::test]
-    async fn generate_trace() {}
 }

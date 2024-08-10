@@ -1,5 +1,5 @@
 [package]
-name = "rs_test_proxy"
+name = "request-sim"
 version = "0.2.0"
 edition = "2021"
 
@@ -8,6 +8,10 @@ edition = "2021"
 [[bin]]
 name = "trace_generator"
 path = "src/trace_generator.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
 
 [dependencies]
 rand = "0.8.5"

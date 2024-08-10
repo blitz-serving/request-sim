@@ -8,8 +8,23 @@ use super::Protocol;
 
 pub struct TgiProtocol {
     tokenizer: Tokenizer,
+
+    /// Start of the token id range.
     start: u32,
+
+    /// End of the token id range.
     end: u32,
+}
+
+impl TgiProtocol {
+    /// Current the randomly generated token ids are in the range of 0..10000.
+    pub fn new(tokenizer: Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            start: 0,
+            end: 10000,
+        }
+    }
 }
 
 impl Protocol for TgiProtocol {
@@ -88,30 +103,31 @@ mod tests {
 
     #[test]
     fn test_tokenizer() {
-        let tokenizer =
-            Tokenizer::from_file("/nvme/huggingface/hub/Llama-2-7b-hf/tokenizer.json").unwrap();
-
-        let encodings = tokenizer
-            .encode("Hello World", false)
-            .unwrap()
-            .get_ids()
-            .to_vec();
-        println!("{:?}", encodings);
-
-        let sentence = tokenizer.decode(&encodings, false).unwrap();
-        println!("{:?}", sentence);
-
-        let words = encodings
-            .iter()
-            .map(|a| tokenizer.id_to_token(*a).unwrap())
-            .collect::<Vec<_>>();
-        println!("{:?}", words);
-
-        let input_token_ids = (0..100)
-            .map(|_| thread_rng().gen_range(0..(tokenizer.get_vocab_size(false) as u32)))
-            .collect::<Vec<_>>();
-
-        let json_body = serde_json::json!({"input":tokenizer.decode(&input_token_ids, false).unwrap(),"parameter":{"max_new_tokens":100}});
-        println!("{}", json_body.to_string());
+        if std::path::Path::new("/nvme/huggingface/hub/Llama-2-7b-hf/tokenizer.json").exists() {
+            let tokenizer =
+                Tokenizer::from_file("/nvme/huggingface/hub/Llama-2-7b-hf/tokenizer.json").unwrap();
+            let vocab_size = tokenizer.get_vocab_size(false);
+            println!("{:?}", vocab_size);
+            let encodings = tokenizer
+                .encode("Hello World", false)
+                .unwrap()
+                .get_ids()
+                .to_vec();
+            println!("{:?}", encodings);
+            let sentence = tokenizer.decode(&encodings, false).unwrap();
+            println!("{:?}", sentence);
+            let words = encodings
+                .iter()
+                .map(|a| tokenizer.id_to_token(*a).unwrap())
+                .collect::<Vec<_>>();
+            println!("{:?}", words);
+            let input_token_ids = (0..100)
+                .map(|_| thread_rng().gen_range(0..(tokenizer.get_vocab_size(false) as u32)))
+                .collect::<Vec<_>>();
+            let json_body = serde_json::json!({"input":tokenizer.decode(&input_token_ids, false).unwrap(),"parameter":{"max_new_tokens":100}});
+            println!("{}", json_body.to_string());
+        } else {
+            print!("Tokenizer file not found");
+        }
     }
 }
