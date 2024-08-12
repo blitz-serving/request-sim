@@ -1,7 +1,7 @@
 use clap::Parser;
 use request_sim::{
     dataset::Dataset,
-    protocols::tgi_protocol::TgiProtocol,
+    protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol, Protocol},
     requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
 };
 use tokenizers::Tokenizer;
@@ -44,6 +44,10 @@ struct Args {
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
+
+    /// Protocol type
+    #[clap(long, short, default_value = "tgi")]
+    protocol: String,
 }
 
 async fn async_main(args: Args) {
@@ -57,6 +61,7 @@ async fn async_main(args: Args) {
         dataset_type,
         dataset_path,
         time_in_secs,
+        protocol
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -68,16 +73,24 @@ async fn async_main(args: Args) {
         .unwrap();
 
     let (tx, rx) = flume::unbounded();
-    let protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
     let dataset = match dataset_type.to_lowercase().as_str() {
         "mooncake" => Dataset::load_mooncake_jsonl(dataset_path.as_str()),
         "burstgpt" => Dataset::load_burstgpt_csv(dataset_path.as_str()),
         _ => panic!("Invalid dataset type"),
     };
-
     let interval_generator = create_gamma_interval_generator(request_rate, cv);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let handle_1 = spawn_request_loop(endpoint, dataset, protocol, interval_generator, tx, stop_rx);
+    let handle_1 = match protocol.to_lowercase().as_str() {
+        "tgi" => {
+            let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
+            spawn_request_loop(endpoint, dataset, tgi_protocol, interval_generator, tx, stop_rx)
+        },
+        "vllm" => {
+            let vllm_protocol = VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
+            spawn_request_loop(endpoint, dataset, vllm_protocol, interval_generator, tx, stop_rx)
+        },
+        _ => panic!("Unsupported protocol type"),
+    };
     let handle_2 = spawn(report_loop(output_file, rx));
 
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
