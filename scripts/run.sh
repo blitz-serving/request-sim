@@ -7,6 +7,6 @@ dataset_type=mooncake
 threads=1
 
 
-cargo install --path .
+CARGO_BUILD_JOBS=88 cargo install --path .
 
-RUST_BACKTRACE=1 client --tokenizer $model --endpoint localhost:$port --dataset-path $dataset_path --dataset-type $dataset_type --threads $threads 
+RUST_BACKTRACE=1 client --tokenizer $model --endpoint http://localhost:$port/generate --dataset-path $dataset_path --dataset-type $dataset_type --threads $threads --protocol distserve -t 10

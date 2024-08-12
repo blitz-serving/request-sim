@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use reqwest::Response;
 
 pub mod tgi_protocol;
-
+pub mod vllm_protocol;
 pub mod distserve_protocol;
 
 pub trait Protocol {

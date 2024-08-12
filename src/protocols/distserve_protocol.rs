@@ -14,6 +14,8 @@ pub struct DistserveProtocol {
 
     /// End of the token id range.
     end: u32,
+
+    max_token_size: u64,
 }
 
 impl DistserveProtocol {
@@ -23,13 +25,23 @@ impl DistserveProtocol {
             tokenizer,
             start: 0,
             end: 10000,
+            max_token_size: 2048
         }
     }
 }
 
 impl Protocol for DistserveProtocol {
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String {
-        let input_token_ids = (0..input_token_length)
+        let truncated_input_length;
+        let truncated_output_length;
+        if input_token_length + output_token_length >= self.max_token_size {
+            truncated_input_length = self.max_token_size / 2;
+            truncated_output_length = self.max_token_size / 2 - 5;
+        } else {
+            truncated_input_length = input_token_length;
+            truncated_output_length = output_token_length;
+        }
+        let input_token_ids = (0..truncated_input_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
         let input = self
@@ -39,7 +51,7 @@ impl Protocol for DistserveProtocol {
         let json_body =
             serde_json::json!({
                 "prompt":input,
-                "max_tokens":output_token_length,
+                "max_tokens":truncated_output_length,
                 "n":1,
                 "best_of":1,
                 "use_beam_search": false,
