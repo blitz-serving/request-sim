@@ -25,7 +25,6 @@ def load_vllm():
     args.worker_use_ray=False
     args.engine_use_ray=False
     args.tokenizer=model_dir
-    args.trust_remote_code=True
     args.dtype=dtype
     args.max_num_seqs=20 
     engine=AsyncLLMEngine.from_engine_args(args)
@@ -38,6 +37,7 @@ async def chat(request: Request):
     request=await request.json()
     input_tokens=request.get('tokens',None)
     max_tokens=request.get('max_tokens', 10)
+    print(f"max tokens: {max_tokens}")
     history=request.get('history',[])
     user_stop_words=[]
     
@@ -53,7 +53,6 @@ async def chat(request: Request):
     request_id=str(uuid.uuid4().hex)
     results_iter=engine.generate(inputs = TokensPrompt(prompt_token_ids=input_tokens), sampling_params=sampling_params,request_id=request_id)
 
-    # 整体一次性返回模式
     start = time.perf_counter()
     lags = []
     all_text = ""
@@ -64,8 +63,10 @@ async def chat(request: Request):
     response = {
         "output": "haha",
     }
-    headers = {"x-first-token-time": str(lags[0] if len(lags) > 0 else -1), 
-               "x-inference-time": str(lags[-1]-lags[0] if len(lags) > 1 else -1),
+    if len(lags) == 0:
+        lags.append(0)
+    headers = {"x-first-token-time": str(lags[0]), 
+               "x-inference-time": str((sum(lags[1:])if len(lags) > 1 else 0) + lags[0]),
                "x-max-time-between-tokens": str(max(lags[1:]) if len(lags) > 1 else -1)
                }
     return JSONResponse(content=response, headers=headers)
