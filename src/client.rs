@@ -1,7 +1,7 @@
 use clap::Parser;
 use request_sim::{
     dataset::Dataset,
-    protocols::tgi_protocol::TgiProtocol,
+    protocols::{distserve_protocol::DistserveProtocol, tgi_protocol::TgiProtocol},
     requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
 };
 use tokenizers::Tokenizer;
@@ -68,7 +68,8 @@ async fn async_main(args: Args) {
         .unwrap();
 
     let (tx, rx) = flume::unbounded();
-    let protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
+    //let protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
+    let protocol = DistserveProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
     let dataset = match dataset_type.to_lowercase().as_str() {
         "mooncake" => Dataset::load_mooncake_jsonl(dataset_path.as_str()),
         "burstgpt" => Dataset::load_burstgpt_csv(dataset_path.as_str()),
