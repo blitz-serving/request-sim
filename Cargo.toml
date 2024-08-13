@@ -16,10 +16,11 @@ path = "src/client.rs"
 [dependencies]
 rand = "0.8.5"
 rand_distr = "0.4.3"
-reqwest = "0.11.25"
+reqwest = { version = "0.12.5", features = ["json"] }
 tokenizers = "0.14.0"
 flume = "0.11.0"
 tokio = { version = "1.36.0", features = ["full"] }
 clap = { version = "4.5.2", features = ["derive"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+http = "1.1.0"

@@ -27,7 +27,14 @@ impl TgiProtocol {
     }
 }
 
+#[derive(serde::Deserialize, Debug)]
+pub struct TgiParsed {
+    pub lags: Vec<f64>,
+}
+
 impl Protocol for TgiProtocol {
+    type Parsed = TgiParsed;
+
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String {
         let input_token_ids = (0..input_token_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
@@ -95,10 +102,16 @@ impl Protocol for TgiProtocol {
         }
         map
     }
+
+    fn parse_response_async(response: Response) -> impl std::future::Future<Output = Self::Parsed> {
+        async { response.json().await.unwrap() }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -129,5 +142,17 @@ mod tests {
         } else {
             print!("Tokenizer file not found");
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_response_async() {
+        let response = reqwest::Response::from(
+            http::response::Builder::new()
+                .status(200)
+                .body(json!({"lags":[0.1,0.2,0.3]}).to_string())
+                .unwrap(),
+        );
+        let parsed = TgiProtocol::parse_response_async(response).await;
+        println!("{:?}", parsed);
     }
 }

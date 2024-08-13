@@ -1,7 +1,7 @@
 use clap::Parser;
 use request_sim::{
     dataset::Dataset,
-    protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol, Protocol},
+    protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol},
     requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
 };
 use tokenizers::Tokenizer;
@@ -61,7 +61,7 @@ async fn async_main(args: Args) {
         dataset_type,
         dataset_path,
         time_in_secs,
-        protocol
+        protocol,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -83,12 +83,26 @@ async fn async_main(args: Args) {
     let handle_1 = match protocol.to_lowercase().as_str() {
         "tgi" => {
             let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(endpoint, dataset, tgi_protocol, interval_generator, tx, stop_rx)
-        },
+            spawn_request_loop(
+                endpoint,
+                dataset,
+                tgi_protocol,
+                interval_generator,
+                tx,
+                stop_rx,
+            )
+        }
         "vllm" => {
             let vllm_protocol = VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(endpoint, dataset, vllm_protocol, interval_generator, tx, stop_rx)
-        },
+            spawn_request_loop(
+                endpoint,
+                dataset,
+                vllm_protocol,
+                interval_generator,
+                tx,
+                stop_rx,
+            )
+        }
         _ => panic!("Unsupported protocol type"),
     };
     let handle_2 = spawn(report_loop(output_file, rx));
