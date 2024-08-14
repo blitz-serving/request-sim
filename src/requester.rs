@@ -5,6 +5,7 @@ use std::{
 };
 
 use reqwest::Response;
+use std::io::Write;
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
@@ -99,7 +100,17 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                 metrics.insert("s_time".to_string(), s_time.to_string());
                 metrics.insert("e_time".to_string(), e_time.to_string());
 
-                response_sender.send(metrics).unwrap();
+                if let Err(e) = response_sender.send(metrics) {
+                    // Print more information on error.
+                    eprintln!("Error sending metrics: {}", e);
+                    let log_file_path = "error.log";
+                    let mut error_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(log_file_path)
+                        .expect("Failed to open error log file");
+                    writeln!(&mut error_file, "Error: {}", e).unwrap();
+                }
             });
             tx.send_async(request_handle).await.unwrap();
             let interval = interval_generator.interval_in_millis() as u64;

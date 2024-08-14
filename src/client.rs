@@ -1,7 +1,10 @@
 use clap::Parser;
 use request_sim::{
     dataset::Dataset,
-    protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol},
+    protocols::{
+        distserve_protocol::DistserveProtocol, tgi_protocol::TgiProtocol,
+        vllm_protocol::VllmProtocol,
+    },
     requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
 };
 use tokenizers::Tokenizer;
@@ -22,8 +25,8 @@ struct Args {
     endpoint: String,
 
     /// Dataset type. Either "mooncake" or "burstgpt".
-    #[clap(long, required = true)]
-    dataset_type: String,
+    #[clap(long, required = true, value_parser = parse_dataset_type)]
+    dataset_type: DatasetType,
 
     /// Path to dataset file.
     #[clap(long, required = true)]
@@ -45,9 +48,39 @@ struct Args {
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
 
-    /// Protocol type
-    #[clap(long, short, default_value = "tgi")]
-    protocol: String,
+    /// Protocol type. Either "tgi", "vllm" or "distserve".
+    #[clap(long, short, default_value = "tgi",  value_parser = parse_protocol)]
+    protocol: Protocol,
+}
+
+fn parse_protocol(s: &str) -> Result<Protocol, String> {
+    match s.to_lowercase().as_ref() {
+        "tgi" => Ok(Protocol::Tgi),
+        "vllm" => Ok(Protocol::Vllm),
+        "distserve" => Ok(Protocol::Distserve),
+        _ => Err("Invalid protocol type".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Protocol {
+    Tgi,
+    Vllm,
+    Distserve,
+}
+
+fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
+    match s.to_lowercase().as_ref() {
+        "mooncake" => Ok(DatasetType::Mooncake),
+        "burstgpt" => Ok(DatasetType::Burstgpt),
+        _ => Err("Invalid dataset type.".to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DatasetType {
+    Mooncake,
+    Burstgpt,
 }
 
 async fn async_main(args: Args) {
@@ -73,15 +106,14 @@ async fn async_main(args: Args) {
         .unwrap();
 
     let (tx, rx) = flume::unbounded();
-    let dataset = match dataset_type.to_lowercase().as_str() {
-        "mooncake" => Dataset::load_mooncake_jsonl(dataset_path.as_str()),
-        "burstgpt" => Dataset::load_burstgpt_csv(dataset_path.as_str()),
-        _ => panic!("Invalid dataset type"),
+    let dataset = match dataset_type {
+        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str()),
+        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str()),
     };
     let interval_generator = create_gamma_interval_generator(request_rate, cv);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let handle_1 = match protocol.to_lowercase().as_str() {
-        "tgi" => {
+    let handle_1 = match protocol {
+        Protocol::Tgi => {
             let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
             spawn_request_loop(
                 endpoint,
@@ -92,7 +124,7 @@ async fn async_main(args: Args) {
                 stop_rx,
             )
         }
-        "vllm" => {
+        Protocol::Vllm => {
             let vllm_protocol = VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
             spawn_request_loop(
                 endpoint,
@@ -103,7 +135,18 @@ async fn async_main(args: Args) {
                 stop_rx,
             )
         }
-        _ => panic!("Unsupported protocol type"),
+        Protocol::Distserve => {
+            let distserve_protocol =
+                DistserveProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
+            spawn_request_loop(
+                endpoint,
+                dataset,
+                distserve_protocol,
+                interval_generator,
+                tx,
+                stop_rx,
+            )
+        }
     };
     let handle_2 = spawn(report_loop(output_file, rx));
 

@@ -15,6 +15,7 @@ pub struct Dataset {
 impl Dataset {
     pub fn load_mooncake_jsonl(path: &str) -> Self {
         #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
         pub struct MooncakeRecord {
             pub timestamp: u64,
             pub input_length: u64,
