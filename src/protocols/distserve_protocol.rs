@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use rand::{thread_rng, Rng};
 use reqwest::Response;
+use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
+use tokio::runtime::Runtime;
 
 use super::Protocol;
 
@@ -25,9 +27,21 @@ impl DistserveProtocol {
             tokenizer,
             start: 0,
             end: 10000,
-            max_token_size: 2048
+            max_token_size: 3950
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct LifetimeEvent {
+    timestamp: f64,
+    event_type: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+struct DistserveResponse {
+    text: String,
+    timestamps: Vec<f64>,
+    lifetime_events: Vec<LifetimeEvent>
 }
 
 impl Protocol for DistserveProtocol {
@@ -35,22 +49,27 @@ impl Protocol for DistserveProtocol {
         let truncated_input_length;
         let truncated_output_length;
         if input_token_length + output_token_length >= self.max_token_size {
-            truncated_input_length = self.max_token_size / 2;
-            truncated_output_length = self.max_token_size / 2 - 5;
+            truncated_input_length = 3900;
+            truncated_output_length = 49;
+            println!("trucated length {} {}", truncated_input_length, truncated_output_length);
         } else {
             truncated_input_length = input_token_length;
             truncated_output_length = output_token_length;
+            println!("original length {} {}", truncated_input_length, truncated_output_length);
         }
         let input_token_ids = (0..truncated_input_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
+        println!("vector length: {}", input_token_ids.len());
         let input = self
             .tokenizer
-            .decode(input_token_ids.as_slice(), false)
+            .decode(input_token_ids.as_slice(),false)
             .unwrap();
+        //println!("prmopt: {}", input);
         let json_body =
             serde_json::json!({
-                "prompt":input,
+                //"prompt":input,
+                "prompt_token_ids": input_token_ids,
                 "max_tokens":truncated_output_length,
                 "n":1,
                 "best_of":1,
@@ -63,59 +82,85 @@ impl Protocol for DistserveProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(response: Response) -> BTreeMap<String, String> {
+    fn parse_response(response: Response) -> BTreeMap<String, String>{
         let mut map = BTreeMap::new();
         println!("{:?}", response);
-        // map.insert("status".to_string(), response.status().as_str().to_string());
-        // if response.status().is_success() {
-        //     let first_token_time = response
-        //         .headers()
-        //         .get("x-first-token-time")
-        //         .unwrap()
-        //         .to_str()
-        //         .unwrap()
-        //         .to_string();
-        //     map.insert("first_token_time".to_string(), first_token_time);
+        //println!("headers {:?}", response.headers());
+        //map.insert("status".to_string(), response.status().as_str().to_string());
+        map.insert("status".to_string(), response.status().as_str().to_string());
+        if response.status().is_success() {
+            let first_token_time = response
+                .headers()
+                .get("x-first-token-time")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert("first_token_time".to_string(), first_token_time);
 
-        //     let total_time = response
-        //         .headers()
-        //         .get("x-total-time")
-        //         .unwrap()
-        //         .to_str()
-        //         .unwrap()
-        //         .to_string();
-        //     map.insert("total_time".to_string(), total_time);
+            let total_time = response
+                .headers()
+                .get("x-total-time")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert("total_time".to_string(), total_time);
 
-        //     let inference_time = response
-        //         .headers()
-        //         .get("x-inference-time")
-        //         .unwrap()
-        //         .to_str()
-        //         .unwrap()
-        //         .to_string();
-        //     map.insert("inference_time".to_string(), inference_time);
+            let inference_time = response
+                .headers()
+                .get("x-inference-time")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert("inference_time".to_string(), inference_time);
 
-        //     let queue_time = response
-        //         .headers()
-        //         .get("x-queue-time")
-        //         .unwrap()
-        //         .to_str()
-        //         .unwrap()
-        //         .to_string();
-        //     map.insert("queue_time".to_string(), queue_time);
+            let queue_time = response
+                .headers()
+                .get("x-queue-time")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert("queue_time".to_string(), queue_time);
 
-        //     let max_time_between_tokens = response
-        //         .headers()
-        //         .get("x-max-time-between-tokens")
-        //         .unwrap()
-        //         .to_str()
-        //         .unwrap()
-        //         .to_string();
-        //     map.insert(
-        //         "max_time_between_tokens".to_string(),
-        //         max_time_between_tokens,
-        //     );
-        // }
+            let max_time_between_tokens = response
+                .headers()
+                .get("x-max-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "max_time_between_tokens".to_string(),
+                max_time_between_tokens,
+            );
+
+            let output_length = response
+                .headers()
+                .get("x-output-length")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "output_length".to_string(), 
+                output_length,
+            );
+
+            let input_length = response
+                .headers()
+                .get("x-input-length")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "input_length".to_string(), 
+                input_length,
+            );
+        }
         map
     }
 }
