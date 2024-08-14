@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future};
 
 use rand::{thread_rng, Rng};
 use reqwest::Response;
@@ -28,7 +28,7 @@ impl VllmProtocol {
 }
 
 impl Protocol for VllmProtocol {
-    fn request_json_body(&self,input_token_length: u64, output_token_length: u64) -> String {
+    fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String {
         let input_token_ids = (0..input_token_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
@@ -76,6 +76,10 @@ impl Protocol for VllmProtocol {
             );
         }
         map
+    }
+
+    fn parse_response_async(_: Response) -> impl Future<Output = BTreeMap<String, String>> {
+        async { unimplemented!() }
     }
 }
 

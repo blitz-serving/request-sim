@@ -1,12 +1,13 @@
-use std::{collections::BTreeMap, future::Future};
+use std::collections::BTreeMap;
 
 use rand::{thread_rng, Rng};
 use reqwest::Response;
+use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
 use super::Protocol;
 
-pub struct TgiProtocol {
+pub struct DistserveProtocol {
     tokenizer: Tokenizer,
 
     /// Start of the token id range.
@@ -14,40 +15,76 @@ pub struct TgiProtocol {
 
     /// End of the token id range.
     end: u32,
+
+    max_token_size: u64,
 }
 
-impl TgiProtocol {
+impl DistserveProtocol {
     /// Current the randomly generated token ids are in the range of 0..10000.
     pub fn new(tokenizer: Tokenizer) -> Self {
         Self {
             tokenizer,
             start: 0,
             end: 10000,
+            max_token_size: 3950,
         }
     }
 }
 
-#[derive(serde::Deserialize, Debug)]
-pub struct TgiParsed {
-    pub lags: Vec<f64>,
+#[derive(Serialize, Deserialize, Debug)]
+struct LifetimeEvent {
+    timestamp: f64,
+    event_type: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+struct DistserveResponse {
+    text: String,
+    timestamps: Vec<f64>,
+    lifetime_events: Vec<LifetimeEvent>,
 }
 
-impl Protocol for TgiProtocol {
+impl Protocol for DistserveProtocol {
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String {
-        let input_token_ids = (0..input_token_length)
+        let truncated_input_length;
+        let truncated_output_length;
+        if input_token_length + output_token_length >= self.max_token_size {
+            truncated_input_length = 3900;
+            truncated_output_length = 49;
+            //println!("trucated length {} {}", truncated_input_length, truncated_output_length);
+        } else {
+            truncated_input_length = input_token_length;
+            truncated_output_length = output_token_length;
+            //println!("original length {} {}", truncated_input_length, truncated_output_length);
+        }
+        let input_token_ids = (0..truncated_input_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
-        let input = self
+        //println!("vector length: {}", input_token_ids.len());
+        let _input = self
             .tokenizer
             .decode(input_token_ids.as_slice(), false)
             .unwrap();
-        let json_body =
-            serde_json::json!({"input":input,"parameter":{"max_new_tokens":output_token_length}});
+        //println!("prmopt: {}", input);
+        let json_body = serde_json::json!({
+            //"prompt":input,
+            "prompt_token_ids": input_token_ids,
+            "max_tokens":truncated_output_length,
+            "n":1,
+            "best_of":1,
+            "use_beam_search": false,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "ignore_eos": true,
+            "stream": false
+        });
         json_body.to_string()
     }
 
     fn parse_response(response: Response) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
+        println!("{:?}", response);
+        //println!("headers {:?}", response.headers());
+        //map.insert("status".to_string(), response.status().as_str().to_string());
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {
             let first_token_time = response
@@ -97,32 +134,37 @@ impl Protocol for TgiProtocol {
                 "max_time_between_tokens".to_string(),
                 max_time_between_tokens,
             );
+
+            let output_length = response
+                .headers()
+                .get("x-output-length")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert("output_length".to_string(), output_length);
+
+            let input_length = response
+                .headers()
+                .get("x-input-length")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert("input_length".to_string(), input_length);
         }
         map
     }
 
-    fn parse_response_async(response: Response) -> impl Future<Output = BTreeMap<String, String>> {
-        #[derive(Debug, serde::Deserialize)]
-        struct TgiResponse {
-            lags: Vec<f64>,
-        }
-
-        async move {
-            let tgi_response = response.json::<TgiResponse>().await.unwrap();
-            let mut map = BTreeMap::new();
-            map.insert(
-                "lags".to_string(),
-                serde_json::to_string(&tgi_response.lags).unwrap(),
-            );
-            map
-        }
+    fn parse_response_async(
+        _: Response,
+    ) -> impl std::future::Future<Output = BTreeMap<String, String>> {
+        async { unimplemented!() }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     #[test]
@@ -153,17 +195,5 @@ mod tests {
         } else {
             print!("Tokenizer file not found");
         }
-    }
-
-    #[tokio::test]
-    async fn test_parse_response_async() {
-        let response = reqwest::Response::from(
-            http::response::Builder::new()
-                .status(200)
-                .body(json!({"lags":[0.1,0.2,0.3]}).to_string())
-                .unwrap(),
-        );
-        let parsed = TgiProtocol::parse_response_async(response).await;
-        println!("{:?}", parsed);
     }
 }

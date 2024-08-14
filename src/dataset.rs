@@ -15,6 +15,7 @@ pub struct Dataset {
 impl Dataset {
     pub fn load_mooncake_jsonl(path: &str) -> Self {
         #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
         pub struct MooncakeRecord {
             pub timestamp: u64,
             pub input_length: u64,
@@ -56,6 +57,19 @@ impl Dataset {
         }
 
         requests.shuffle(&mut rand::thread_rng());
+
+        Self {
+            dataset_size: requests.len(),
+            requests,
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn load_mock_dataset() -> Self {
+        let requests = (0..1000)
+            .into_iter()
+            .map(|_| (rand::random::<u64>() % 100, rand::random::<u64>() % 100))
+            .collect::<Vec<_>>();
 
         Self {
             dataset_size: requests.len(),
