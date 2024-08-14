@@ -8,10 +8,10 @@ port=8499
 #dataset_type=mooncake
 dataset_path=/huggingface/datasets/burstgpt.csv
 dataset_type=burstgpt
-threads=1
-req_rate=30
-cv=1
+threads=56
+req_rate=200
+cv=2
 
 CARGO_BUILD_JOBS=88 cargo install --path .
 
-RUST_BACKTRACE=1 client --tokenizer $model --endpoint http://localhost:$port/generate --dataset-path $dataset_path --dataset-type $dataset_type --threads $threads --protocol distserve -t 900 --request-rate $req_rate --cv $cv
+RUST_BACKTRACE=1 client --tokenizer $model --threads $threads --endpoint http://localhost:$port/generate --dataset-path $dataset_path --dataset-type $dataset_type --protocol distserve -t 900 --request-rate $req_rate --cv $cv

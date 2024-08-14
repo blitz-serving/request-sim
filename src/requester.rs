@@ -13,6 +13,7 @@ use tokio::{
     task::JoinHandle,
     time::sleep,
 };
+use std::io::Write;
 
 use crate::{dataset::Dataset, distribution::Distribution, protocols::Protocol};
 
@@ -99,7 +100,32 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                 metrics.insert("s_time".to_string(), s_time.to_string());
                 metrics.insert("e_time".to_string(), e_time.to_string());
 
-                response_sender.send(metrics).unwrap();
+                match response_sender.send(metrics) {
+                    Ok(_) => {
+
+                    }
+                    Err(e) => {
+                       // 提供更详细的错误信息
+                        println!("Error sending metrics: {}", e);
+
+                        // 检查并创建/打开错误日志文件
+                        let log_file_path = "error.log";
+                        let mut error_file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(log_file_path)
+                            .expect("Failed to open error log file");
+
+                        // 将错误信息写入日志文件
+                        if let Err(err) = writeln!(
+                            &mut error_file,
+                            "Error: {}\n",
+                            e
+                        ) {
+                            println!("Failed to write to error log file: {}", err);
+                        }
+                    }
+                }
             });
             tx.send_async(request_handle).await.unwrap();
             let interval = interval_generator.interval_in_millis() as u64;

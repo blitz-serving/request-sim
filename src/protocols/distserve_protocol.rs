@@ -51,16 +51,16 @@ impl Protocol for DistserveProtocol {
         if input_token_length + output_token_length >= self.max_token_size {
             truncated_input_length = 3900;
             truncated_output_length = 49;
-            println!("trucated length {} {}", truncated_input_length, truncated_output_length);
+            //println!("trucated length {} {}", truncated_input_length, truncated_output_length);
         } else {
             truncated_input_length = input_token_length;
             truncated_output_length = output_token_length;
-            println!("original length {} {}", truncated_input_length, truncated_output_length);
+            //println!("original length {} {}", truncated_input_length, truncated_output_length);
         }
         let input_token_ids = (0..truncated_input_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
-        println!("vector length: {}", input_token_ids.len());
+        //println!("vector length: {}", input_token_ids.len());
         let input = self
             .tokenizer
             .decode(input_token_ids.as_slice(),false)
