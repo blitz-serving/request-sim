@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future};
 
 use rand::{thread_rng, Rng};
 use reqwest::Response;
@@ -101,9 +101,7 @@ impl Protocol for TgiProtocol {
         map
     }
 
-    fn parse_response_async(
-        response: Response,
-    ) -> impl std::future::Future<Output = BTreeMap<String, String>> {
+    fn parse_response_async(response: Response) -> impl Future<Output = BTreeMap<String, String>> {
         #[derive(Debug, serde::Deserialize)]
         struct TgiResponse {
             lags: Vec<f64>,

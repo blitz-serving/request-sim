@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, future::Future};
 
 use rand::{thread_rng, Rng};
 use reqwest::Response;
@@ -78,9 +78,7 @@ impl Protocol for VllmProtocol {
         map
     }
 
-    fn parse_response_async(
-        _: Response,
-    ) -> impl std::future::Future<Output = BTreeMap<String, String>> {
+    fn parse_response_async(_: Response) -> impl Future<Output = BTreeMap<String, String>> {
         async { unimplemented!() }
     }
 }

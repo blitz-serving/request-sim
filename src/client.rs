@@ -1,10 +1,7 @@
 use clap::Parser;
 use request_sim::{
     dataset::Dataset,
-    protocols::{
-        distserve_protocol::DistserveProtocol, tgi_protocol::TgiProtocol,
-        vllm_protocol::VllmProtocol,
-    },
+    protocols::{DistserveProtocol, MockProtocol, TgiProtocol, VllmProtocol},
     requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
 };
 use tokenizers::Tokenizer;
@@ -24,7 +21,7 @@ struct Args {
     #[clap(long, required = true)]
     endpoint: String,
 
-    /// Dataset type. Either "mooncake" or "burstgpt".
+    /// Dataset type. Either "mooncake", "burstgpt" or "mock".
     #[clap(long, required = true, value_parser = parse_dataset_type)]
     dataset_type: DatasetType,
 
@@ -48,7 +45,7 @@ struct Args {
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
 
-    /// Protocol type. Either "tgi", "vllm" or "distserve".
+    /// Protocol type. Either "tgi", "vllm", "distserve" or "mock".
     #[clap(long, short, default_value = "tgi",  value_parser = parse_protocol)]
     protocol: Protocol,
 }
@@ -58,6 +55,7 @@ fn parse_protocol(s: &str) -> Result<Protocol, String> {
         "tgi" => Ok(Protocol::Tgi),
         "vllm" => Ok(Protocol::Vllm),
         "distserve" => Ok(Protocol::Distserve),
+        "mock" => Ok(Protocol::Mock),
         _ => Err("Invalid protocol type".to_string()),
     }
 }
@@ -67,12 +65,14 @@ enum Protocol {
     Tgi,
     Vllm,
     Distserve,
+    Mock,
 }
 
 fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
     match s.to_lowercase().as_ref() {
         "mooncake" => Ok(DatasetType::Mooncake),
         "burstgpt" => Ok(DatasetType::Burstgpt),
+        "mock" => Ok(DatasetType::Mock),
         _ => Err("Invalid dataset type.".to_string()),
     }
 }
@@ -81,6 +81,7 @@ fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
 enum DatasetType {
     Mooncake,
     Burstgpt,
+    Mock,
 }
 
 async fn async_main(args: Args) {
@@ -109,6 +110,7 @@ async fn async_main(args: Args) {
     let dataset = match dataset_type {
         DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str()),
         DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str()),
+        DatasetType::Mock => Dataset::load_mock_dataset(),
     };
     let interval_generator = create_gamma_interval_generator(request_rate, cv);
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -147,6 +149,14 @@ async fn async_main(args: Args) {
                 stop_rx,
             )
         }
+        Protocol::Mock => spawn_request_loop(
+            endpoint,
+            dataset,
+            MockProtocol,
+            interval_generator,
+            tx,
+            stop_rx,
+        ),
     };
     let handle_2 = spawn(report_loop(output_file, rx));
 

@@ -65,6 +65,19 @@ impl Dataset {
         }
     }
 
+    pub fn load_mock_dataset() -> Self {
+        let requests = (0..1000)
+            .into_iter()
+            .map(|_| (rand::random::<u64>() % 100, rand::random::<u64>() % 100))
+            .collect::<Vec<_>>();
+
+        Self {
+            dataset_size: requests.len(),
+            requests,
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
     pub fn next_request(&self) -> (u64, u64) {
         let index = self
             .next_index

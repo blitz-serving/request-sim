@@ -79,10 +79,15 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     BASETIME.get_or_init(|| Instant::now());
 
+    fn get_timestamp() -> u64 {
+        BASETIME.get().unwrap().elapsed().as_millis() as u64
+    }
+
     let (tx, rx) = flume::unbounded();
     let handle = spawn(wait_all(rx));
 
     spawn(async move {
+        let mut timestamp = get_timestamp();
         loop {
             if stopped.try_recv().is_ok() {
                 break;
@@ -92,9 +97,9 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
             let json_body = protocol.request_json_body(input_length, output_length);
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
-                let s_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
+                let s_time = get_timestamp();
                 let response = request(endpoint.as_str(), json_body.to_string()).await;
-                let e_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
+                let e_time = get_timestamp();
 
                 let mut metrics = P::parse_response(response);
                 metrics.insert("s_time".to_string(), s_time.to_string());
@@ -113,8 +118,11 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                 }
             });
             tx.send_async(request_handle).await.unwrap();
-            let interval = interval_generator.interval_in_millis() as u64;
-            sleep(Duration::from_millis(interval)).await;
+            timestamp += interval_generator.interval_in_millis().round() as u64;
+            let current_timestamp = get_timestamp();
+            if timestamp > current_timestamp + 1 {
+                sleep(Duration::from_millis(timestamp - current_timestamp)).await;
+            }
         }
     });
 
