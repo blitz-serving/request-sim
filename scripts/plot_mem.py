@@ -1,9 +1,9 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-name="gpu_usage_log_rr47_cv.15_conver_debatch128"
+name="cpu_usage_rr47_debatch128-1h"
 #name="cpu_usage_log_rr47_cv.15_conver_debatch128"
-tp = "GPU"
+tp = "CPU"
 # 读取 CSV 文件,没有表头
 df = pd.read_csv(f'{name}.csv', header=None)
 

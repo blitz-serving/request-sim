@@ -5,14 +5,13 @@ use std::{
 };
 
 use reqwest::Response;
-use std::io::Write;
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
     spawn,
     sync::oneshot,
-    task::JoinHandle,
-    time::sleep,
+    task::{yield_now, JoinHandle},
+    time::{sleep, timeout},
 };
 
 use crate::{dataset::Dataset, distribution::Distribution, protocols::Protocol};
@@ -98,30 +97,71 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let response = request(endpoint.as_str(), json_body.to_string()).await;
-                let e_time = get_timestamp();
+                let slo = Duration::from_secs(output_length / 10 + 300);
+                match timeout(slo, request(endpoint.as_str(), json_body.to_string())).await {
+                    Ok(response) => {
+                        let e_time = get_timestamp();
 
-                let mut metrics = P::parse_response(response);
-                metrics.insert("s_time".to_string(), s_time.to_string());
-                metrics.insert("e_time".to_string(), e_time.to_string());
+                        let mut metrics = P::parse_response(response);
+                        metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("e_time".to_string(), e_time.to_string());
 
-                if let Err(e) = response_sender.send(metrics) {
-                    // Print more information on error.
-                    eprintln!("Error sending metrics: {}", e);
-                    let log_file_path = "error.log";
-                    let mut error_file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(log_file_path)
-                        .expect("Failed to open error log file");
-                    writeln!(&mut error_file, "Error: {}", e).unwrap();
+                        if let Err(e) = response_sender.send(metrics) {
+                            let error_file_path = "/tmp/client_logs/send_error.log";
+                            let mut error_file = tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(error_file_path)
+                                .await
+                                .expect("Failed to open error log file");
+                            error_file
+                                .write(format!("{},{},Error: {}\n", s_time.to_string(), e_time.to_string(), e).as_bytes())
+                                .await
+                                .expect("Failed to write to error log file");
+                            error_file
+                                .flush()
+                                .await
+                                .expect("Failed to flush error log file");
+                        }
+                    }
+                    Err(_) => {
+                        let e_time = get_timestamp();
+                        let error_file_path = "/tmp/client_logs/timeout_error.log";
+                        eprintln!(
+                            "{},{},Error: Request with input {} output {} timeout!\n",
+                                    s_time.to_string(), e_time.to_string(), input_length, output_length
+                        );
+                        let mut error_file = tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(error_file_path)
+                            .await
+                            .expect("Failed to open error log file");
+                        error_file
+                            .write(
+                                format!(
+                                    "{},{},Error: Request with input {} output {} timeout!\n",
+                                    s_time.to_string(), e_time.to_string(), input_length, output_length
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .expect("Failed to write to error log file");
+                        error_file
+                            .flush()
+                            .await
+                            .expect("Failed to flush error log file");
+                    }
                 }
             });
+
             tx.send_async(request_handle).await.unwrap();
             timestamp += interval_generator.interval_in_millis().round() as u64;
             let current_timestamp = get_timestamp();
             if timestamp > current_timestamp + 1 {
                 sleep(Duration::from_millis(timestamp - current_timestamp)).await;
+            } else {
+                yield_now().await;
             }
         }
     });

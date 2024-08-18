@@ -138,6 +138,42 @@ impl Protocol for DistserveProtocol {
                 max_time_between_tokens,
             );
 
+            let p70_time_between_tokens = response
+                .headers()
+                .get("x-p70-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p70_time_between_tokens".to_string(),
+                p70_time_between_tokens,
+            );
+
+            let p90_time_between_tokens = response
+                .headers()
+                .get("x-p90-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p90_time_between_tokens".to_string(),
+                p90_time_between_tokens,
+            );
+
+            let p99_time_between_tokens = response
+                .headers()
+                .get("x-p99-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p99_time_between_tokens".to_string(),
+                p99_time_between_tokens,
+            );
+
             let output_length = response
                 .headers()
                 .get("x-output-length")

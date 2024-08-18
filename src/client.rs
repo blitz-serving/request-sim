@@ -25,6 +25,10 @@ struct Args {
     #[clap(long, required = true, value_parser = parse_dataset_type)]
     dataset_type: DatasetType,
 
+    /// Protocol type. Either "tgi", "vllm", "distserve" or "mock".
+    #[clap(long, short, default_value = "tgi",  value_parser = parse_protocol)]
+    protocol: Protocol,
+
     /// Path to dataset file.
     #[clap(long, required = true)]
     dataset_path: String,
@@ -38,16 +42,12 @@ struct Args {
     cv: f64,
 
     /// Output path
-    #[clap(long, short, default_value = "/tmp/client_logs/output.csv")]
+    #[clap(long, short, default_value = "/tmp/client_logs/output.jsonl")]
     output_path: String,
 
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
-
-    /// Protocol type. Either "tgi", "vllm", "distserve" or "mock".
-    #[clap(long, short, default_value = "tgi",  value_parser = parse_protocol)]
-    protocol: Protocol,
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
@@ -114,7 +114,7 @@ async fn async_main(args: Args) {
     };
     let interval_generator = create_gamma_interval_generator(request_rate, cv);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let handle_1 = match protocol {
+    let requester_handle = match protocol {
         Protocol::Tgi => {
             let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
             spawn_request_loop(
@@ -158,13 +158,13 @@ async fn async_main(args: Args) {
             stop_rx,
         ),
     };
-    let handle_2 = spawn(report_loop(output_file, rx));
+    let reporter_handle = spawn(report_loop(output_file, rx));
 
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
     stop_tx.send(()).unwrap();
 
-    handle_1.await.unwrap();
-    handle_2.await.unwrap();
+    requester_handle.await.unwrap();
+    reporter_handle.await.unwrap();
 }
 
 fn main() {
