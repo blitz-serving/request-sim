@@ -5,7 +5,7 @@ import numpy as np
 
 # 读取CSV文件
 # with open("./output/mooncake-c2-r1.csv", "r") as file:
-name = "output-1p2d-burstgpt-old-100wrr-cv2"
+name = "output-cc"
 with open(f"./{name}.csv", "r") as file:
     lines = file.readlines()
 # 将每行数据转换为JSON对象
@@ -13,7 +13,7 @@ data = [json.loads(line) for line in lines]
 
 # 将数据转换为DataFrame
 df = pd.DataFrame(data)
-df = df.iloc[3000:,]
+#df = df.iloc[5000:,]
 
 # 将时间相关的列转换为浮点数
 time_columns = ["first_token_time", "inference_time", "max_time_between_tokens"]

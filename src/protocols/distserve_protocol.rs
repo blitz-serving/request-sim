@@ -56,6 +56,9 @@ impl Protocol for DistserveProtocol {
             truncated_output_length = output_token_length;
             //println!("original length {} {}", truncated_input_length, truncated_output_length);
         }
+        // hack here
+        //truncated_input_length = 100; 
+        //truncated_output_length = 120;
         let input_token_ids = (0..truncated_input_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
