@@ -76,8 +76,8 @@ async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
     }
 }
 
-async fn append_error_log<E: std::fmt::Display>(file: &str, line: u32, err: E) {
-    let error_file_path = "error.log";
+async fn append_error_log(msg: String) {
+    let error_file_path = "/tmp/client_logs/error.log";
     let mut error_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -85,7 +85,7 @@ async fn append_error_log<E: std::fmt::Display>(file: &str, line: u32, err: E) {
         .await
         .expect("Failed to open error log file");
     error_file
-        .write(format!("{}:{} Error: {}\n", file, line, err).as_bytes())
+        .write(msg.as_bytes())
         .await
         .expect("Failed to write to error log file");
     error_file
@@ -131,7 +131,7 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 60);
+                let timeout = Duration::from_secs(output_length / 10 + 300);
 
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
@@ -143,10 +143,30 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                         metrics.insert("e_time".to_string(), e_time.to_string());
 
                         if let Err(err) = response_sender.send(metrics) {
-                            append_error_log(file!(), line!(), err).await;
+                            let msg = format!(
+                                "{},{}, Error: {} ({}:{})\n",
+                                s_time,
+                                e_time,
+                                err.to_string(),
+                                file!(),
+                                line!(),
+                            );
+                            append_error_log(msg).await;
                         }
                     }
-                    Err(err) => append_error_log(file!(), line!(), err).await,
+                    Err(err) => {
+                        let msg = format!(
+                            "{},{}, Request with input {} output {} error: {} ({}:{})\n",
+                            s_time,
+                            get_timestamp(),
+                            input_length,
+                            output_length,
+                            err.to_string(),
+                            file!(),
+                            line!(),
+                        );
+                        append_error_log(msg).await;
+                    }
                 }
             });
 
@@ -160,7 +180,6 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
             }
         }
     });
-
     handle
 }
 
@@ -192,7 +211,7 @@ pub async fn spawn_request_loop_with_timestamp<P: 'static + Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 60);
+                let timeout = Duration::from_secs(output_length / 10 + 300);
 
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
@@ -204,10 +223,30 @@ pub async fn spawn_request_loop_with_timestamp<P: 'static + Protocol + Send>(
                         metrics.insert("e_time".to_string(), e_time.to_string());
 
                         if let Err(err) = response_sender.send(metrics) {
-                            append_error_log(file!(), line!(), err).await;
+                            let msg = format!(
+                                "{},{}, Error: {} ({}:{})\n",
+                                s_time,
+                                e_time,
+                                err.to_string(),
+                                file!(),
+                                line!(),
+                            );
+                            append_error_log(msg).await;
                         }
                     }
-                    Err(err) => append_error_log(file!(), line!(), err).await,
+                    Err(err) => {
+                        let msg = format!(
+                            "{},{}, Request with input {} output {} error: {} ({}:{})\n",
+                            s_time,
+                            get_timestamp(),
+                            input_length,
+                            output_length,
+                            err.to_string(),
+                            file!(),
+                            line!(),
+                        );
+                        append_error_log(msg).await;
+                    }
                 }
             });
 
@@ -221,7 +260,6 @@ pub async fn spawn_request_loop_with_timestamp<P: 'static + Protocol + Send>(
             }
         }
     });
-
     handle
 }
 

@@ -74,10 +74,13 @@ impl Dataset {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>();
             let timestamp = parts[0].parse::<f64>().unwrap() as u64;
-            timestamps.push(timestamp);
             let input_length = parts[2].parse().unwrap();
             let output_length = parts[3].parse().unwrap();
-            requests.push((input_length, output_length));
+            let log_type = &parts[5];
+            if log_type == "Conversation log" {
+                timestamps.push(timestamp);
+                requests.push((input_length, output_length));
+            }
         }
 
         let base_timestamp = timestamps[0];
