@@ -97,7 +97,7 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let slo = Duration::from_secs(output_length / 10 + 120);
+                let slo = Duration::from_secs(output_length / 10 + 300);
                 match timeout(slo, request(endpoint.as_str(), json_body.to_string())).await {
                     Ok(response) => {
                         let e_time = get_timestamp();
@@ -107,7 +107,7 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                         metrics.insert("e_time".to_string(), e_time.to_string());
 
                         if let Err(e) = response_sender.send(metrics) {
-                            let error_file_path = "error.log";
+                            let error_file_path = "/tmp/client_logs/send_error.log";
                             let mut error_file = tokio::fs::OpenOptions::new()
                                 .create(true)
                                 .append(true)
@@ -115,7 +115,7 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                                 .await
                                 .expect("Failed to open error log file");
                             error_file
-                                .write(format!("Error: {}\n", e).as_bytes())
+                                .write(format!("{},{},Error: {}\n", s_time.to_string(), e_time.to_string(), e).as_bytes())
                                 .await
                                 .expect("Failed to write to error log file");
                             error_file
@@ -125,10 +125,11 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                         }
                     }
                     Err(_) => {
-                        let error_file_path = "error.log";
+                        let e_time = get_timestamp();
+                        let error_file_path = "/tmp/client_logs/timeout_error.log";
                         eprintln!(
-                            "Request with input {} output {} timeout!",
-                            input_length, output_length
+                            "{},{},Error: Request with input {} output {} timeout!\n",
+                                    s_time.to_string(), e_time.to_string(), input_length, output_length
                         );
                         let mut error_file = tokio::fs::OpenOptions::new()
                             .create(true)
@@ -139,8 +140,8 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                         error_file
                             .write(
                                 format!(
-                                    "Error: Request with input {} output {} timeout!\n",
-                                    input_length, output_length
+                                    "{},{},Error: Request with input {} output {} timeout!\n",
+                                    s_time.to_string(), e_time.to_string(), input_length, output_length
                                 )
                                 .as_bytes(),
                             )

@@ -42,7 +42,7 @@ struct Args {
     cv: f64,
 
     /// Output path
-    #[clap(long, short, default_value = "output.jsonl")]
+    #[clap(long, short, default_value = "/tmp/client_logs/output.jsonl")]
     output_path: String,
 
     /// Requester run time.

@@ -51,9 +51,12 @@ impl Dataset {
                 .split(',')
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>();
+            let log_type = &parts[5];
             let input_length = parts[2].parse().unwrap();
             let output_length = parts[3].parse().unwrap();
-            requests.push((input_length, output_length));
+            if log_type == "Conversation log" {
+                requests.push((input_length, output_length));
+            }
         }
 
         requests.shuffle(&mut rand::thread_rng());

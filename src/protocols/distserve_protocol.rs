@@ -56,6 +56,9 @@ impl Protocol for DistserveProtocol {
             truncated_output_length = output_token_length;
             //println!("original length {} {}", truncated_input_length, truncated_output_length);
         }
+        // hack here
+        //truncated_input_length = 100; 
+        //truncated_output_length = 120;
         let input_token_ids = (0..truncated_input_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
@@ -133,6 +136,42 @@ impl Protocol for DistserveProtocol {
             map.insert(
                 "max_time_between_tokens".to_string(),
                 max_time_between_tokens,
+            );
+
+            let p70_time_between_tokens = response
+                .headers()
+                .get("x-p70-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p70_time_between_tokens".to_string(),
+                p70_time_between_tokens,
+            );
+
+            let p90_time_between_tokens = response
+                .headers()
+                .get("x-p90-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p90_time_between_tokens".to_string(),
+                p90_time_between_tokens,
+            );
+
+            let p99_time_between_tokens = response
+                .headers()
+                .get("x-p99-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p99_time_between_tokens".to_string(),
+                p99_time_between_tokens,
             );
 
             let output_length = response

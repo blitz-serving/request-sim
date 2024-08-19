@@ -49,7 +49,7 @@ def plot_throughput(throughput_per_second, name):
     plt.savefig(f"{name}-decode-thpt.png")
 
 # Usage
-name = "output-1p2d-burstgpt-old-100wrr-cv2"
+name = "output-cc"
 csv_file = f"{name}.csv"  # replace with your actual CSV file path
 throughput = calculate_throughput_per_millisecond(csv_file)
 throughput_per_second = aggregate_throughput_per_second(throughput)
