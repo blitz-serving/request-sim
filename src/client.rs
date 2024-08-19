@@ -108,8 +108,8 @@ async fn async_main(args: Args) {
 
     let (tx, rx) = flume::unbounded();
     let dataset = match dataset_type {
-        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str()),
-        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str()),
+        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str(), true),
+        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str(), true),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
     let interval_generator = create_gamma_interval_generator(request_rate, cv);

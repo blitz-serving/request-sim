@@ -11,7 +11,7 @@ use tokio::{
     spawn,
     sync::oneshot,
     task::{yield_now, JoinHandle},
-    time::{sleep, timeout},
+    time::sleep,
 };
 
 use crate::{dataset::Dataset, distribution::Distribution, protocols::Protocol};
@@ -41,24 +41,64 @@ pub fn create_gamma_interval_generator(request_rate: f64, cv: f64) -> IntervalGe
     IntervalGenerator::new(distribution)
 }
 
-async fn request(endpoint: &str, json_body: String) -> Response {
-    reqwest::Client::builder()
+#[allow(dead_code)]
+async fn request(endpoint: &str, json_body: String) -> Result<Response, reqwest::Error> {
+    Ok(reqwest::Client::builder()
         .no_proxy()
-        .build()
-        .unwrap()
+        .build()?
         .post(endpoint)
         .body(json_body)
         .header("Content-Type", "application/json")
         .send()
+        .await?)
+}
+
+#[allow(dead_code)]
+async fn request_with_timeout(
+    endpoint: &str,
+    json_body: String,
+    timeout: Duration,
+) -> Result<Response, reqwest::Error> {
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .build()?
+        .post(endpoint)
+        .body(json_body)
+        .header("Content-Type", "application/json")
+        .send()
+        .await?)
+}
+
+async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
+    while let Ok(handle) = response_receiver.recv_async().await {
+        handle.await.unwrap();
+    }
+}
+
+async fn append_error_log<E: std::fmt::Display>(file: &str, line: u32, err: E) {
+    let error_file_path = "error.log";
+    let mut error_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(error_file_path)
         .await
-        .unwrap()
+        .expect("Failed to open error log file");
+    error_file
+        .write(format!("{}:{} Error: {}\n", file, line, err).as_bytes())
+        .await
+        .expect("Failed to write to error log file");
+    error_file
+        .flush()
+        .await
+        .expect("Failed to flush error log file");
 }
 
 /// Send requests in the open loop way.
 ///
 /// Note:
 /// - Intervals between requests are randomly generated.
-/// - Use [`request_loop_with_timestamp`] instead if you want to control the intervals.
+/// - Use [`spawn_request_loop_with_timestamp`] instead if you want to control the intervals.
 ///
 /// Await on the returned handle to wait for the loop to finish.
 pub fn spawn_request_loop<P: 'static + Protocol + Send>(
@@ -69,12 +109,6 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
-    async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
-        while let Ok(handle) = response_receiver.recv_async().await {
-            handle.await.unwrap();
-        }
-    }
-
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     BASETIME.get_or_init(|| Instant::now());
 
@@ -97,8 +131,10 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let slo = Duration::from_secs(output_length / 10 + 120);
-                match timeout(slo, request(endpoint.as_str(), json_body.to_string())).await {
+                let timeout = Duration::from_secs(output_length / 10 + 60);
+
+                match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
+                {
                     Ok(response) => {
                         let e_time = get_timestamp();
 
@@ -106,51 +142,11 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                         metrics.insert("s_time".to_string(), s_time.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
 
-                        if let Err(e) = response_sender.send(metrics) {
-                            let error_file_path = "error.log";
-                            let mut error_file = tokio::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(error_file_path)
-                                .await
-                                .expect("Failed to open error log file");
-                            error_file
-                                .write(format!("Error: {}\n", e).as_bytes())
-                                .await
-                                .expect("Failed to write to error log file");
-                            error_file
-                                .flush()
-                                .await
-                                .expect("Failed to flush error log file");
+                        if let Err(err) = response_sender.send(metrics) {
+                            append_error_log(file!(), line!(), err).await;
                         }
                     }
-                    Err(_) => {
-                        let error_file_path = "error.log";
-                        eprintln!(
-                            "Request with input {} output {} timeout!",
-                            input_length, output_length
-                        );
-                        let mut error_file = tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(error_file_path)
-                            .await
-                            .expect("Failed to open error log file");
-                        error_file
-                            .write(
-                                format!(
-                                    "Error: Request with input {} output {} timeout!\n",
-                                    input_length, output_length
-                                )
-                                .as_bytes(),
-                            )
-                            .await
-                            .expect("Failed to write to error log file");
-                        error_file
-                            .flush()
-                            .await
-                            .expect("Failed to flush error log file");
-                    }
+                    Err(err) => append_error_log(file!(), line!(), err).await,
                 }
             });
 
@@ -168,8 +164,65 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     handle
 }
 
-pub async fn request_loop_with_timestamp<P: Protocol>() {
-    unimplemented!("request_loop_with_timestamp");
+pub async fn spawn_request_loop_with_timestamp<P: 'static + Protocol + Send>(
+    endpoint: String,
+    dataset: Dataset,
+    protocol: P,
+    response_sender: flume::Sender<BTreeMap<String, String>>,
+    mut stopped: oneshot::Receiver<()>,
+) -> JoinHandle<()> {
+    static BASETIME: OnceLock<Instant> = OnceLock::new();
+    BASETIME.get_or_init(|| Instant::now());
+
+    fn get_timestamp() -> u64 {
+        BASETIME.get().unwrap().elapsed().as_millis() as u64
+    }
+
+    let (tx, rx) = flume::unbounded();
+    let handle = spawn(wait_all(rx));
+
+    spawn(async move {
+        loop {
+            if stopped.try_recv().is_ok() {
+                break;
+            }
+            let endpoint = endpoint.clone();
+            let (input_length, output_length) = dataset.next_request();
+            let json_body = protocol.request_json_body(input_length, output_length);
+            let response_sender = response_sender.clone();
+            let request_handle = spawn(async move {
+                let s_time = get_timestamp();
+                let timeout = Duration::from_secs(output_length / 10 + 60);
+
+                match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
+                {
+                    Ok(response) => {
+                        let e_time = get_timestamp();
+
+                        let mut metrics = P::parse_response(response);
+                        metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("e_time".to_string(), e_time.to_string());
+
+                        if let Err(err) = response_sender.send(metrics) {
+                            append_error_log(file!(), line!(), err).await;
+                        }
+                    }
+                    Err(err) => append_error_log(file!(), line!(), err).await,
+                }
+            });
+
+            tx.send_async(request_handle).await.unwrap();
+            let next_timestamp = dataset.next_timestamp();
+            let current_timestamp = get_timestamp();
+            if next_timestamp > current_timestamp + 1 {
+                sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
+            } else {
+                yield_now().await;
+            }
+        }
+    });
+
+    handle
 }
 
 /// The report loop writes the metrics to a file in JSONL format.
