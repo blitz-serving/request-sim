@@ -6,8 +6,8 @@ use request_sim::{dataset, requester::create_gamma_interval_generator};
 fn main() {
     let args: Args = Args::parse();
     let dataset = match args.dataset_name.to_lowercase().as_str() {
-        "mooncake" => dataset::Dataset::load_mooncake_jsonl(&args.dataset_path),
-        "burstgpt" => dataset::Dataset::load_burstgpt_csv(&args.dataset_path),
+        "mooncake" => dataset::Dataset::load_mooncake_jsonl(&args.dataset_path, true),
+        "burstgpt" => dataset::Dataset::load_burstgpt_csv(&args.dataset_path, true),
         _ => panic!("Invalid dataset name"),
     };
     let inverval_generator = create_gamma_interval_generator(args.request_rate, args.cv);

@@ -34,14 +34,18 @@ async fn main() {
     let listener = TcpListener::bind(args.addr).await.unwrap();
 
     spawn(async move {
-        let interval = 15;
+        let interval = 5;
         let mut prev = 0;
         let mut epoch = 0;
         loop {
             epoch += 1;
             sleep(Duration::from_secs(interval)).await;
             let count = COUNTER.load(Ordering::Relaxed);
-            println!("{epoch} rps = {}", (count - prev) as f64 / interval as f64);
+            println!(
+                "{:<4} rps = {}",
+                epoch,
+                (count - prev) as f64 / interval as f64
+            );
             prev = count;
         }
     });

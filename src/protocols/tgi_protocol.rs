@@ -27,11 +27,6 @@ impl TgiProtocol {
     }
 }
 
-#[derive(serde::Deserialize, Debug)]
-pub struct TgiParsed {
-    pub lags: Vec<f64>,
-}
-
 impl Protocol for TgiProtocol {
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String {
         let input_token_ids = (0..input_token_length)
