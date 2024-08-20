@@ -185,7 +185,7 @@ mod tests {
             dataset.next_request_with_timestamp();
         }
         for _ in 0..10 {
-            println!("{}", dataset.next_request_with_timestamp());
+            println!("{}", dataset.next_request_with_timestamp().0);
         }
     }
 }

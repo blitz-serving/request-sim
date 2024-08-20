@@ -204,13 +204,6 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
     let scale_factor =
         dataset.dataset_size() as f64 * 1000.0 / (request_rate * dataset.round_time() as f64);
 
-    println!(
-        "Request rate {}. Dataset interval {}. Scale factor {}",
-        request_rate,
-        dataset.round_time() as f64 / dataset.dataset_size() as f64,
-        scale_factor,
-    );
-
     spawn(async move {
         loop {
             if stopped.try_recv().is_ok() {
@@ -233,7 +226,7 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 5);
+                let timeout = Duration::from_secs(output_length / 10 + 100);
 
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
