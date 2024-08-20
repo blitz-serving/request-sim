@@ -14,12 +14,18 @@ impl Protocol for MockProtocol {
     }
 
     fn parse_response(_: reqwest::Response) -> BTreeMap<String, String> {
-        Default::default()
+        let mut map = BTreeMap::new();
+        map.insert("id".to_string(), rand::random::<u64>().to_string());
+        map
     }
 
     fn parse_response_async(
         _: reqwest::Response,
     ) -> impl Future<Output = BTreeMap<String, String>> {
-        async { Default::default() }
+        async {
+            let mut map = BTreeMap::new();
+            map.insert("id".to_string(), rand::random::<u64>().to_string());
+            map
+        }
     }
 }

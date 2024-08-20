@@ -14,7 +14,7 @@ use tokio::{
     time::sleep,
 };
 
-use crate::{dataset::Dataset, distribution::Distribution, protocols::Protocol};
+use crate::{dataset::Dataset, distribution::Distribution};
 
 pub struct IntervalGenerator {
     distribution: Box<dyn Distribution>,
@@ -77,7 +77,7 @@ async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
 }
 
 async fn append_error_log(msg: String) {
-    let error_file_path = "/tmp/client_logs/error.log";
+    let error_file_path = "/tmp/error.log";
     let mut error_file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -101,7 +101,7 @@ async fn append_error_log(msg: String) {
 /// - Use [`spawn_request_loop_with_timestamp`] instead if you want to control the intervals.
 ///
 /// Await on the returned handle to wait for the loop to finish.
-pub fn spawn_request_loop<P: 'static + Protocol + Send>(
+pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
     endpoint: String,
     dataset: Dataset,
     protocol: P,
@@ -131,7 +131,7 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 300);
+                let timeout = Duration::from_secs(output_length / 10 + 100);
 
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
@@ -183,10 +183,11 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     handle
 }
 
-pub async fn spawn_request_loop_with_timestamp<P: 'static + Protocol + Send>(
+pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::Protocol + Send>(
     endpoint: String,
     dataset: Dataset,
-    protocol: P,
+    protocol: Protocol,
+    request_rate: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
@@ -200,25 +201,46 @@ pub async fn spawn_request_loop_with_timestamp<P: 'static + Protocol + Send>(
     let (tx, rx) = flume::unbounded();
     let handle = spawn(wait_all(rx));
 
+    let scale_factor =
+        dataset.dataset_size() as f64 * 1000.0 / (request_rate * dataset.round_time() as f64);
+
+    println!(
+        "Request rate {}. Dataset interval {}. Scale factor {}",
+        request_rate,
+        dataset.round_time() as f64 / dataset.dataset_size() as f64,
+        scale_factor,
+    );
+
     spawn(async move {
         loop {
             if stopped.try_recv().is_ok() {
                 break;
             }
+
+            // Get next request and its timestamp
             let endpoint = endpoint.clone();
-            let (input_length, output_length) = dataset.next_request();
+            let current_timestamp = get_timestamp();
+            let (ts, input_length, output_length) = dataset.next_request_with_timestamp();
+            let next_timestamp = (ts as f64 * scale_factor) as u64;
+
+            if next_timestamp > current_timestamp + 1 {
+                sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
+            } else {
+                yield_now().await;
+            }
+
             let json_body = protocol.request_json_body(input_length, output_length);
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 300);
+                let timeout = Duration::from_secs(output_length / 10 + 5);
 
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
                     Ok(response) => {
                         let e_time = get_timestamp();
 
-                        let mut metrics = P::parse_response(response);
+                        let mut metrics = Protocol::parse_response(response);
                         metrics.insert("s_time".to_string(), s_time.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
 
@@ -251,13 +273,6 @@ pub async fn spawn_request_loop_with_timestamp<P: 'static + Protocol + Send>(
             });
 
             tx.send_async(request_handle).await.unwrap();
-            let next_timestamp = dataset.next_timestamp();
-            let current_timestamp = get_timestamp();
-            if next_timestamp > current_timestamp + 1 {
-                sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
-            } else {
-                yield_now().await;
-            }
         }
     });
     handle

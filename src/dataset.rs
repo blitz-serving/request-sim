@@ -46,7 +46,7 @@ impl Dataset {
         }
 
         let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / requests.len() as u64;
+            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
 
         Self {
             dataset_size: requests.len(),
@@ -93,7 +93,7 @@ impl Dataset {
         }
 
         let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / requests.len() as u64;
+            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
 
         Self {
             dataset_size: requests.len(),
@@ -109,9 +109,9 @@ impl Dataset {
             .into_iter()
             .map(|_| (rand::random::<u64>() % 100, rand::random::<u64>() % 100))
             .collect::<Vec<_>>();
-        let timestamps = (0..1000).into_iter().collect::<Vec<_>>();
+        let timestamps = (0..1000).into_iter().map(|i| i * 1000).collect::<Vec<_>>();
         let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / requests.len() as u64;
+            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
 
         Self {
             dataset_size: requests.len(),
@@ -127,15 +127,23 @@ impl Dataset {
         self.requests[next_index % self.dataset_size]
     }
 
-    pub fn next_timestamp(&self) -> u64 {
+    /// Returned tuple is (timestamp, input_length, output_length).
+    pub fn next_request_with_timestamp(&self) -> (u64, u64, u64) {
         let next_index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let round = next_index / self.dataset_size;
         let index = next_index % self.dataset_size;
-        round as u64 * self.round_time + self.timestamps[index % self.dataset_size]
+
+        let (input, output) = self.requests[next_index % self.dataset_size];
+        let ts = round as u64 * self.round_time + self.timestamps[index % self.dataset_size];
+        (ts, input, output)
     }
 
     pub fn dataset_size(&self) -> usize {
         self.dataset_size
+    }
+
+    pub fn round_time(&self) -> u64 {
+        self.round_time
     }
 }
 
@@ -171,17 +179,13 @@ mod tests {
 
     #[test]
     fn test_dataset_timestamp() {
-        let dataset_path = std::path::Path::new("./data/BurstGPT_without_fails_2.csv");
-        if dataset_path.exists() {
-            let dataset = Dataset::load_burstgpt_csv(dataset_path.to_str().unwrap(), false);
-            let dataset_size = dataset.dataset_size();
-            for _ in 0..(dataset_size - 1) {
-                dataset.next_timestamp();
-            }
-            println!("{}", dataset.next_timestamp());
-            println!("{}", dataset.next_timestamp());
-        } else {
-            eprintln!("Dataset not found");
+        let dataset = Dataset::load_mock_dataset();
+        let dataset_size = dataset.dataset_size();
+        for _ in 0..(dataset_size - 5) {
+            dataset.next_request_with_timestamp();
+        }
+        for _ in 0..10 {
+            println!("{}", dataset.next_request_with_timestamp());
         }
     }
 }

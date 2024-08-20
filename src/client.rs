@@ -2,10 +2,13 @@ use clap::Parser;
 use request_sim::{
     dataset::Dataset,
     protocols::{DistserveProtocol, MockProtocol, TgiProtocol, VllmProtocol},
-    requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
+    requester::{
+        create_gamma_interval_generator, report_loop, spawn_request_loop,
+        spawn_request_loop_with_timestamp,
+    },
 };
 use tokenizers::Tokenizer;
-use tokio::{spawn, sync::oneshot};
+use tokio::{spawn, sync::oneshot, task::JoinHandle};
 
 #[derive(Parser)]
 struct Args {
@@ -33,21 +36,26 @@ struct Args {
     #[clap(long, required = true)]
     dataset_path: String,
 
-    /// Request rate.
+    /// Request rate (request per second). It always takes effect whether `replay_mode` is enabled or not.
     #[clap(long, short, default_value_t = 1.0)]
     request_rate: f64,
 
-    /// Coefficient of variation of the request rate
+    /// Coefficient of variation of the request rate. It takes effect only when `replay_mode` is enabled.
     #[clap(long, short, default_value_t = 0.5)]
     cv: f64,
 
     /// Output path
-    #[clap(long, short, default_value = "/tmp/client_logs/output.jsonl")]
+    #[clap(long, short, default_value = "/tmp/output.jsonl")]
     output_path: String,
 
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
+
+    /// If the replay_mode is enabled, the client will send requests following
+    /// the sequence and input/output length of provided dataset above.
+    #[clap(long, short, default_value_t = false)]
+    replay_mode: bool,
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
@@ -96,6 +104,7 @@ async fn async_main(args: Args) {
         dataset_path,
         time_in_secs,
         protocol,
+        replay_mode,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -106,59 +115,104 @@ async fn async_main(args: Args) {
         .await
         .unwrap();
 
-    let (tx, rx) = flume::unbounded();
+    let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
         DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str(), true),
         DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str(), true),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
-    let interval_generator = create_gamma_interval_generator(request_rate, cv);
     let (stop_tx, stop_rx) = oneshot::channel();
-    let requester_handle = match protocol {
+    let requester_handle: JoinHandle<()> = match protocol {
         Protocol::Tgi => {
             let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(
-                endpoint,
-                dataset,
-                tgi_protocol,
-                interval_generator,
-                tx,
-                stop_rx,
-            )
+            if replay_mode {
+                spawn_request_loop_with_timestamp(
+                    endpoint,
+                    dataset,
+                    tgi_protocol,
+                    request_rate,
+                    response_tx,
+                    stop_rx,
+                )
+            } else {
+                spawn_request_loop(
+                    endpoint,
+                    dataset,
+                    tgi_protocol,
+                    create_gamma_interval_generator(request_rate, cv),
+                    response_tx,
+                    stop_rx,
+                )
+            }
         }
         Protocol::Vllm => {
             let vllm_protocol = VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(
-                endpoint,
-                dataset,
-                vllm_protocol,
-                interval_generator,
-                tx,
-                stop_rx,
-            )
+            if replay_mode {
+                spawn_request_loop_with_timestamp(
+                    endpoint,
+                    dataset,
+                    vllm_protocol,
+                    request_rate,
+                    response_tx,
+                    stop_rx,
+                )
+            } else {
+                spawn_request_loop(
+                    endpoint,
+                    dataset,
+                    vllm_protocol,
+                    create_gamma_interval_generator(request_rate, cv),
+                    response_tx,
+                    stop_rx,
+                )
+            }
         }
         Protocol::Distserve => {
             let distserve_protocol =
                 DistserveProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(
-                endpoint,
-                dataset,
-                distserve_protocol,
-                interval_generator,
-                tx,
-                stop_rx,
-            )
+            if replay_mode {
+                spawn_request_loop_with_timestamp(
+                    endpoint,
+                    dataset,
+                    distserve_protocol,
+                    request_rate,
+                    response_tx,
+                    stop_rx,
+                )
+            } else {
+                spawn_request_loop(
+                    endpoint,
+                    dataset,
+                    distserve_protocol,
+                    create_gamma_interval_generator(request_rate, cv),
+                    response_tx,
+                    stop_rx,
+                )
+            }
         }
-        Protocol::Mock => spawn_request_loop(
-            endpoint,
-            dataset,
-            MockProtocol,
-            interval_generator,
-            tx,
-            stop_rx,
-        ),
+        Protocol::Mock => {
+            if replay_mode {
+                spawn_request_loop_with_timestamp(
+                    endpoint,
+                    dataset,
+                    MockProtocol,
+                    request_rate,
+                    response_tx,
+                    stop_rx,
+                )
+            } else {
+                spawn_request_loop(
+                    endpoint,
+                    dataset,
+                    MockProtocol,
+                    create_gamma_interval_generator(request_rate, cv),
+                    response_tx,
+                    stop_rx,
+                )
+            }
+        }
     };
-    let reporter_handle = spawn(report_loop(output_file, rx));
+    let reporter_handle = spawn(report_loop(output_file, response_rx));
 
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
     stop_tx.send(()).unwrap();
