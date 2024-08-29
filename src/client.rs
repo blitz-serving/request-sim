@@ -54,6 +54,8 @@ struct Args {
 
     /// If the replay_mode is enabled, the client will send requests following
     /// the sequence and input/output length of provided dataset above.
+    ///
+    /// Note that if the replay_mode is enabled, the cv will be ignored and the requests will not be shuffled.
     #[clap(long, short, default_value_t = false)]
     replay_mode: bool,
 }
@@ -117,8 +119,8 @@ async fn async_main(args: Args) {
 
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
-        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str(), true),
-        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str(), true),
+        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str(), !replay_mode),
+        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str(), !replay_mode),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
     let (stop_tx, stop_rx) = oneshot::channel();
