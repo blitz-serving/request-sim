@@ -3,7 +3,7 @@ use request_sim::{
     dataset::Dataset,
     protocols::{DistserveProtocol, MockProtocol, TgiProtocol, VllmProtocol},
     requester::{
-        create_gamma_interval_generator, report_loop, spawn_request_loop,
+        create_gamma_interval_generator, init_error_log, report_loop, spawn_request_loop,
         spawn_request_loop_with_timestamp,
     },
 };
@@ -25,32 +25,16 @@ struct Args {
     endpoint: String,
 
     /// Dataset type. Either "mooncake", "burstgpt" or "mock".
-    #[clap(long, required = true, value_parser = parse_dataset_type)]
+    #[clap(long, short,required = true, value_parser = parse_dataset_type)]
     dataset_type: DatasetType,
 
     /// Protocol type. Either "tgi", "vllm", "distserve" or "mock".
     #[clap(long, short, default_value = "tgi",  value_parser = parse_protocol)]
     protocol: Protocol,
 
-    /// Path to dataset file.
-    #[clap(long, required = true)]
-    dataset_path: String,
-
-    /// Request rate (request per second). It always takes effect whether `replay_mode` is enabled or not.
-    #[clap(long, short, default_value_t = 1.0)]
-    request_rate: f64,
-
-    /// Coefficient of variation of the request rate. It takes effect only when `replay_mode` is enabled.
-    #[clap(long, short, default_value_t = 0.5)]
-    cv: f64,
-
-    /// Output path
-    #[clap(long, short, default_value = "/tmp/output.jsonl")]
-    output_path: String,
-
-    /// Requester run time.
-    #[clap(long, short, default_value_t = 60)]
-    time_in_secs: u64,
+    /// Path to dataset file. Required when dataset_type is not "mock".
+    #[clap(long)]
+    dataset_path: Option<String>,
 
     /// If the replay_mode is enabled, the client will send requests following
     /// the sequence and input/output length of provided dataset above.
@@ -58,6 +42,26 @@ struct Args {
     /// Note that if the replay_mode is enabled, the cv will be ignored and the requests will not be shuffled.
     #[clap(long, short, default_value_t = false)]
     replay_mode: bool,
+
+    /// Request rate (request per second). It always takes effect whether `replay_mode` is enabled or not.
+    #[clap(long, default_value_t = 1.0)]
+    request_rate: f64,
+
+    /// Coefficient of variation of the request rate. It takes effect only when `replay_mode` is disabled.
+    #[clap(long, default_value_t = 0.5)]
+    cv: f64,
+
+    /// Output path.
+    #[clap(long, short, default_value = "./log/output.jsonl")]
+    output_path: String,
+
+    /// Error log path.
+    #[clap(long, short, default_value = "./log/error.log")]
+    error_log_path: String,
+
+    /// Requester run time.
+    #[clap(long, short, default_value_t = 60)]
+    time_in_secs: u64,
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
@@ -102,6 +106,7 @@ async fn async_main(args: Args) {
         request_rate,
         cv,
         output_path,
+        error_log_path,
         dataset_type,
         dataset_path,
         time_in_secs,
@@ -113,14 +118,22 @@ async fn async_main(args: Args) {
         .create(true)
         .write(true)
         .truncate(true)
-        .open(output_path)
+        .open(&output_path)
         .await
         .unwrap();
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&error_log_path)
+        .await
+        .unwrap();
+    init_error_log(error_log_path).await;
 
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
-        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(dataset_path.as_str(), !replay_mode),
-        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(dataset_path.as_str(), !replay_mode),
+        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
+        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
     let (stop_tx, stop_rx) = oneshot::channel();
