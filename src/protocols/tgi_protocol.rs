@@ -37,7 +37,7 @@ impl Protocol for TgiProtocol {
             .decode(input_token_ids.as_slice(), false)
             .unwrap();
         let json_body =
-            serde_json::json!({"input":input,"parameter":{"max_new_tokens":output_token_length}});
+            serde_json::json!({"inputs":input,"parameters":{"max_new_tokens":output_token_length}});
         json_body.to_string()
     }
 

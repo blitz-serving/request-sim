@@ -59,6 +59,7 @@ async fn request_with_timeout(
     json_body: String,
     timeout: Duration,
 ) -> Result<Response, reqwest::Error> {
+    println!("{}", json_body);
     Ok(reqwest::Client::builder()
         .no_proxy()
         .timeout(timeout)
@@ -76,22 +77,29 @@ async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
     }
 }
 
+static ERROR_LOG_FILE: OnceLock<String> = OnceLock::new();
+
+pub async fn init_error_log(error_log_path: String) {
+    ERROR_LOG_FILE.get_or_init(|| error_log_path);
+}
+
 async fn append_error_log(msg: String) {
-    let error_file_path = "/tmp/error.log";
-    let mut error_file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(error_file_path)
-        .await
-        .expect("Failed to open error log file");
-    error_file
-        .write(msg.as_bytes())
-        .await
-        .expect("Failed to write to error log file");
-    error_file
-        .flush()
-        .await
-        .expect("Failed to flush error log file");
+    if let Some(error_file_path) = ERROR_LOG_FILE.get() {
+        let mut error_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(error_file_path)
+            .await
+            .expect("Failed to open error log file");
+        error_file
+            .write(msg.as_bytes())
+            .await
+            .expect("Failed to write to error log file");
+        error_file
+            .flush()
+            .await
+            .expect("Failed to flush error log file");
+    }
 }
 
 /// Send requests in the open loop way.

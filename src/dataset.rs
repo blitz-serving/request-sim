@@ -107,7 +107,12 @@ impl Dataset {
     pub fn load_mock_dataset() -> Self {
         let requests = (0..1000)
             .into_iter()
-            .map(|_| (rand::random::<u64>() % 100, rand::random::<u64>() % 100))
+            .map(|_| {
+                (
+                    rand::random::<u64>() % 100 + 1,
+                    rand::random::<u64>() % 100 + 1,
+                )
+            })
             .collect::<Vec<_>>();
         let timestamps = (0..1000).into_iter().map(|i| i * 1000).collect::<Vec<_>>();
         let round_time =
