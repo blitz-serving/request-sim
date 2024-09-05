@@ -59,7 +59,6 @@ async fn request_with_timeout(
     json_body: String,
     timeout: Duration,
 ) -> Result<Response, reqwest::Error> {
-    println!("{}", json_body);
     Ok(reqwest::Client::builder()
         .no_proxy()
         .timeout(timeout)
@@ -129,7 +128,9 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
 
     spawn(async move {
         let mut timestamp = get_timestamp();
+        let mut count = 0u64;
         loop {
+            count += 1;
             if stopped.try_recv().is_ok() {
                 break;
             }
@@ -139,11 +140,18 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 100);                
-
+                let timeout = Duration::from_secs(output_length / 10 + 100);
+                println!(
+                    "Send request  {:<3} input {:<4} output {:<4}",
+                    count, input_length, output_length
+                );
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
                     Ok(response) => {
+                        println!(
+                            "Recv request  {:<3} input {:<4} output {:<4}",
+                            count, input_length, output_length
+                        );
                         let e_time = get_timestamp();
 
                         let mut metrics = P::parse_response(response);
@@ -163,6 +171,10 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
                         }
                     }
                     Err(err) => {
+                        println!(
+                            "Error request {:<3} input {:<4} output {:<4}",
+                            count, input_length, output_length
+                        );
                         let msg = format!(
                             "{},{}, Request with input {} output {} error: {} ({}:{})\n",
                             s_time,
@@ -213,7 +225,9 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
         dataset.dataset_size() as f64 * 1000.0 / (request_rate * dataset.round_time() as f64);
 
     spawn(async move {
+        let mut count = 0u64;
         loop {
+            count += 1;
             if stopped.try_recv().is_ok() {
                 break;
             }
@@ -235,10 +249,17 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
                 let timeout = Duration::from_secs(output_length / 10 + 100);
-
+                println!(
+                    "Send request  {:<3} input {:<4} output {:<4}",
+                    count, input_length, output_length
+                );
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
                     Ok(response) => {
+                        println!(
+                            "Recv request  {:<3} input {:<4} output {:<4}",
+                            count, input_length, output_length
+                        );
                         let e_time = get_timestamp();
 
                         let mut metrics = Protocol::parse_response(response);
@@ -258,6 +279,10 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
                         }
                     }
                     Err(err) => {
+                        println!(
+                            "Error request {:<3} input {:<4} output {:<4}",
+                            count, input_length, output_length
+                        );
                         let msg = format!(
                             "{},{}, Request with input {} output {} error: {} ({}:{})\n",
                             s_time,
