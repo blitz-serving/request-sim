@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, future::Future};
 
-use rand::{thread_rng, Rng};
 use reqwest::Response;
 use tokenizers::Tokenizer;
 
@@ -9,33 +8,24 @@ use super::Protocol;
 pub struct StProtocol {
     tokenizer: Tokenizer,
 
-    /// Start of the token id range.
-    start: u32,
-
-    /// End of the token id range.
-    end: u32,
+    target_token: u32,
 }
 
 impl StProtocol {
     /// Current the randomly generated token ids are in the range of 0..10000.
     pub fn new(tokenizer: Tokenizer) -> Self {
+        let target_token = tokenizer.encode("Hello World", true).unwrap().get_ids()[1];
         Self {
             tokenizer,
-            start: 0,
-            end: 10000,
+            target_token,
         }
     }
 }
 
 impl Protocol for StProtocol {
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String {
-        let input_token_ids = (0..input_token_length)
-            .map(|_| thread_rng().gen_range(self.start..self.end))
-            .collect::<Vec<_>>();
-        let input = self
-            .tokenizer
-            .decode(input_token_ids.as_slice(), false)
-            .unwrap();
+        let input = vec![self.target_token; input_token_length as usize];
+        let input = self.tokenizer.decode(&input, false).unwrap();
         let json_body =
             serde_json::json!({"inputs":input,"parameters":{"max_new_tokens":output_token_length}});
         json_body.to_string()
@@ -116,6 +106,7 @@ impl Protocol for StProtocol {
 
 #[cfg(test)]
 mod tests {
+    use rand::{thread_rng, Rng};
     use serde_json::json;
 
     use super::*;
@@ -148,6 +139,15 @@ mod tests {
         } else {
             print!("Tokenizer file not found");
         }
+    }
+
+    #[tokio::test]
+    async fn test_st_protocol() {
+        let tokenizer =
+            Tokenizer::from_file("/nvme/huggingface/hub/Llama-2-7b-hf/tokenizer.json").unwrap();
+        let st_protocol = StProtocol::new(tokenizer);
+        let json_body = st_protocol.request_json_body(100, 100);
+        println!("{}", json_body);
     }
 
     #[tokio::test]
