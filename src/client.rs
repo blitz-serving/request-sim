@@ -1,7 +1,7 @@
 use clap::Parser;
 use request_sim::{
     dataset::Dataset,
-    protocols::{DistserveProtocol, MockProtocol, TgiProtocol, VllmProtocol},
+    protocols::{DistserveProtocol, MockProtocol, StProtocol, VllmProtocol},
     requester::{
         create_gamma_interval_generator, init_error_log, report_loop, spawn_request_loop,
         spawn_request_loop_with_timestamp,
@@ -24,15 +24,15 @@ struct Args {
     #[clap(long, required = true)]
     endpoint: String,
 
-    /// Dataset type. Either "mooncake", "burstgpt" or "mock".
-    #[clap(long, short,required = true, value_parser = parse_dataset_type)]
-    dataset_type: DatasetType,
-
-    /// Protocol type. Either "tgi", "vllm", "distserve" or "mock".
-    #[clap(long, short, default_value = "tgi",  value_parser = parse_protocol)]
+    /// Protocol type. Either "st", "vllm", "distserve" or "mock".
+    #[clap(long, short, required = true, value_parser = parse_protocol)]
     protocol: Protocol,
 
-    /// Path to dataset file. Required when dataset_type is not "mock".
+    /// Dataset type. Either "mooncake", "burstgpt" or "mock".
+    #[clap(long, short, required = true, value_parser = parse_dataset_type)]
+    dataset_type: DatasetType,
+
+    /// Path to dataset file. The dataset file will be accessed only when dataset_type is not "mock".
     #[clap(long)]
     dataset_path: Option<String>,
 
@@ -66,7 +66,7 @@ struct Args {
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
     match s.to_lowercase().as_ref() {
-        "tgi" => Ok(Protocol::Tgi),
+        "st" => Ok(Protocol::St),
         "vllm" => Ok(Protocol::Vllm),
         "distserve" => Ok(Protocol::Distserve),
         "mock" => Ok(Protocol::Mock),
@@ -76,7 +76,7 @@ fn parse_protocol(s: &str) -> Result<Protocol, String> {
 
 #[derive(Debug, Clone, Copy)]
 enum Protocol {
-    Tgi,
+    St,
     Vllm,
     Distserve,
     Mock,
@@ -138,13 +138,13 @@ async fn async_main(args: Args) {
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     let requester_handle: JoinHandle<()> = match protocol {
-        Protocol::Tgi => {
-            let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
+        Protocol::St => {
+            let st_protocol = StProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
             if replay_mode {
                 spawn_request_loop_with_timestamp(
                     endpoint,
                     dataset,
-                    tgi_protocol,
+                    st_protocol,
                     request_rate,
                     response_tx,
                     stop_rx,
@@ -153,7 +153,7 @@ async fn async_main(args: Args) {
                 spawn_request_loop(
                     endpoint,
                     dataset,
-                    tgi_protocol,
+                    st_protocol,
                     create_gamma_interval_generator(request_rate, cv),
                     response_tx,
                     stop_rx,

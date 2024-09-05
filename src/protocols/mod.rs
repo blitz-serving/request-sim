@@ -4,12 +4,12 @@ use reqwest::Response;
 
 pub mod distserve_protocol;
 pub mod mock_protocol;
-pub mod tgi_protocol;
+pub mod st_protocol;
 pub mod vllm_protocol;
 
 pub use distserve_protocol::DistserveProtocol;
 pub use mock_protocol::MockProtocol;
-pub use tgi_protocol::TgiProtocol;
+pub use st_protocol::StProtocol;
 pub use vllm_protocol::VllmProtocol;
 
 pub trait Protocol {

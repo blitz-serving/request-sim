@@ -6,7 +6,7 @@ use tokenizers::Tokenizer;
 
 use super::Protocol;
 
-pub struct TgiProtocol {
+pub struct StProtocol {
     tokenizer: Tokenizer,
 
     /// Start of the token id range.
@@ -16,7 +16,7 @@ pub struct TgiProtocol {
     end: u32,
 }
 
-impl TgiProtocol {
+impl StProtocol {
     /// Current the randomly generated token ids are in the range of 0..10000.
     pub fn new(tokenizer: Tokenizer) -> Self {
         Self {
@@ -27,7 +27,7 @@ impl TgiProtocol {
     }
 }
 
-impl Protocol for TgiProtocol {
+impl Protocol for StProtocol {
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String {
         let input_token_ids = (0..input_token_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
@@ -98,16 +98,16 @@ impl Protocol for TgiProtocol {
 
     fn parse_response_async(response: Response) -> impl Future<Output = BTreeMap<String, String>> {
         #[derive(Debug, serde::Deserialize)]
-        struct TgiResponse {
+        struct StResponse {
             lags: Vec<f64>,
         }
 
         async move {
-            let tgi_response = response.json::<TgiResponse>().await.unwrap();
+            let st_response = response.json::<StResponse>().await.unwrap();
             let mut map = BTreeMap::new();
             map.insert(
                 "lags".to_string(),
-                serde_json::to_string(&tgi_response.lags).unwrap(),
+                serde_json::to_string(&st_response.lags).unwrap(),
             );
             map
         }
@@ -158,7 +158,7 @@ mod tests {
                 .body(json!({"lags":[0.1,0.2,0.3]}).to_string())
                 .unwrap(),
         );
-        let parsed = TgiProtocol::parse_response_async(response).await;
+        let parsed = StProtocol::parse_response_async(response).await;
         println!("{:?}", parsed);
     }
 }

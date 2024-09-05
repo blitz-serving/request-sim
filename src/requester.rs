@@ -139,7 +139,7 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 100);
+                let timeout = Duration::from_secs(output_length / 10 + 100);                
 
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
