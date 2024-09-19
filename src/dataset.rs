@@ -4,7 +4,10 @@ use std::{
     sync::atomic::AtomicUsize,
 };
 
+use http::header;
 use rand::seq::SliceRandom;
+use chrono::{NaiveDate,NaiveDateTime};
+use tokio::time::error::Elapsed;
 
 pub struct Dataset {
     dataset_size: usize,
@@ -104,6 +107,7 @@ impl Dataset {
         }
     }
 
+    // ts: mooncake, input&output length: burstgpt
     pub fn load_mooncake_ts_burst_data(mooncake_path: &str, burstgpt_path: &str, shuffle: bool) -> Self {
         #[derive(serde::Deserialize)]
         #[allow(dead_code)]
@@ -154,6 +158,51 @@ impl Dataset {
         let round_time =
             timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
 
+        Self {
+            dataset_size: requests.len(),
+            round_time,
+            requests,
+            timestamps,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+
+    pub fn load_azure_csv(path: &str, shuffle: bool) -> Self {
+       let mut requests = Vec::new();
+       let mut timestamps = Vec::new();
+       let mut reader = BufReader::new(File::open(path).unwrap());
+
+       // skip header
+       let mut header = String::new();
+       reader.read_line(&mut header).unwrap();
+
+    let mut initial_timestamp: Option<NaiveDateTime> = None;
+
+       for line in reader.lines() {
+        let parts = line
+            .unwrap()
+            .split(',')
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let timestamp_str = &parts[0];
+        let timestamp = NaiveDateTime::parse_from_str(&timestamp_str, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+        if initial_timestamp.is_none() {
+            initial_timestamp = Some(timestamp);
+        }
+        let elapsed = timestamp - initial_timestamp.unwrap();
+        let elapsed_millis = elapsed.num_milliseconds() as u64;
+
+        let input_length = parts[1].parse().unwrap();
+        let output_length = parts[2].parse().unwrap();
+        timestamps.push(elapsed_millis);
+        requests.push((input_length, output_length));
+       } 
+
+       if shuffle {
+            requests.shuffle(&mut rand::thread_rng());
+        }
+        let round_time = timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
         Self {
             dataset_size: requests.len(),
             round_time,
@@ -250,6 +299,19 @@ mod tests {
         }
         for _ in 0..10 {
             println!("{}", dataset.next_request_with_timestamp().0);
+        }
+    }
+
+    #[test]
+    fn test_load_azure() {
+        let dataset_path = std::path::Path::new("/nvme/ly/dataset/AzureLLMInferenceTrace_conv.csv");
+        if dataset_path.exists() {
+            let dataset = Dataset::load_azure_csv(dataset_path.to_str().unwrap(), false);
+            for _ in 0..10 {
+                println!("(timestamp, input, output): {:?}", dataset.next_request_with_timestamp());
+            }
+        } else {
+            eprintln!("Dataset not found");
         }
     }
 }

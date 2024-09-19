@@ -90,6 +90,7 @@ fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
     match s.to_lowercase().as_ref() {
         "mooncake" => Ok(DatasetType::Mooncake),
         "burstgpt" => Ok(DatasetType::Burstgpt),
+        "azure" => Ok(DatasetType::Azure),
         "mooncake_sampled" => Ok(DatasetType::MooncakeSampled),
         "mock" => Ok(DatasetType::Mock),
         _ => Err("Invalid dataset type.".to_string()),
@@ -100,6 +101,7 @@ fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
 enum DatasetType {
     Mooncake,
     Burstgpt,
+    Azure,
     MooncakeSampled,
     Mock,
 }
@@ -141,6 +143,7 @@ async fn async_main(args: Args) {
     let dataset = match dataset_type {
         DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
         DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
+        DatasetType::Azure => Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode),
         DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(&dataset_path.unwrap(), &second_dataset_path.unwrap(), !replay_mode),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
