@@ -28,14 +28,18 @@ struct Args {
     #[clap(long, short, required = true, value_parser = parse_protocol)]
     protocol: Protocol,
 
-    /// Dataset type. Either "mooncake", "burstgpt" or "mock".
+    /// Dataset type. Either "mooncake", "burstgpt" "mooncake_sampled" or "mock".
     #[clap(long, short, required = true, value_parser = parse_dataset_type)]
     dataset_type: DatasetType,
-
+    
     /// Path to dataset file. The dataset file will be accessed only when dataset_type is not "mock".
     #[clap(long)]
     dataset_path: Option<String>,
 
+    /// Path to second dataset. The second dataset file will be accessed only when dataset_type is "mooncake_sampled".
+    #[clap(long)]
+    second_dataset_path: Option<String>,
+    
     /// If the replay_mode is enabled, the client will send requests following
     /// the sequence and input/output length of provided dataset above.
     ///
@@ -86,6 +90,7 @@ fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
     match s.to_lowercase().as_ref() {
         "mooncake" => Ok(DatasetType::Mooncake),
         "burstgpt" => Ok(DatasetType::Burstgpt),
+        "mooncake_sampled" => Ok(DatasetType::MooncakeSampled),
         "mock" => Ok(DatasetType::Mock),
         _ => Err("Invalid dataset type.".to_string()),
     }
@@ -95,6 +100,7 @@ fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
 enum DatasetType {
     Mooncake,
     Burstgpt,
+    MooncakeSampled,
     Mock,
 }
 
@@ -109,6 +115,7 @@ async fn async_main(args: Args) {
         error_log_path,
         dataset_type,
         dataset_path,
+        second_dataset_path,
         time_in_secs,
         protocol,
         replay_mode,
@@ -134,6 +141,7 @@ async fn async_main(args: Args) {
     let dataset = match dataset_type {
         DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
         DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
+        DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(&dataset_path.unwrap(), &second_dataset_path.unwrap(), !replay_mode),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
     let (stop_tx, stop_rx) = oneshot::channel();

@@ -104,6 +104,65 @@ impl Dataset {
         }
     }
 
+    pub fn load_mooncake_ts_burst_data(mooncake_path: &str, burstgpt_path: &str, shuffle: bool) -> Self {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        pub struct MoonCakeInfoRecord {
+            pub timestamp: u64,
+            pub input_length: u64,
+            pub output_length: u64,
+            pub hash_ids: Vec<u64>,
+        }
+
+        let mut requests = Vec::new();
+        let mut timestamps = Vec::new();
+
+        let file_mooncake = File::open(mooncake_path).unwrap();
+        for line in BufReader::new(file_mooncake).lines() {
+            let record: MoonCakeInfoRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
+            timestamps.push(record.timestamp);
+        }
+        // fill requests with burstgpt data, each mooncake request has a corresponding burstgpt request
+        let file_burstgpt = File::open(burstgpt_path).unwrap();
+        let mut reader = BufReader::new(file_burstgpt);
+        let mut header = String::new();
+        reader.read_line(&mut header).unwrap();
+        let mut burstgpt_requests = Vec::new();
+        for line in reader.lines() {
+            let parts = line
+                .unwrap()
+                .split(',')
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            let input_length = parts[2].parse().unwrap();
+            let output_length = parts[3].parse().unwrap();
+            let log_type = &parts[5];
+            if log_type == "Conversation log" {
+                burstgpt_requests.push((input_length, output_length));
+            }
+        }
+        let mut burstgpt_iter = burstgpt_requests.iter();
+        for _ in timestamps.iter() {
+            let (input_length, output_length) = burstgpt_iter.next().unwrap();
+            requests.push((*input_length, *output_length));
+        }
+
+        if shuffle {
+            requests.shuffle(&mut rand::thread_rng());
+        }
+
+        let round_time =
+            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
+
+        Self {
+            dataset_size: requests.len(),
+            round_time,
+            requests,
+            timestamps,
+            next: AtomicUsize::new(0),
+        }
+    }
+
     pub fn load_mock_dataset() -> Self {
         let requests = (0..1000)
             .into_iter()
