@@ -8,7 +8,11 @@ fn main() {
     let dataset = match args.dataset_name.to_lowercase().as_str() {
         "mooncake" => dataset::Dataset::load_mooncake_jsonl(&args.dataset_path, true),
         "burstgpt" => dataset::Dataset::load_burstgpt_csv(&args.dataset_path, true),
-        "mooncake_sampled" => dataset::Dataset::load_mooncake_ts_burst_data(&args.dataset_path, "/nvme/huggingface/datasets/burstgpt-v2.csv", true),
+        "mooncake_sampled" => dataset::Dataset::load_mooncake_ts_burst_data(
+            &args.dataset_path,
+            "/nvme/huggingface/datasets/burstgpt-v2.csv",
+            true,
+        ),
         _ => panic!("Invalid dataset name"),
     };
     let inverval_generator = create_gamma_interval_generator(args.request_rate, args.cv);

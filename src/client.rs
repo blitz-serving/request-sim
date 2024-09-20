@@ -16,9 +16,9 @@ struct Args {
     #[clap(long, required = true)]
     tokenizer: String,
 
-    /// Worker threads to use for tokio runtime.
-    #[clap(long, default_value_t = 10)]
-    threads: usize,
+    /// Worker threads to use for tokio runtime. Default is set to the number of cores.
+    #[clap(long)]
+    threads: Option<usize>,
 
     /// Endpoint URL to handle http request.
     #[clap(long, required = true)]
@@ -31,7 +31,7 @@ struct Args {
     /// Dataset type. Either "mooncake", "burstgpt" "mooncake_sampled" or "mock".
     #[clap(long, short, required = true, value_parser = parse_dataset_type)]
     dataset_type: DatasetType,
-    
+
     /// Path to dataset file. The dataset file will be accessed only when dataset_type is not "mock".
     #[clap(long)]
     dataset_path: Option<String>,
@@ -39,7 +39,7 @@ struct Args {
     /// Path to second dataset. The second dataset file will be accessed only when dataset_type is "mooncake_sampled".
     #[clap(long)]
     second_dataset_path: Option<String>,
-    
+
     /// If the replay_mode is enabled, the client will send requests following
     /// the sequence and input/output length of provided dataset above.
     ///
@@ -47,9 +47,15 @@ struct Args {
     #[clap(long, short, default_value_t = false)]
     replay_mode: bool,
 
-    /// Request rate (request per second). It always takes effect whether `replay_mode` is enabled or not.
-    #[clap(long, default_value_t = 1.0)]
-    request_rate: f64,
+    /// Request rate (request per second). It only takes effect when `replay_mode` is disabled.
+    #[clap(long)]
+    request_rate: Option<f64>,
+
+    /// Scale factor for the request rate. It only takes effect when `replay_mode` is enabled.
+    ///
+    /// For example, if the scale factor is 2 the client will send requests at twice the rate of the original data set.
+    #[clap(long)]
+    scale_factor: Option<f64>,
 
     /// Coefficient of variation of the request rate. It takes effect only when `replay_mode` is disabled.
     #[clap(long, default_value_t = 0.5)]
@@ -111,16 +117,17 @@ async fn async_main(args: Args) {
         tokenizer,
         threads: _,
         endpoint,
-        request_rate,
-        cv,
-        output_path,
-        error_log_path,
+        protocol,
         dataset_type,
         dataset_path,
         second_dataset_path,
-        time_in_secs,
-        protocol,
         replay_mode,
+        request_rate,
+        scale_factor,
+        cv,
+        output_path,
+        error_log_path,
+        time_in_secs,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -144,7 +151,11 @@ async fn async_main(args: Args) {
         DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
         DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
         DatasetType::Azure => Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(&dataset_path.unwrap(), &second_dataset_path.unwrap(), !replay_mode),
+        DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(
+            &dataset_path.unwrap(),
+            &second_dataset_path.unwrap(),
+            !replay_mode,
+        ),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
     let (stop_tx, stop_rx) = oneshot::channel();
@@ -156,7 +167,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     st_protocol,
-                    request_rate,
+                    scale_factor.unwrap(),
                     response_tx,
                     stop_rx,
                 )
@@ -165,7 +176,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     st_protocol,
-                    create_gamma_interval_generator(request_rate, cv),
+                    create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,
                     stop_rx,
                 )
@@ -178,7 +189,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     vllm_protocol,
-                    request_rate,
+                    scale_factor.unwrap(),
                     response_tx,
                     stop_rx,
                 )
@@ -187,7 +198,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     vllm_protocol,
-                    create_gamma_interval_generator(request_rate, cv),
+                    create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,
                     stop_rx,
                 )
@@ -201,7 +212,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     distserve_protocol,
-                    request_rate,
+                    scale_factor.unwrap(),
                     response_tx,
                     stop_rx,
                 )
@@ -210,7 +221,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     distserve_protocol,
-                    create_gamma_interval_generator(request_rate, cv),
+                    create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,
                     stop_rx,
                 )
@@ -222,7 +233,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     MockProtocol,
-                    request_rate,
+                    scale_factor.unwrap(),
                     response_tx,
                     stop_rx,
                 )
@@ -231,7 +242,7 @@ async fn async_main(args: Args) {
                     endpoint,
                     dataset,
                     MockProtocol,
-                    create_gamma_interval_generator(request_rate, cv),
+                    create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,
                     stop_rx,
                 )
@@ -249,10 +260,13 @@ async fn async_main(args: Args) {
 
 fn main() {
     let args = Args::parse();
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads)
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async_main(args));
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    match args.threads {
+        Some(threads) => builder.worker_threads(threads),
+        None => &mut builder,
+    }
+    .enable_all()
+    .build()
+    .unwrap()
+    .block_on(async_main(args));
 }

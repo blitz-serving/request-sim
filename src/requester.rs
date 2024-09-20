@@ -207,22 +207,24 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
     endpoint: String,
     dataset: Dataset,
     protocol: Protocol,
-    request_rate: f64,
+    scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     BASETIME.get_or_init(|| Instant::now());
-
     fn get_timestamp() -> u64 {
         BASETIME.get().unwrap().elapsed().as_millis() as u64
     }
 
+    println!("Dataset request rate: {:.3} req/s", dataset.request_rate());
+    println!(
+        "Scaled request rate: {:.3} req/s",
+        dataset.request_rate() * scale_factor
+    );
+
     let (tx, rx) = flume::unbounded();
     let handle = spawn(wait_all(rx));
-
-    let scale_factor =
-        dataset.dataset_size() as f64 * 1000.0 / (request_rate * dataset.round_time() as f64);
 
     spawn(async move {
         let mut count = 0u64;
@@ -236,7 +238,7 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
             let endpoint = endpoint.clone();
             let current_timestamp = get_timestamp();
             let (ts, input_length, output_length) = dataset.next_request_with_timestamp();
-            let next_timestamp = (ts as f64 * scale_factor) as u64;
+            let next_timestamp = (ts as f64 / scale_factor) as u64;
 
             if next_timestamp > current_timestamp + 1 {
                 sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
