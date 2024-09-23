@@ -318,6 +318,7 @@ pub async fn report_loop(
         let line = serde_json::to_string(&metrics).unwrap();
         buf_writer.write_all(line.as_bytes()).await.unwrap();
         buf_writer.write_all(b"\n").await.unwrap();
+        buf_writer.flush().await.unwrap();
     }
 }
 
