@@ -76,6 +76,14 @@ struct Args {
     /// If prefill_only is enabled, the output length will be set to the 1.
     #[clap(long, default_value_t = false)]
     prefill_only: bool,
+
+    /// Only used when dataset_type is "fake".
+    #[clap(long)]
+    fake_input_length: Option<u64>,
+
+    /// Only used when dataset_type is "fake".
+    #[clap(long)]
+    fake_interval_ms: Option<u64>
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
@@ -102,6 +110,7 @@ fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
         "burstgpt" => Ok(DatasetType::Burstgpt),
         "azure" => Ok(DatasetType::Azure),
         "mooncake_sampled" => Ok(DatasetType::MooncakeSampled),
+        "fake" => Ok(DatasetType::Fake),
         "mock" => Ok(DatasetType::Mock),
         _ => Err("Invalid dataset type.".to_string()),
     }
@@ -114,6 +123,7 @@ enum DatasetType {
     Azure,
     MooncakeSampled,
     Mock,
+    Fake,
 }
 
 async fn async_main(args: Args) {
@@ -133,6 +143,8 @@ async fn async_main(args: Args) {
         error_log_path,
         time_in_secs,
         prefill_only,
+        fake_input_length,
+        fake_interval_ms,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -168,6 +180,7 @@ async fn async_main(args: Args) {
             !replay_mode,
             prefill_only,
         ),
+        DatasetType::Fake => Dataset::load_fake_dataset(fake_interval_ms.unwrap(), fake_input_length.unwrap(), prefill_only),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };
     let (stop_tx, stop_rx) = oneshot::channel();

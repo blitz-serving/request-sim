@@ -261,6 +261,34 @@ impl Dataset {
         }
     }
 
+    pub fn load_fake_dataset(interval_ms: u64, input_length:u64, prefill_only: bool) -> Self {
+        let requests = (0..1000)
+            .into_iter()
+            .map(|_| {
+                (
+                    input_length,
+                    if prefill_only {
+                        1
+                    } else {
+                        rand::random::<u64>() % 100 + 1
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let timestamps = (0..1000).into_iter().map(|i| i * interval_ms).collect::<Vec<_>>();
+        let round_time =
+            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
+
+        Self {
+            dataset_size: requests.len(),
+            requests,
+            timestamps,
+            round_time,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+
     pub fn next_request(&self) -> (u64, u64) {
         let next_index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.requests[next_index % self.dataset_size]
@@ -346,6 +374,17 @@ mod tests {
             }
         } else {
             eprintln!("Dataset not found");
+        }
+    }
+
+    #[test]
+    fn test_load_fake_dataset() {
+        let dataset = Dataset::load_fake_dataset(1000, 100, false);
+        for _ in 0..10 {
+            println!(
+                "(timestamp, input, output): {:?}",
+                dataset.next_request_with_timestamp()
+            );
         }
     }
 }
