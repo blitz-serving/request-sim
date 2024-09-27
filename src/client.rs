@@ -44,7 +44,7 @@ struct Args {
     /// the sequence and input/output length of provided dataset above.
     ///
     /// Note that if the replay_mode is enabled, the cv will be ignored and the requests will not be shuffled.
-    #[clap(long, short, default_value_t = false)]
+    #[clap(long, default_value_t = false)]
     replay_mode: bool,
 
     /// Request rate (request per second). It only takes effect when `replay_mode` is disabled.
@@ -72,6 +72,10 @@ struct Args {
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
+
+    /// If prefill_only is enabled, the output length will be set to the 1.
+    #[clap(long, default_value_t = false)]
+    prefill_only: bool,
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
@@ -128,6 +132,7 @@ async fn async_main(args: Args) {
         output_path,
         error_log_path,
         time_in_secs,
+        prefill_only,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -148,13 +153,20 @@ async fn async_main(args: Args) {
 
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
-        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::Azure => Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode),
+        DatasetType::Mooncake => {
+            Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode, prefill_only)
+        }
+        DatasetType::Burstgpt => {
+            Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode, prefill_only)
+        }
+        DatasetType::Azure => {
+            Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode, prefill_only)
+        }
         DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(
             &dataset_path.unwrap(),
             &second_dataset_path.unwrap(),
             !replay_mode,
+            prefill_only,
         ),
         DatasetType::Mock => Dataset::load_mock_dataset(),
     };

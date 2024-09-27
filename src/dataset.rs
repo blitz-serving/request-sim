@@ -23,7 +23,7 @@ pub struct Dataset {
 
 impl Dataset {
     /// If `shuffle` is true, the dataset will be shuffled and the requests returned by [`Self::next_request`] is in random order.
-    pub fn load_mooncake_jsonl(path: &str, shuffle: bool) -> Self {
+    pub fn load_mooncake_jsonl(path: &str, shuffle: bool, prefill_only: bool) -> Self {
         #[derive(serde::Deserialize)]
         #[allow(dead_code)]
         pub struct MooncakeRecord {
@@ -37,10 +37,19 @@ impl Dataset {
         let mut timestamps = Vec::new();
 
         let file = File::open(path).unwrap();
-        for line in BufReader::new(file).lines() {
-            let record: MooncakeRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
-            requests.push((record.input_length, record.output_length));
-            timestamps.push(record.timestamp);
+
+        if prefill_only {
+            for line in BufReader::new(file).lines() {
+                let record: MooncakeRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
+                requests.push((record.input_length, 1));
+                timestamps.push(record.timestamp);
+            }
+        } else {
+            for line in BufReader::new(file).lines() {
+                let record: MooncakeRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
+                requests.push((record.input_length, record.output_length));
+                timestamps.push(record.timestamp);
+            }
         }
 
         if shuffle {
@@ -60,7 +69,7 @@ impl Dataset {
     }
 
     /// If `shuffle` is true, the dataset will be shuffled and the requests returned by [`Self::next_request`] is in random order.
-    pub fn load_burstgpt_csv(path: &str, shuffle: bool) -> Self {
+    pub fn load_burstgpt_csv(path: &str, shuffle: bool, prefill_only: bool) -> Self {
         let mut requests = Vec::new();
         let mut timestamps = Vec::new();
         let mut reader = BufReader::new(File::open(path).unwrap());
@@ -77,7 +86,11 @@ impl Dataset {
                 .collect::<Vec<_>>();
             let timestamp = parts[0].parse::<f64>().unwrap() as u64;
             let input_length = parts[2].parse().unwrap();
-            let output_length = parts[3].parse().unwrap();
+            let output_length = if prefill_only {
+                1
+            } else {
+                parts[3].parse().unwrap()
+            };
             let log_type = &parts[5];
             if log_type == "Conversation log" {
                 timestamps.push(timestamp);
@@ -111,6 +124,7 @@ impl Dataset {
         mooncake_path: &str,
         burstgpt_path: &str,
         shuffle: bool,
+        prefill_only: bool,
     ) -> Self {
         #[derive(serde::Deserialize)]
         #[allow(dead_code)]
@@ -142,7 +156,11 @@ impl Dataset {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>();
             let input_length = parts[2].parse().unwrap();
-            let output_length = parts[3].parse().unwrap();
+            let output_length = if prefill_only {
+                1
+            } else {
+                parts[3].parse().unwrap()
+            };
             let log_type = &parts[5];
             if log_type == "Conversation log" {
                 burstgpt_requests.push((input_length, output_length));
@@ -170,7 +188,7 @@ impl Dataset {
         }
     }
 
-    pub fn load_azure_csv(path: &str, shuffle: bool) -> Self {
+    pub fn load_azure_csv(path: &str, shuffle: bool, prefill_only: bool) -> Self {
         let mut requests = Vec::new();
         let mut timestamps = Vec::new();
         let mut reader = BufReader::new(File::open(path).unwrap());
@@ -197,7 +215,11 @@ impl Dataset {
             let elapsed_millis = elapsed.num_milliseconds() as u64;
 
             let input_length = parts[1].parse().unwrap();
-            let output_length = parts[2].parse().unwrap();
+            let output_length = if prefill_only {
+                1
+            } else {
+                parts[2].parse().unwrap()
+            };
             timestamps.push(elapsed_millis);
             requests.push((input_length, output_length));
         }
@@ -276,7 +298,8 @@ mod tests {
     fn test_load_mooncake() {
         let dataset_path = std::path::Path::new("./data/mooncake_trace.jsonl");
         if dataset_path.exists() {
-            let dataset = Dataset::load_mooncake_jsonl(dataset_path.to_str().unwrap(), false);
+            let dataset =
+                Dataset::load_mooncake_jsonl(dataset_path.to_str().unwrap(), false, false);
             for _ in 0..10 {
                 println!("(input, output): {:?}", dataset.next_request());
             }
@@ -289,7 +312,7 @@ mod tests {
     fn test_load_burstgpt() {
         let dataset_path = std::path::Path::new("./data/BurstGPT_without_fails_2.csv");
         if dataset_path.exists() {
-            let dataset = Dataset::load_burstgpt_csv(dataset_path.to_str().unwrap(), false);
+            let dataset = Dataset::load_burstgpt_csv(dataset_path.to_str().unwrap(), false, false);
             for _ in 0..10 {
                 println!("(input, output): {:?}", dataset.next_request());
             }
@@ -314,7 +337,7 @@ mod tests {
     fn test_load_azure() {
         let dataset_path = std::path::Path::new("/nvme/ly/dataset/AzureLLMInferenceTrace_conv.csv");
         if dataset_path.exists() {
-            let dataset = Dataset::load_azure_csv(dataset_path.to_str().unwrap(), false);
+            let dataset = Dataset::load_azure_csv(dataset_path.to_str().unwrap(), false, false);
             for _ in 0..10 {
                 println!(
                     "(timestamp, input, output): {:?}",
