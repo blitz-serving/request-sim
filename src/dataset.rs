@@ -6,6 +6,7 @@ use std::{
 
 use chrono::NaiveDateTime;
 use rand::seq::SliceRandom;
+use regex::Regex;
 
 pub struct Dataset {
     dataset_size: usize,
@@ -261,6 +262,24 @@ impl Dataset {
         }
     }
 
+    pub fn load_uniform_dataset(input_length: u64, output_length: u64) -> Self {
+        let dataset_size = 1000;
+        let requests = vec![(input_length, output_length); dataset_size];
+        let timestamps = (0..dataset_size)
+            .into_iter()
+            .map(|i| i as u64 * 1000)
+            .collect::<Vec<_>>();
+        let round_time = 1000000;
+
+        Self {
+            dataset_size,
+            requests,
+            timestamps,
+            round_time,
+            next: AtomicUsize::new(0),
+        }
+    }
+
     pub fn next_request(&self) -> (u64, u64) {
         let next_index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.requests[next_index % self.dataset_size]
@@ -288,6 +307,45 @@ impl Dataset {
     pub fn request_rate(&self) -> f64 {
         self.dataset_size() as f64 * 1000.0 / self.round_time() as f64
     }
+}
+
+pub fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
+    fn parse_u64(text: &str) -> Result<Vec<u64>, String> {
+        let mut integers = Vec::new();
+        let re = Regex::new(r"\b\d+\b").map_err(|e| e.to_string())?;
+        for cap in re.captures_iter(text) {
+            integers.push(cap[0].parse::<u64>().map_err(|e| e.to_string())?);
+        }
+        Ok(integers)
+    }
+
+    let s = s.to_lowercase();
+    if s.starts_with("uniform") {
+        let integers = parse_u64(s.as_str())?;
+        Ok(DatasetType::Uniform {
+            input: integers[0],
+            output: integers[1],
+        })
+    } else {
+        match s.to_lowercase().as_ref() {
+            "mooncake" => Ok(DatasetType::Mooncake),
+            "burstgpt" => Ok(DatasetType::Burstgpt),
+            "azure" => Ok(DatasetType::Azure),
+            "mooncake_sampled" => Ok(DatasetType::MooncakeSampled),
+            "mock" => Ok(DatasetType::Mock),
+            _ => Err("Invalid dataset type.".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DatasetType {
+    Mooncake,
+    Burstgpt,
+    Azure,
+    MooncakeSampled,
+    Mock,
+    Uniform { input: u64, output: u64 },
 }
 
 #[cfg(test)]
@@ -347,5 +405,18 @@ mod tests {
         } else {
             eprintln!("Dataset not found");
         }
+    }
+
+    #[test]
+    fn test_load_uniform_dataset() {
+        let dataset_type = parse_dataset_type("Uniform(10,1)").unwrap();
+        println!("{:?}", dataset_type);
+        let dataset = Dataset::load_uniform_dataset(10, 1);
+        println!(
+            "{} {} {}",
+            dataset.request_rate(),
+            dataset.round_time(),
+            dataset.dataset_size()
+        );
     }
 }

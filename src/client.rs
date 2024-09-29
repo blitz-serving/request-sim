@@ -1,6 +1,6 @@
 use clap::Parser;
 use request_sim::{
-    dataset::Dataset,
+    dataset::{parse_dataset_type, Dataset, DatasetType},
     protocols::{DistserveProtocol, MockProtocol, StProtocol, VllmProtocol},
     requester::{
         create_gamma_interval_generator, init_error_log, report_loop, spawn_request_loop,
@@ -21,6 +21,7 @@ struct Args {
     threads: Option<usize>,
 
     /// Endpoint URL to handle http request.
+    /// For example, "http://localhost:8000/generate".
     #[clap(long, required = true)]
     endpoint: String,
 
@@ -28,11 +29,17 @@ struct Args {
     #[clap(long, short, required = true, value_parser = parse_protocol)]
     protocol: Protocol,
 
-    /// Dataset type. Either "mooncake", "burstgpt" "mooncake_sampled" or "mock".
+    /// Dataset type. Either "mooncake", "burstgpt", "mooncake_sampled", "azure", "uniform($input,$output)" or "mock".
+    ///
+    /// The uniform dataset requires input and output length arguments and its default request rate is 1.0 rps.
+    ///
+    /// To adjust the request rate:
+    /// - use the `request_rate` argument for non-replay mode.
+    /// - use the `scale_factor` argument for replay mode.
     #[clap(long, short, required = true, value_parser = parse_dataset_type)]
     dataset_type: DatasetType,
 
-    /// Path to dataset file. The dataset file will be accessed only when dataset_type is not "mock".
+    /// Path to dataset file. This argument is required only when dataset_type is not "mock" or "uniform".
     #[clap(long)]
     dataset_path: Option<String>,
 
@@ -96,26 +103,6 @@ enum Protocol {
     Mock,
 }
 
-fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
-    match s.to_lowercase().as_ref() {
-        "mooncake" => Ok(DatasetType::Mooncake),
-        "burstgpt" => Ok(DatasetType::Burstgpt),
-        "azure" => Ok(DatasetType::Azure),
-        "mooncake_sampled" => Ok(DatasetType::MooncakeSampled),
-        "mock" => Ok(DatasetType::Mock),
-        _ => Err("Invalid dataset type.".to_string()),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum DatasetType {
-    Mooncake,
-    Burstgpt,
-    Azure,
-    MooncakeSampled,
-    Mock,
-}
-
 async fn async_main(args: Args) {
     let Args {
         tokenizer,
@@ -169,6 +156,7 @@ async fn async_main(args: Args) {
             prefill_only,
         ),
         DatasetType::Mock => Dataset::load_mock_dataset(),
+        DatasetType::Uniform { input, output } => Dataset::load_uniform_dataset(input, output),
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     let requester_handle: JoinHandle<()> = match protocol {
