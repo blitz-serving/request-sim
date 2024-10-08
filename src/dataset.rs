@@ -327,7 +327,7 @@ pub fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
             output: integers[1],
         })
     } else {
-        match s.to_lowercase().as_ref() {
+        match s.as_ref() {
             "mooncake" => Ok(DatasetType::Mooncake),
             "burstgpt" => Ok(DatasetType::Burstgpt),
             "azure" => Ok(DatasetType::Azure),

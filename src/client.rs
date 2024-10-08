@@ -16,7 +16,7 @@ struct Args {
     #[clap(long, required = true)]
     tokenizer: String,
 
-    /// Worker threads to use for tokio runtime. Default is set to the number of cores.
+    /// Worker threads to use for tokio runime. Default is set to the number of cores.
     #[clap(long)]
     threads: Option<usize>,
 
@@ -33,9 +33,7 @@ struct Args {
     ///
     /// The uniform dataset requires input and output length arguments and its default request rate is 1.0 rps.
     ///
-    /// To adjust the request rate:
-    /// - use the `request_rate` argument for non-replay mode.
-    /// - use the `scale_factor` argument for replay mode.
+    /// To adjust the request rate, use the `request_rate` argument for non-replay mode and the `scale_factor` argument for replay mode instead.
     #[clap(long, short, required = true, value_parser = parse_dataset_type)]
     dataset_type: DatasetType,
 
