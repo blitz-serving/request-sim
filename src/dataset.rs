@@ -24,7 +24,12 @@ pub struct Dataset {
 
 impl Dataset {
     /// If `shuffle` is true, the dataset will be shuffled and the requests returned by [`Self::next_request`] is in random order.
-    pub fn load_mooncake_jsonl(path: &str, shuffle: bool, prefill_only: bool) -> Self {
+    pub fn load_mooncake_jsonl(
+        path: &str,
+        shuffle: bool,
+        prefill_only: bool,
+        filter_long_context: bool,
+    ) -> Self {
         #[derive(serde::Deserialize)]
         #[allow(dead_code)]
         pub struct MooncakeRecord {
@@ -42,13 +47,21 @@ impl Dataset {
         if prefill_only {
             for line in BufReader::new(file).lines() {
                 let record: MooncakeRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
-                requests.push((record.input_length, 1));
+                if !filter_long_context && record.input_length + record.output_length >= 4096 {
+                    requests.push((4095 - record.output_length, record.output_length));
+                } else {
+                    requests.push((record.input_length, 1));
+                }
                 timestamps.push(record.timestamp);
             }
         } else {
             for line in BufReader::new(file).lines() {
                 let record: MooncakeRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
-                requests.push((record.input_length, record.output_length));
+                if !filter_long_context && record.input_length + record.output_length >= 4096 {
+                    requests.push((4095 - record.output_length, record.output_length));
+                } else {
+                    requests.push((record.input_length, record.output_length));
+                }
                 timestamps.push(record.timestamp);
             }
         }
@@ -70,7 +83,12 @@ impl Dataset {
     }
 
     /// If `shuffle` is true, the dataset will be shuffled and the requests returned by [`Self::next_request`] is in random order.
-    pub fn load_burstgpt_csv(path: &str, shuffle: bool, prefill_only: bool) -> Self {
+    pub fn load_burstgpt_csv(
+        path: &str,
+        shuffle: bool,
+        prefill_only: bool,
+        filter_long_context: bool,
+    ) -> Self {
         let mut requests = Vec::new();
         let mut timestamps = Vec::new();
         let mut reader = BufReader::new(File::open(path).unwrap());
@@ -86,12 +104,15 @@ impl Dataset {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>();
             let timestamp = parts[0].parse::<f64>().unwrap() as u64;
-            let input_length = parts[2].parse().unwrap();
+            let mut input_length = parts[2].parse().unwrap();
             let output_length = if prefill_only {
                 1
             } else {
                 parts[3].parse().unwrap()
             };
+            if !filter_long_context && input_length + output_length >= 4096 {
+                input_length = 4095 - output_length;
+            }
             let log_type = &parts[5];
             if log_type == "Conversation log" {
                 timestamps.push(timestamp);
@@ -189,7 +210,12 @@ impl Dataset {
         }
     }
 
-    pub fn load_azure_csv(path: &str, shuffle: bool, prefill_only: bool) -> Self {
+    pub fn load_azure_csv(
+        path: &str,
+        shuffle: bool,
+        prefill_only: bool,
+        filter_long_context: bool,
+    ) -> Self {
         let mut requests = Vec::new();
         let mut timestamps = Vec::new();
         let mut reader = BufReader::new(File::open(path).unwrap());
@@ -215,12 +241,15 @@ impl Dataset {
             let elapsed = timestamp - initial_timestamp.unwrap();
             let elapsed_millis = elapsed.num_milliseconds() as u64;
 
-            let input_length = parts[1].parse().unwrap();
+            let mut input_length = parts[1].parse().unwrap();
             let output_length = if prefill_only {
                 1
             } else {
                 parts[2].parse().unwrap()
             };
+            if !filter_long_context && input_length + output_length >= 4096 {
+                input_length = 4095 - output_length;
+            }
             timestamps.push(elapsed_millis);
             requests.push((input_length, output_length));
         }

@@ -81,6 +81,9 @@ struct Args {
     /// If prefill_only is enabled, the output length will be set to the 1.
     #[clap(long, default_value_t = false)]
     prefill_only: bool,
+
+    #[clap(long, default_value_t = true)]
+    filter_long_requests: bool,
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
@@ -118,6 +121,7 @@ async fn async_main(args: Args) {
         error_log_path,
         time_in_secs,
         prefill_only,
+        filter_long_requests,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -139,13 +143,13 @@ async fn async_main(args: Args) {
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
         DatasetType::Mooncake => {
-            Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode, prefill_only)
+            Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode, prefill_only, filter_long_requests)
         }
         DatasetType::Burstgpt => {
-            Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode, prefill_only)
+            Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode, prefill_only,filter_long_requests)
         }
         DatasetType::Azure => {
-            Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode, prefill_only)
+            Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode, prefill_only, filter_long_requests)
         }
         DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(
             &dataset_path.unwrap(),
@@ -157,6 +161,7 @@ async fn async_main(args: Args) {
         DatasetType::Uniform { input, output } => Dataset::load_uniform_dataset(input, output),
     };
     let (stop_tx, stop_rx) = oneshot::channel();
+    tracing::info!("Client start");
     let requester_handle: JoinHandle<()> = match protocol {
         Protocol::St => {
             let st_protocol = StProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
@@ -257,6 +262,12 @@ async fn async_main(args: Args) {
 }
 
 fn main() {
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("setting default subscriber failed");
     let args = Args::parse();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     match args.threads {
