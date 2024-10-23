@@ -141,17 +141,17 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
                 let timeout = Duration::from_secs(output_length / 10 + 100);
-                println!(
-                    "Send request  {:<3} input {:<4} output {:<4}",
-                    count, input_length, output_length
-                );
+                // println!(
+                //     "Send request  {:<3} input {:<4} output {:<4}",
+                //     count, input_length, output_length
+                // );
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
                     Ok(response) => {
-                        println!(
-                            "Recv request  {:<3} input {:<4} output {:<4}",
-                            count, input_length, output_length
-                        );
+                        // println!(
+                        //     "Recv request  {:<3} input {:<4} output {:<4}",
+                        //     count, input_length, output_length
+                        // );
                         let e_time = get_timestamp();
 
                         let mut metrics = P::parse_response(response);
@@ -251,17 +251,17 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
                 let timeout = Duration::from_secs(output_length / 10 + 100);
-                println!(
-                    "Send request  {:<3} input {:<4} output {:<4}",
-                    count, input_length, output_length
-                );
+                // println!(
+                //     "Send request  {:<3} input {:<4} output {:<4}",
+                //     count, input_length, output_length
+                // );
                 match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
                 {
                     Ok(response) => {
-                        println!(
-                            "Recv request  {:<3} input {:<4} output {:<4}",
-                            count, input_length, output_length
-                        );
+                        // println!(
+                        //     "Recv request  {:<3} input {:<4} output {:<4}",
+                        //     count, input_length, output_length
+                        // );
                         let e_time = get_timestamp();
 
                         let mut metrics = Protocol::parse_response(response);

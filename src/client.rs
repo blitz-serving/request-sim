@@ -82,7 +82,7 @@ struct Args {
     #[clap(long, default_value_t = false)]
     prefill_only: bool,
 
-    #[clap(long, default_value_t = true)]
+    #[clap(long, default_value_t = false, action = clap::ArgAction::SetFalse)]
     filter_long_requests: bool,
 }
 
@@ -142,15 +142,24 @@ async fn async_main(args: Args) {
 
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
-        DatasetType::Mooncake => {
-            Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode, prefill_only, filter_long_requests)
-        }
-        DatasetType::Burstgpt => {
-            Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode, prefill_only,filter_long_requests)
-        }
-        DatasetType::Azure => {
-            Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode, prefill_only, filter_long_requests)
-        }
+        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(
+            &dataset_path.unwrap(),
+            !replay_mode,
+            prefill_only,
+            filter_long_requests,
+        ),
+        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(
+            &dataset_path.unwrap(),
+            !replay_mode,
+            prefill_only,
+            filter_long_requests,
+        ),
+        DatasetType::Azure => Dataset::load_azure_csv(
+            &dataset_path.unwrap(),
+            !replay_mode,
+            prefill_only,
+            filter_long_requests,
+        ),
         DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(
             &dataset_path.unwrap(),
             &second_dataset_path.unwrap(),
@@ -266,8 +275,7 @@ fn main() {
         .with_max_level(tracing::Level::INFO)
         .finish();
 
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     let args = Args::parse();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     match args.threads {

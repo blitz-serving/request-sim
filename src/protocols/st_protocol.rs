@@ -82,6 +82,54 @@ impl Protocol for StProtocol {
                 "max_time_between_tokens".to_string(),
                 max_time_between_tokens,
             );
+
+            let avg_time_between_tokens = response
+                .headers()
+                .get("x-avg-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "avg_time_between_tokens".to_string(),
+                avg_time_between_tokens,
+            );
+
+            let p90_time_between_tokens = response
+                .headers()
+                .get("x-p90-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p90_time_between_tokens".to_string(),
+                p90_time_between_tokens,
+            );
+
+            let p95_time_between_tokens = response
+                .headers()
+                .get("x-p95-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p95_time_between_tokens".to_string(),
+                p95_time_between_tokens,
+            );
+
+            let p99_time_between_tokens = response
+                .headers()
+                .get("x-p99-time-between-tokens")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert(
+                "p99_time_between_tokens".to_string(),
+                p99_time_between_tokens,
+            );
         }
         map
     }
