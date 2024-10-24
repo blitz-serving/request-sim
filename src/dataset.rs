@@ -386,7 +386,7 @@ mod tests {
         let dataset_path = std::path::Path::new("./data/mooncake_trace.jsonl");
         if dataset_path.exists() {
             let dataset =
-                Dataset::load_mooncake_jsonl(dataset_path.to_str().unwrap(), false, false);
+                Dataset::load_mooncake_jsonl(dataset_path.to_str().unwrap(), false, false, false);
             for _ in 0..10 {
                 println!("(input, output): {:?}", dataset.next_request());
             }
@@ -399,7 +399,7 @@ mod tests {
     fn test_load_burstgpt() {
         let dataset_path = std::path::Path::new("./data/BurstGPT_without_fails_2.csv");
         if dataset_path.exists() {
-            let dataset = Dataset::load_burstgpt_csv(dataset_path.to_str().unwrap(), false, false);
+            let dataset = Dataset::load_burstgpt_csv(dataset_path.to_str().unwrap(), false, false, false);
             for _ in 0..10 {
                 println!("(input, output): {:?}", dataset.next_request());
             }
