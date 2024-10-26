@@ -31,7 +31,10 @@ impl Protocol for StProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(response: Response) -> BTreeMap<String, String> {
+    fn parse_response(
+        response: Response,
+        input_token_length: Option<u64>,
+    ) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {
@@ -130,6 +133,27 @@ impl Protocol for StProtocol {
                 "p99_time_between_tokens".to_string(),
                 p99_time_between_tokens,
             );
+
+            let input_length = match input_token_length {
+                Some(input_token_length) => input_token_length.to_string(),
+                None => response
+                    .headers()
+                    .get("x-input-length")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            };
+            map.insert("input_length".to_string(), input_length);
+
+            let output_length = response
+                .headers()
+                .get("x-output-length")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            map.insert("output_length".to_string(), output_length);
         }
         map
     }

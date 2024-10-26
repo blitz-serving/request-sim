@@ -83,7 +83,7 @@ impl Protocol for DistserveProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(response: Response) -> BTreeMap<String, String> {
+    fn parse_response(response: Response, _input_token_length: Option<u64>) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         println!("{:?}", response);
         //println!("headers {:?}", response.headers());

@@ -41,7 +41,7 @@ impl Protocol for VllmProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(response: Response) -> BTreeMap<String, String> {
+    fn parse_response(response: Response, _input_token_length:Option<u64>) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {
