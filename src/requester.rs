@@ -154,7 +154,7 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
                         // );
                         let e_time = get_timestamp();
 
-                        let mut metrics = P::parse_response(response, Some((input_length)));
+                        let mut metrics = P::parse_response(response, Some(input_length));
                         metrics.insert("s_time".to_string(), s_time.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
 

@@ -168,6 +168,14 @@ async fn async_main(args: Args) {
         ),
         DatasetType::Mock => Dataset::load_mock_dataset(),
         DatasetType::Uniform { input, output } => Dataset::load_uniform_dataset(input, output),
+        DatasetType::CherryPickBurstgpt {start_ts, end_ts} => Dataset::cherry_pick_burstgpt(
+            &dataset_path.unwrap(),
+            !replay_mode,
+            prefill_only,
+            filter_long_requests,
+            start_ts,
+            end_ts,
+        ),
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     tracing::info!("Client start");

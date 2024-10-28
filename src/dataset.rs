@@ -114,7 +114,7 @@ impl Dataset {
                 input_length = 4095 - output_length;
             }
             let log_type = &parts[5];
-            if log_type == "Conversation log" {
+            if log_type == "Conversation log" || log_type == "API log" {
                 timestamps.push(timestamp);
                 requests.push((input_length, output_length));
             }
@@ -268,6 +268,79 @@ impl Dataset {
         }
     }
 
+    pub fn cherry_pick_burstgpt(
+        path: &str,
+        shuffle: bool,
+        prefill_only: bool,
+        filter_long_context: bool,
+        start_ts: u64,
+        end_ts: u64,
+    ) -> Self {
+        let mut requests = Vec::new();
+        let mut timestamps = Vec::new();
+        let mut reader = BufReader::new(File::open
+        (path).unwrap());
+
+        // skip header
+        let mut header = String::new();
+        reader.read_line(&mut header).unwrap();
+
+        let mut initial_timestamp: Option<u64> = None;
+
+        for line in reader.lines() {
+            let parts = line
+                .unwrap()
+                .split(',')
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            let timestamp = parts[0].parse::<f64>().unwrap() as u64;
+            if initial_timestamp.is_none() {
+                initial_timestamp = Some(timestamp);
+            }
+            if timestamp - initial_timestamp.unwrap() < start_ts {
+                continue;
+            }
+            if timestamp - initial_timestamp.unwrap() > end_ts {
+                break;
+            }
+            let mut input_length = parts[2].parse().unwrap();
+            let output_length = if prefill_only {
+                1
+            } else {
+                parts[3].parse().unwrap()
+            };
+            if !filter_long_context && input_length + output_length >= 4096 {
+                input_length = 4095 - output_length;
+            }
+            let log_type = &parts[5];
+            if log_type == "Conversation log" || log_type == "API log" {
+                timestamps.push(timestamp);
+                requests.push((input_length, output_length));
+            }
+        }
+
+        let base_timestamp = timestamps[0];
+        timestamps
+            .iter_mut()
+            .for_each(|timestamp| *timestamp = (*timestamp - base_timestamp) * 1000);
+
+        if shuffle {
+            requests.shuffle(&mut rand::thread_rng());
+        }
+
+        let round_time =
+            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
+
+        Self {
+            dataset_size: requests.len(),
+            round_time,
+            requests,
+            timestamps,
+            next: AtomicUsize::new(0),
+        }
+        
+    }
+
     pub fn load_mock_dataset() -> Self {
         let requests = (0..1000)
             .into_iter()
@@ -355,7 +428,14 @@ pub fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
             input: integers[0],
             output: integers[1],
         })
-    } else {
+    }
+    else if s.starts_with("cherry_pick_burstgpt") {
+        let integers = parse_u64(s.as_str())?;
+        Ok(DatasetType::CherryPickBurstgpt {
+            start_ts: integers[0],
+            end_ts: integers[1],
+        })
+    }else {
         match s.as_ref() {
             "mooncake" => Ok(DatasetType::Mooncake),
             "burstgpt" => Ok(DatasetType::Burstgpt),
@@ -375,6 +455,7 @@ pub enum DatasetType {
     MooncakeSampled,
     Mock,
     Uniform { input: u64, output: u64 },
+    CherryPickBurstgpt { start_ts: u64, end_ts: u64 },
 }
 
 #[cfg(test)]
@@ -422,9 +503,9 @@ mod tests {
 
     #[test]
     fn test_load_azure() {
-        let dataset_path = std::path::Path::new("/nvme/ly/dataset/AzureLLMInferenceTrace_conv.csv");
+        let dataset_path = std::path::Path::new("/nvme/ly/dataset/AzureLLMInferenceTrace_code.csv");
         if dataset_path.exists() {
-            let dataset = Dataset::load_azure_csv(dataset_path.to_str().unwrap(), false, false);
+            let dataset = Dataset::load_azure_csv(dataset_path.to_str().unwrap(), false, false, false);
             for _ in 0..10 {
                 println!(
                     "(timestamp, input, output): {:?}",
@@ -447,5 +528,27 @@ mod tests {
             dataset.round_time(),
             dataset.dataset_size()
         );
+    }
+
+    #[test]
+    fn test_cherry_pick_burstgpt() {
+        let dataset_type = parse_dataset_type("cherry_pick_burstgpt(0, 1000)").unwrap();
+        println!("{:?}", dataset_type);
+        let dataset_path = std::path::Path::new("/nvme/wht/dataset/BurstGPT_without_fails_2.csv");
+        if dataset_path.exists() {
+            let dataset = Dataset::cherry_pick_burstgpt(
+                dataset_path.to_str().unwrap(),
+                false,
+                false,
+                false,
+                0,
+                1000,
+            );
+            for _ in 0..10 {
+                println!("(input, output): {:?}", dataset.next_request());
+            }
+        } else {
+            eprintln!("Dataset not found");
+        }
     }
 }
