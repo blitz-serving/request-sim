@@ -56,9 +56,6 @@ impl Protocol for DistserveProtocol {
             truncated_output_length = output_token_length;
             //println!("original length {} {}", truncated_input_length, truncated_output_length);
         }
-        // hack here
-        //truncated_input_length = 100;
-        //truncated_output_length = 120;
         let input_token_ids = (0..truncated_input_length)
             .map(|_| thread_rng().gen_range(self.start..self.end))
             .collect::<Vec<_>>();
@@ -83,11 +80,9 @@ impl Protocol for DistserveProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(response: Response, _input_token_length: Option<u64>) -> BTreeMap<String, String> {
+    fn parse_response(response: Response) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         println!("{:?}", response);
-        //println!("headers {:?}", response.headers());
-        //map.insert("status".to_string(), response.status().as_str().to_string());
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {
             let first_token_time = response
@@ -193,12 +188,6 @@ impl Protocol for DistserveProtocol {
             map.insert("input_length".to_string(), input_length);
         }
         map
-    }
-
-    fn parse_response_async(
-        _: Response,
-    ) -> impl std::future::Future<Output = BTreeMap<String, String>> {
-        async { unimplemented!() }
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, future::Future};
+use std::collections::BTreeMap;
 
 use super::Protocol;
 
@@ -13,19 +13,9 @@ impl Protocol for MockProtocol {
         .to_string()
     }
 
-    fn parse_response(_: reqwest::Response, _input_token_length: Option<u64>) -> BTreeMap<String, String> {
+    fn parse_response(_: reqwest::Response) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("id".to_string(), rand::random::<u64>().to_string());
         map
-    }
-
-    fn parse_response_async(
-        _: reqwest::Response,
-    ) -> impl Future<Output = BTreeMap<String, String>> {
-        async {
-            let mut map = BTreeMap::new();
-            map.insert("id".to_string(), rand::random::<u64>().to_string());
-            map
-        }
     }
 }

@@ -85,8 +85,9 @@ struct Args {
     #[clap(long, default_value_t = false)]
     prefill_only: bool,
 
-    #[clap(long, default_value_t = false, action = clap::ArgAction::SetFalse)]
-    filter_long_requests: bool,
+    /// Truncate the request if the sum of input and output token length is greater than the specified value.
+    #[clap(long)]
+    truncate: Option<u64>,
 }
 
 fn parse_protocol(s: &str) -> Result<Protocol, String> {
@@ -125,7 +126,7 @@ async fn async_main(args: Args) {
         error_log_path,
         time_in_secs,
         prefill_only,
-        filter_long_requests,
+        truncate,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -146,40 +147,19 @@ async fn async_main(args: Args) {
 
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
-        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(
-            &dataset_path.unwrap(),
-            !replay_mode,
-            prefill_only,
-            filter_long_requests,
-        ),
-        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(
-            &dataset_path.unwrap(),
-            !replay_mode,
-            prefill_only,
-            filter_long_requests,
-        ),
-        DatasetType::Azure => Dataset::load_azure_csv(
-            &dataset_path.unwrap(),
-            !replay_mode,
-            prefill_only,
-            filter_long_requests,
-        ),
+        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
+        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
+        DatasetType::Azure => Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode),
         DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(
             &dataset_path.unwrap(),
             &second_dataset_path.unwrap(),
             !replay_mode,
-            prefill_only,
         ),
         DatasetType::Mock => Dataset::load_mock_dataset(),
         DatasetType::Uniform { input, output } => Dataset::load_uniform_dataset(input, output),
-        DatasetType::CherryPickBurstgpt {start_ts, end_ts} => Dataset::cherry_pick_burstgpt(
-            &dataset_path.unwrap(),
-            !replay_mode,
-            prefill_only,
-            filter_long_requests,
-            start_ts,
-            end_ts,
-        ),
+        DatasetType::CherryPickBurstgpt { start_ts, end_ts } => {
+            Dataset::cherry_pick_burstgpt(&dataset_path.unwrap(), !replay_mode, start_ts, end_ts)
+        }
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     tracing::info!("Client start");
@@ -191,6 +171,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     st_protocol,
                     scale_factor.unwrap(),
                     response_tx,
@@ -201,6 +183,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     st_protocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,
@@ -215,6 +199,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     vllm_protocol,
                     scale_factor.unwrap(),
                     response_tx,
@@ -225,6 +211,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     vllm_protocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,
@@ -240,6 +228,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     distserve_protocol,
                     scale_factor.unwrap(),
                     response_tx,
@@ -250,6 +240,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     distserve_protocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,
@@ -263,6 +255,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     MockProtocol,
                     scale_factor.unwrap(),
                     response_tx,
@@ -273,6 +267,8 @@ async fn async_main(args: Args) {
                     endpoint,
                     endpoints,
                     dataset,
+                    prefill_only,
+                    truncate,
                     MockProtocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
                     response_tx,

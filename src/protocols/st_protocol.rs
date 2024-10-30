@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, future::Future};
+use std::collections::BTreeMap;
 
 use reqwest::Response;
 use tokenizers::Tokenizer;
@@ -31,10 +31,7 @@ impl Protocol for StProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(
-        response: Response,
-        input_token_length: Option<u64>,
-    ) -> BTreeMap<String, String> {
+    fn parse_response(response: Response) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {
@@ -134,18 +131,6 @@ impl Protocol for StProtocol {
                 p99_time_between_tokens,
             );
 
-            let input_length = match input_token_length {
-                Some(input_token_length) => input_token_length.to_string(),
-                None => response
-                    .headers()
-                    .get("x-input-length")
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
-            };
-            map.insert("input_length".to_string(), input_length);
-
             let output_length = response
                 .headers()
                 .get("x-output-length")
@@ -157,29 +142,10 @@ impl Protocol for StProtocol {
         }
         map
     }
-
-    fn parse_response_async(response: Response) -> impl Future<Output = BTreeMap<String, String>> {
-        #[derive(Debug, serde::Deserialize)]
-        struct StResponse {
-            lags: Vec<f64>,
-        }
-
-        async move {
-            let st_response = response.json::<StResponse>().await.unwrap();
-            let mut map = BTreeMap::new();
-            map.insert(
-                "lags".to_string(),
-                serde_json::to_string(&st_response.lags).unwrap(),
-            );
-            map
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     const TOKENIZER_PATH: &str = "/nvme/huggingface/hub/opt-1.3b/tokenizer.json";
@@ -222,17 +188,5 @@ mod tests {
         let st_protocol = StProtocol::new(tokenizer);
         let json_body = st_protocol.request_json_body(100, 100);
         println!("{}", json_body);
-    }
-
-    #[tokio::test]
-    async fn test_parse_response_async() {
-        let response = reqwest::Response::from(
-            http::response::Builder::new()
-                .status(200)
-                .body(json!({"lags":[0.1,0.2,0.3]}).to_string())
-                .unwrap(),
-        );
-        let parsed = StProtocol::parse_response_async(response).await;
-        println!("{:?}", parsed);
     }
 }

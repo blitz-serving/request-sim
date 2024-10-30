@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, future::Future};
+use std::collections::BTreeMap;
 
 use reqwest::Response;
 
@@ -14,8 +14,5 @@ pub use vllm_protocol::VllmProtocol;
 
 pub trait Protocol {
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String;
-    fn parse_response(response: Response, input_length:Option<u64>) -> BTreeMap<String, String>;
-
-    /// New method to parse response asynchronously with generic output type.
-    fn parse_response_async(response: Response) -> impl Future<Output = BTreeMap<String, String>>;
+    fn parse_response(response: Response) -> BTreeMap<String, String>;
 }

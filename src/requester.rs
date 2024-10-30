@@ -108,11 +108,13 @@ async fn append_error_log(msg: String) {
 /// - Use [`spawn_request_loop_with_timestamp`] instead if you want to control the intervals.
 ///
 /// Await on the returned handle to wait for the loop to finish.
-pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
+pub fn spawn_request_loop<Protocol: 'static + crate::protocols::Protocol + Send>(
     endpoint: String,
     endpoints: Option<Vec<String>>,
     dataset: Dataset,
-    protocol: P,
+    prefill_only: bool,
+    truncate: Option<u64>,
+    protocol: Protocol,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
@@ -137,12 +139,13 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
             }
 
             let endpoint = match cfg!(feature = "bypass_router") {
-                true => endpoints
-                    .clone().and_then(|vec| {vec.get(count as usize % vec.len()).cloned()}),
                 false => Some(endpoint.clone()),
+                true => endpoints
+                    .as_ref()
+                    .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
             };
             assert!(endpoint.is_some());
-            let (input_length, output_length) = dataset.next_request();
+            let (input_length, output_length) = dataset.next_request(prefill_only, truncate);
             let json_body = protocol.request_json_body(input_length, output_length);
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
@@ -152,18 +155,21 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
                 //     "Send request  {:<3} input {:<4} output {:<4}",
                 //     count, input_length, output_length
                 // );
-                match request_with_timeout(endpoint.unwrap().as_str(), json_body.to_string(), timeout).await
+                match request_with_timeout(
+                    endpoint.unwrap().as_str(),
+                    json_body.to_string(),
+                    timeout,
+                )
+                .await
                 {
                     Ok(response) => {
-                        // println!(
-                        //     "Recv request  {:<3} input {:<4} output {:<4}",
-                        //     count, input_length, output_length
-                        // );
                         let e_time = get_timestamp();
 
-                        let mut metrics = P::parse_response(response, Some(input_length));
+                        let mut metrics = Protocol::parse_response(response);
                         metrics.insert("s_time".to_string(), s_time.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
 
                         if let Err(err) = response_sender.send(metrics) {
                             let msg = format!(
@@ -214,6 +220,8 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
     endpoint: String,
     endpoints: Option<Vec<String>>,
     dataset: Dataset,
+    prefill_only: bool,
+    truncate: Option<u64>,
     protocol: Protocol,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
@@ -225,11 +233,9 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
         BASETIME.get().unwrap().elapsed().as_millis() as u64
     }
 
-    println!("Dataset request rate: {:.3} req/s", dataset.request_rate());
-    println!(
-        "Scaled request rate: {:.3} req/s",
-        dataset.request_rate() * scale_factor
-    );
+    let rr = dataset.request_rate();
+    println!("Origin request rate: {:.3} req/s", rr);
+    println!("Scaled request rate: {:.3} req/s", rr * scale_factor);
 
     let (tx, rx) = flume::unbounded();
     let handle = spawn(wait_all(rx));
@@ -244,13 +250,16 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
 
             // Get next request and its timestamp
             let endpoint = match cfg!(feature = "bypass_router") {
-               true => endpoints.clone().and_then(|vec| {vec.get(count as usize % vec.len()).cloned()}),
-                false => Some(endpoint.clone()), 
+                false => Some(endpoint.clone()),
+                true => endpoints
+                    .as_ref()
+                    .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
             };
             assert!(endpoint.is_some());
-            
+
             let current_timestamp = get_timestamp();
-            let (ts, input_length, output_length) = dataset.next_request_with_timestamp();
+            let (ts, input_length, output_length) =
+                dataset.next_request_with_timestamp(prefill_only, truncate);
             let next_timestamp = (ts as f64 / scale_factor) as u64;
 
             if next_timestamp > current_timestamp + 1 {
@@ -264,22 +273,21 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
                 let timeout = Duration::from_secs(output_length / 10 + 100);
-                // println!(
-                //     "Send request  {:<3} input {:<4} output {:<4}",
-                //     count, input_length, output_length
-                // );
-                match request_with_timeout(endpoint.unwrap().as_str(), json_body.to_string(), timeout).await
+                match request_with_timeout(
+                    endpoint.unwrap().as_str(),
+                    json_body.to_string(),
+                    timeout,
+                )
+                .await
                 {
                     Ok(response) => {
-                        // println!(
-                        //     "Recv request  {:<3} input {:<4} output {:<4}",
-                        //     count, input_length, output_length
-                        // );
                         let e_time = get_timestamp();
 
-                        let mut metrics = Protocol::parse_response(response, Some(input_length));
+                        let mut metrics = Protocol::parse_response(response);
                         metrics.insert("s_time".to_string(), s_time.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
 
                         if let Err(err) = response_sender.send(metrics) {
                             let msg = format!(

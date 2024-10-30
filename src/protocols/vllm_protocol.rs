@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, future::Future};
+use std::collections::BTreeMap;
 
 use rand::{thread_rng, Rng};
 use reqwest::Response;
@@ -41,7 +41,7 @@ impl Protocol for VllmProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(response: Response, _input_token_length:Option<u64>) -> BTreeMap<String, String> {
+    fn parse_response(response: Response) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {
@@ -76,10 +76,6 @@ impl Protocol for VllmProtocol {
             );
         }
         map
-    }
-
-    fn parse_response_async(_: Response) -> impl Future<Output = BTreeMap<String, String>> {
-        async { unimplemented!() }
     }
 }
 
