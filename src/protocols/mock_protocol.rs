@@ -13,9 +13,11 @@ impl Protocol for MockProtocol {
         .to_string()
     }
 
-    fn parse_response(_: reqwest::Response) -> BTreeMap<String, String> {
-        let mut map = BTreeMap::new();
-        map.insert("id".to_string(), rand::random::<u64>().to_string());
-        map
+    fn parse_response(&self) -> fn(response: reqwest::Response) -> BTreeMap<String, String> {
+        |_| -> BTreeMap<String, String> {
+            let mut map = BTreeMap::new();
+            map.insert("id".to_string(), rand::random::<u64>().to_string());
+            map
+        }
     }
 }

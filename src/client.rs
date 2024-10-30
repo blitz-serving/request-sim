@@ -8,7 +8,7 @@ use request_sim::{
     },
 };
 use tokenizers::Tokenizer;
-use tokio::{spawn, sync::oneshot, task::JoinHandle};
+use tokio::{spawn, sync::oneshot};
 
 #[derive(Parser)]
 struct Args {
@@ -163,120 +163,42 @@ async fn async_main(args: Args) {
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     tracing::info!("Client start");
-    let requester_handle: JoinHandle<()> = match protocol {
-        Protocol::St => {
-            let st_protocol = StProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            if replay_mode {
-                spawn_request_loop_with_timestamp(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    st_protocol,
-                    scale_factor.unwrap(),
-                    response_tx,
-                    stop_rx,
-                )
-            } else {
-                spawn_request_loop(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    st_protocol,
-                    create_gamma_interval_generator(request_rate.unwrap(), cv),
-                    response_tx,
-                    stop_rx,
-                )
-            }
-        }
-        Protocol::Vllm => {
-            let vllm_protocol = VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            if replay_mode {
-                spawn_request_loop_with_timestamp(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    vllm_protocol,
-                    scale_factor.unwrap(),
-                    response_tx,
-                    stop_rx,
-                )
-            } else {
-                spawn_request_loop(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    vllm_protocol,
-                    create_gamma_interval_generator(request_rate.unwrap(), cv),
-                    response_tx,
-                    stop_rx,
-                )
-            }
-        }
-        Protocol::Distserve => {
-            let distserve_protocol =
-                DistserveProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            if replay_mode {
-                spawn_request_loop_with_timestamp(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    distserve_protocol,
-                    scale_factor.unwrap(),
-                    response_tx,
-                    stop_rx,
-                )
-            } else {
-                spawn_request_loop(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    distserve_protocol,
-                    create_gamma_interval_generator(request_rate.unwrap(), cv),
-                    response_tx,
-                    stop_rx,
-                )
-            }
-        }
-        Protocol::Mock => {
-            if replay_mode {
-                spawn_request_loop_with_timestamp(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    MockProtocol,
-                    scale_factor.unwrap(),
-                    response_tx,
-                    stop_rx,
-                )
-            } else {
-                spawn_request_loop(
-                    endpoint,
-                    endpoints,
-                    dataset,
-                    prefill_only,
-                    truncate,
-                    MockProtocol,
-                    create_gamma_interval_generator(request_rate.unwrap(), cv),
-                    response_tx,
-                    stop_rx,
-                )
-            }
-        }
+
+    let protocol: Box<dyn request_sim::protocols::Protocol + Send> = match protocol {
+        Protocol::St => Box::new(StProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
+        Protocol::Vllm => Box::new(VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
+        Protocol::Distserve => Box::new(DistserveProtocol::new(
+            Tokenizer::from_file(tokenizer).unwrap(),
+        )),
+        Protocol::Mock => Box::new(MockProtocol),
     };
+
+    let requester_handle = if replay_mode {
+        spawn_request_loop_with_timestamp(
+            endpoint,
+            endpoints,
+            dataset,
+            prefill_only,
+            truncate,
+            protocol,
+            scale_factor.unwrap(),
+            response_tx,
+            stop_rx,
+        )
+    } else {
+        spawn_request_loop(
+            endpoint,
+            endpoints,
+            dataset,
+            prefill_only,
+            truncate,
+            protocol,
+            create_gamma_interval_generator(request_rate.unwrap(), cv),
+            response_tx,
+            stop_rx,
+        )
+    };
+
     let reporter_handle = spawn(report_loop(output_file, response_rx));
 
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;

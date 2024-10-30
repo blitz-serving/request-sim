@@ -108,13 +108,13 @@ async fn append_error_log(msg: String) {
 /// - Use [`spawn_request_loop_with_timestamp`] instead if you want to control the intervals.
 ///
 /// Await on the returned handle to wait for the loop to finish.
-pub fn spawn_request_loop<Protocol: 'static + crate::protocols::Protocol + Send>(
+pub fn spawn_request_loop(
     endpoint: String,
     endpoints: Option<Vec<String>>,
     dataset: Dataset,
     prefill_only: bool,
     truncate: Option<u64>,
-    protocol: Protocol,
+    protocol: Box<dyn crate::protocols::Protocol + Send>,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
@@ -125,6 +125,8 @@ pub fn spawn_request_loop<Protocol: 'static + crate::protocols::Protocol + Send>
     fn get_timestamp() -> u64 {
         BASETIME.get().unwrap().elapsed().as_millis() as u64
     }
+
+    let parse_response = protocol.parse_response();
 
     let (tx, rx) = flume::unbounded();
     let handle = spawn(wait_all(rx));
@@ -165,7 +167,7 @@ pub fn spawn_request_loop<Protocol: 'static + crate::protocols::Protocol + Send>
                     Ok(response) => {
                         let e_time = get_timestamp();
 
-                        let mut metrics = Protocol::parse_response(response);
+                        let mut metrics = parse_response(response);
                         metrics.insert("s_time".to_string(), s_time.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
                         metrics.insert("input_length".to_string(), input_length.to_string());
@@ -216,13 +218,13 @@ pub fn spawn_request_loop<Protocol: 'static + crate::protocols::Protocol + Send>
     handle
 }
 
-pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::Protocol + Send>(
+pub fn spawn_request_loop_with_timestamp(
     endpoint: String,
     endpoints: Option<Vec<String>>,
     dataset: Dataset,
     prefill_only: bool,
     truncate: Option<u64>,
-    protocol: Protocol,
+    protocol: Box<dyn crate::protocols::Protocol + Send>,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
@@ -232,6 +234,8 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
     fn get_timestamp() -> u64 {
         BASETIME.get().unwrap().elapsed().as_millis() as u64
     }
+
+    let parse_response = protocol.parse_response();
 
     let rr = dataset.request_rate();
     println!("Origin request rate: {:.3} req/s", rr);
@@ -283,7 +287,7 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
                     Ok(response) => {
                         let e_time = get_timestamp();
 
-                        let mut metrics = Protocol::parse_response(response);
+                        let mut metrics = parse_response(response);
                         metrics.insert("s_time".to_string(), s_time.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
                         metrics.insert("input_length".to_string(), input_length.to_string());

@@ -41,41 +41,43 @@ impl Protocol for VllmProtocol {
         json_body.to_string()
     }
 
-    fn parse_response(response: Response) -> BTreeMap<String, String> {
-        let mut map = BTreeMap::new();
-        map.insert("status".to_string(), response.status().as_str().to_string());
-        if response.status().is_success() {
-            let first_token_time = response
-                .headers()
-                .get("x-first-token-time")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-            map.insert("first_token_time".to_string(), first_token_time);
+    fn parse_response(&self) -> fn(response: Response) -> BTreeMap<String, String> {
+        |response: Response| -> BTreeMap<String, String> {
+            let mut map = BTreeMap::new();
+            map.insert("status".to_string(), response.status().as_str().to_string());
+            if response.status().is_success() {
+                let first_token_time = response
+                    .headers()
+                    .get("x-first-token-time")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("first_token_time".to_string(), first_token_time);
 
-            let inference_time = response
-                .headers()
-                .get("x-inference-time")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-            map.insert("inference_time".to_string(), inference_time);
+                let inference_time = response
+                    .headers()
+                    .get("x-inference-time")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("inference_time".to_string(), inference_time);
 
-            let max_time_between_tokens = response
-                .headers()
-                .get("x-max-time-between-tokens")
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-            map.insert(
-                "max_time_between_tokens".to_string(),
-                max_time_between_tokens,
-            );
+                let max_time_between_tokens = response
+                    .headers()
+                    .get("x-max-time-between-tokens")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert(
+                    "max_time_between_tokens".to_string(),
+                    max_time_between_tokens,
+                );
+            }
+            map
         }
-        map
     }
 }
 

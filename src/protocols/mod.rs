@@ -14,5 +14,5 @@ pub use vllm_protocol::VllmProtocol;
 
 pub trait Protocol {
     fn request_json_body(&self, input_token_length: u64, output_token_length: u64) -> String;
-    fn parse_response(response: Response) -> BTreeMap<String, String>;
+    fn parse_response(&self) -> fn(response: Response) -> BTreeMap<String, String>;
 }
