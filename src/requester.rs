@@ -110,6 +110,7 @@ async fn append_error_log(msg: String) {
 /// Await on the returned handle to wait for the loop to finish.
 pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
     endpoint: String,
+    endpoints: Option<Vec<String>>,
     dataset: Dataset,
     protocol: P,
     interval_generator: IntervalGenerator,
@@ -134,7 +135,13 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
             if stopped.try_recv().is_ok() {
                 break;
             }
-            let endpoint = endpoint.clone();
+
+            let endpoint = match cfg!(feature = "bypass_router") {
+                true => endpoints
+                    .clone().and_then(|vec| {vec.get(count as usize % vec.len()).cloned()}),
+                false => Some(endpoint.clone()),
+            };
+            assert!(endpoint.is_some());
             let (input_length, output_length) = dataset.next_request();
             let json_body = protocol.request_json_body(input_length, output_length);
             let response_sender = response_sender.clone();
@@ -145,7 +152,7 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
                 //     "Send request  {:<3} input {:<4} output {:<4}",
                 //     count, input_length, output_length
                 // );
-                match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
+                match request_with_timeout(endpoint.unwrap().as_str(), json_body.to_string(), timeout).await
                 {
                     Ok(response) => {
                         // println!(
@@ -205,6 +212,7 @@ pub fn spawn_request_loop<P: 'static + crate::protocols::Protocol + Send>(
 
 pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::Protocol + Send>(
     endpoint: String,
+    endpoints: Option<Vec<String>>,
     dataset: Dataset,
     protocol: Protocol,
     scale_factor: f64,
@@ -235,7 +243,12 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
             }
 
             // Get next request and its timestamp
-            let endpoint = endpoint.clone();
+            let endpoint = match cfg!(feature = "bypass_router") {
+               true => endpoints.clone().and_then(|vec| {vec.get(count as usize % vec.len()).cloned()}),
+                false => Some(endpoint.clone()), 
+            };
+            assert!(endpoint.is_some());
+            
             let current_timestamp = get_timestamp();
             let (ts, input_length, output_length) = dataset.next_request_with_timestamp();
             let next_timestamp = (ts as f64 / scale_factor) as u64;
@@ -255,7 +268,7 @@ pub fn spawn_request_loop_with_timestamp<Protocol: 'static + crate::protocols::P
                 //     "Send request  {:<3} input {:<4} output {:<4}",
                 //     count, input_length, output_length
                 // );
-                match request_with_timeout(endpoint.as_str(), json_body.to_string(), timeout).await
+                match request_with_timeout(endpoint.unwrap().as_str(), json_body.to_string(), timeout).await
                 {
                     Ok(response) => {
                         // println!(

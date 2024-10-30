@@ -25,6 +25,9 @@ struct Args {
     #[clap(long, required = true)]
     endpoint: String,
 
+    #[clap(long)]
+    endpoints: Option<Vec<String>>,
+
     /// Protocol type. Either "st", "vllm", "distserve" or "mock".
     #[clap(long, short, required = true, value_parser = parse_protocol)]
     protocol: Protocol,
@@ -109,6 +112,7 @@ async fn async_main(args: Args) {
         tokenizer,
         threads: _,
         endpoint,
+        endpoints,
         protocol,
         dataset_type,
         dataset_path,
@@ -185,6 +189,7 @@ async fn async_main(args: Args) {
             if replay_mode {
                 spawn_request_loop_with_timestamp(
                     endpoint,
+                    endpoints,
                     dataset,
                     st_protocol,
                     scale_factor.unwrap(),
@@ -194,6 +199,7 @@ async fn async_main(args: Args) {
             } else {
                 spawn_request_loop(
                     endpoint,
+                    endpoints,
                     dataset,
                     st_protocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
@@ -207,6 +213,7 @@ async fn async_main(args: Args) {
             if replay_mode {
                 spawn_request_loop_with_timestamp(
                     endpoint,
+                    endpoints,
                     dataset,
                     vllm_protocol,
                     scale_factor.unwrap(),
@@ -216,6 +223,7 @@ async fn async_main(args: Args) {
             } else {
                 spawn_request_loop(
                     endpoint,
+                    endpoints,
                     dataset,
                     vllm_protocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
@@ -230,6 +238,7 @@ async fn async_main(args: Args) {
             if replay_mode {
                 spawn_request_loop_with_timestamp(
                     endpoint,
+                    endpoints,
                     dataset,
                     distserve_protocol,
                     scale_factor.unwrap(),
@@ -239,6 +248,7 @@ async fn async_main(args: Args) {
             } else {
                 spawn_request_loop(
                     endpoint,
+                    endpoints,
                     dataset,
                     distserve_protocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
@@ -251,6 +261,7 @@ async fn async_main(args: Args) {
             if replay_mode {
                 spawn_request_loop_with_timestamp(
                     endpoint,
+                    endpoints,
                     dataset,
                     MockProtocol,
                     scale_factor.unwrap(),
@@ -260,6 +271,7 @@ async fn async_main(args: Args) {
             } else {
                 spawn_request_loop(
                     endpoint,
+                    endpoints,
                     dataset,
                     MockProtocol,
                     create_gamma_interval_generator(request_rate.unwrap(), cv),
