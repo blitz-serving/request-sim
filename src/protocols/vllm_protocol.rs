@@ -37,7 +37,8 @@ impl Protocol for VllmProtocol {
             .decode(input_token_ids.as_slice(), false)
             .unwrap();
         let json_body =
-            serde_json::json!({"max_tokens": output_token_length, "tokens": input_token_ids});
+            serde_json::json!({"prompt": _input, "max_tokens": output_token_length, "min_tokens": output_token_length, "input_token_length": input_token_length, "output_token_length": output_token_length});
+            // serde_json::json!({"max_tokens": output_token_length, "tokens": input_token_ids});
         json_body.to_string()
     }
 
@@ -75,6 +76,60 @@ impl Protocol for VllmProtocol {
                     "max_time_between_tokens".to_string(),
                     max_time_between_tokens,
                 );
+
+                let avg_tbt = response
+                    .headers()
+                    .get("x-avg-time-between-tokens")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("avg_time_between_tokens".to_string(), avg_tbt);
+
+                let p99_tbt = response
+                    .headers()
+                    .get("x-p99-time-between-tokens")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("p99_time_between_tokens".to_string(), p99_tbt);
+
+                let p95_tbt = response
+                    .headers()
+                    .get("x-p95-time-between-tokens")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("p95_time_between_tokens".to_string(), p95_tbt);
+
+                let p90_tbt = response
+                    .headers()
+                    .get("x-p90-time-between-tokens")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("p90_time_between_tokens".to_string(), p90_tbt);
+
+                let input_length = response
+                    .headers()
+                    .get("x-input-length")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("input_length".to_string(), input_length);
+
+                let output_length = response
+                    .headers()
+                    .get("x-output-length")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                map.insert("output_length".to_string(), output_length);
             }
             map
         }
