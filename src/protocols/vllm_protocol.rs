@@ -36,9 +36,8 @@ impl Protocol for VllmProtocol {
             .tokenizer
             .decode(input_token_ids.as_slice(), false)
             .unwrap();
-        let json_body =
-            serde_json::json!({"prompt": _input, "max_tokens": output_token_length, "min_tokens": output_token_length, "input_token_length": input_token_length, "output_token_length": output_token_length});
-            // serde_json::json!({"max_tokens": output_token_length, "tokens": input_token_ids});
+        let json_body = serde_json::json!({"prompt": _input, "max_tokens": output_token_length, "min_tokens": output_token_length, "input_token_length": input_token_length, "output_token_length": output_token_length});
+        // serde_json::json!({"max_tokens": output_token_length, "tokens": input_token_ids});
         json_body.to_string()
     }
 
