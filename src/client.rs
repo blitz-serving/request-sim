@@ -147,6 +147,9 @@ async fn async_main(args: Args) {
 
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {
+        DatasetType::ProcessedCsv => {
+            Dataset::load_processed_csv(&dataset_path.unwrap(), !replay_mode)
+        }
         DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
         DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
         DatasetType::Azure => Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode),

@@ -218,6 +218,42 @@ impl Dataset {
         }
     }
 
+    pub fn load_processed_csv(path: &str, shuffle: bool) -> Self {
+        let mut requests = Vec::new();
+        let mut timestamps = Vec::new();
+        let mut reader = BufReader::new(File::open(path).unwrap());
+
+        // skip header
+        let mut header = String::new();
+        reader.read_line(&mut header).unwrap();
+
+        for line in reader.lines() {
+            let parts = line
+                .unwrap()
+                .split(',')
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            let timestamp: u64 = parts[0].parse().unwrap();
+            let input_length = parts[1].parse().unwrap();
+            let output_length = parts[2].parse().unwrap();
+            timestamps.push(timestamp);
+            requests.push((input_length, output_length));
+        }
+
+        if shuffle {
+            requests.shuffle(&mut rand::thread_rng());
+        }
+        let round_time =
+            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
+        Self {
+            dataset_size: requests.len(),
+            round_time,
+            requests,
+            timestamps,
+            next: AtomicUsize::new(0),
+        }
+    }
+
     pub fn cherry_pick_burstgpt(path: &str, shuffle: bool, start_ts: u64, end_ts: u64) -> Self {
         let mut requests = Vec::new();
         let mut timestamps = Vec::new();
@@ -398,6 +434,7 @@ pub fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
             "azure" => Ok(DatasetType::Azure),
             "mooncake_sampled" => Ok(DatasetType::MooncakeSampled),
             "mock" => Ok(DatasetType::Mock),
+            "processed" => Ok(DatasetType::ProcessedCsv),
             _ => Err("Invalid dataset type.".to_string()),
         }
     }
@@ -412,6 +449,7 @@ pub enum DatasetType {
     Mock,
     Uniform { input: u64, output: u64 },
     CherryPickBurstgpt { start_ts: u64, end_ts: u64 },
+    ProcessedCsv,
 }
 
 #[cfg(test)]
