@@ -36,6 +36,12 @@ impl Protocol for StProtocol {
             let mut map = BTreeMap::new();
             map.insert("status".to_string(), response.status().as_str().to_string());
             if response.status().is_success() {
+                let request_id = response
+                    .headers()
+                    .get("x-request-id")
+                    .map_or("0".to_string(), |hv| hv.to_str().unwrap().to_string());
+                map.insert("request_id".to_string(), request_id);
+
                 let first_token_time = response
                     .headers()
                     .get("x-first-token-time")

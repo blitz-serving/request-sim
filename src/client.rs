@@ -165,7 +165,6 @@ async fn async_main(args: Args) {
         }
     };
     let (stop_tx, stop_rx) = oneshot::channel();
-    tracing::info!("Client start");
 
     let protocol: Box<dyn request_sim::protocols::Protocol + Send> = match protocol {
         Protocol::St => Box::new(StProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
@@ -176,6 +175,7 @@ async fn async_main(args: Args) {
         Protocol::Mock => Box::new(MockProtocol),
     };
 
+    tracing::info!("Client start");
     let requester_handle = if replay_mode {
         spawn_request_loop_with_timestamp(
             endpoint,
