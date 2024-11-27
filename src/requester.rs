@@ -152,15 +152,10 @@ pub fn spawn_request_loop(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 100);
-                // println!(
-                //     "Send request  {:<3} input {:<4} output {:<4}",
-                //     count, input_length, output_length
-                // );
                 match request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    timeout,
+                    Duration::from_secs(100),
                 )
                 .await
                 {
@@ -276,11 +271,10 @@ pub fn spawn_request_loop_with_timestamp(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let timeout = Duration::from_secs(output_length / 10 + 100);
                 match request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    timeout,
+                    Duration::from_secs(100),
                 )
                 .await
                 {
