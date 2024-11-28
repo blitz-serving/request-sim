@@ -78,6 +78,15 @@ impl Protocol for StProtocol {
                     .to_string();
                 map.insert("queue_time".to_string(), queue_time);
 
+                let first_decode_token_time = response
+                    .headers()
+                    .get("x-first-decode-token-time")
+                    .map_or("0".to_string(), |hv| hv.to_str().unwrap().to_string());
+                map.insert(
+                    "first_decode_token_time".to_string(),
+                    first_decode_token_time,
+                );
+
                 let max_time_between_tokens = response
                     .headers()
                     .get("x-max-time-between-tokens")
