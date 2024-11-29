@@ -152,51 +152,29 @@ pub fn spawn_request_loop(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                match request_with_timeout(
+                let response = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
                     Duration::from_secs(100),
                 )
                 .await
-                {
-                    Ok(response) => {
-                        let e_time = get_timestamp();
-
-                        let mut metrics = parse_response(response);
-                        metrics.insert("s_time".to_string(), s_time.to_string());
-                        metrics.insert("e_time".to_string(), e_time.to_string());
-                        metrics.insert("input_length".to_string(), input_length.to_string());
-                        metrics.insert("output_length".to_string(), output_length.to_string());
-
-                        if let Err(err) = response_sender.send(metrics) {
-                            let msg = format!(
-                                "{},{}, Error: {} ({}:{})\n",
-                                s_time,
-                                e_time,
-                                err.to_string(),
-                                file!(),
-                                line!(),
-                            );
-                            append_error_log(msg).await;
-                        }
-                    }
-                    Err(err) => {
-                        println!(
-                            "Error request {:<3} input {:<4} output {:<4}",
-                            count, input_length, output_length
-                        );
-                        let msg = format!(
-                            "{},{}, Request with input {} output {} error: {} ({}:{})\n",
-                            s_time,
-                            get_timestamp(),
-                            input_length,
-                            output_length,
-                            err.to_string(),
-                            file!(),
-                            line!(),
-                        );
-                        append_error_log(msg).await;
-                    }
+                .unwrap();
+                let e_time = get_timestamp();
+                let mut metrics = parse_response(response);
+                metrics.insert("s_time".to_string(), s_time.to_string());
+                metrics.insert("e_time".to_string(), e_time.to_string());
+                metrics.insert("input_length".to_string(), input_length.to_string());
+                metrics.insert("output_length".to_string(), output_length.to_string());
+                if let Err(err) = response_sender.send(metrics) {
+                    let msg = format!(
+                        "{},{}, Error: {} ({}:{})\n",
+                        s_time,
+                        e_time,
+                        err.to_string(),
+                        file!(),
+                        line!(),
+                    );
+                    append_error_log(msg).await;
                 }
             });
 
@@ -271,51 +249,29 @@ pub fn spawn_request_loop_with_timestamp(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                match request_with_timeout(
+                let response = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
                     Duration::from_secs(100),
                 )
                 .await
-                {
-                    Ok(response) => {
-                        let e_time = get_timestamp();
-
-                        let mut metrics = parse_response(response);
-                        metrics.insert("s_time".to_string(), s_time.to_string());
-                        metrics.insert("e_time".to_string(), e_time.to_string());
-                        metrics.insert("input_length".to_string(), input_length.to_string());
-                        metrics.insert("output_length".to_string(), output_length.to_string());
-
-                        if let Err(err) = response_sender.send(metrics) {
-                            let msg = format!(
-                                "{},{}, Error: {} ({}:{})\n",
-                                s_time,
-                                e_time,
-                                err.to_string(),
-                                file!(),
-                                line!(),
-                            );
-                            append_error_log(msg).await;
-                        }
-                    }
-                    Err(err) => {
-                        println!(
-                            "Error request {:<3} input {:<4} output {:<4}",
-                            count, input_length, output_length
-                        );
-                        let msg = format!(
-                            "{},{}, Request with input {} output {} error: {} ({}:{})\n",
-                            s_time,
-                            get_timestamp(),
-                            input_length,
-                            output_length,
-                            err.to_string(),
-                            file!(),
-                            line!(),
-                        );
-                        append_error_log(msg).await;
-                    }
+                .unwrap();
+                let e_time = get_timestamp();
+                let mut metrics = parse_response(response);
+                metrics.insert("s_time".to_string(), s_time.to_string());
+                metrics.insert("e_time".to_string(), e_time.to_string());
+                metrics.insert("input_length".to_string(), input_length.to_string());
+                metrics.insert("output_length".to_string(), output_length.to_string());
+                if let Err(err) = response_sender.send(metrics) {
+                    let msg = format!(
+                        "{},{}, Error: {} ({}:{})\n",
+                        s_time,
+                        e_time,
+                        err.to_string(),
+                        file!(),
+                        line!(),
+                    );
+                    append_error_log(msg).await;
                 }
             });
 
