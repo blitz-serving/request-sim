@@ -3,7 +3,7 @@ use request_sim::{
     dataset::{parse_dataset_type, Dataset, DatasetType},
     protocols::{DistserveProtocol, MockProtocol, StProtocol, VllmProtocol},
     requester::{
-        create_gamma_interval_generator, init_error_log, report_loop, spawn_request_loop,
+        create_gamma_interval_generator, report_loop, spawn_request_loop,
         spawn_request_loop_with_timestamp,
     },
 };
@@ -73,10 +73,6 @@ struct Args {
     #[clap(long, short, default_value = "./log/output.jsonl")]
     output_path: String,
 
-    /// Error log path.
-    #[clap(long, short, default_value = "./log/error.log")]
-    error_log_path: String,
-
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
@@ -123,7 +119,6 @@ async fn async_main(args: Args) {
         scale_factor,
         cv,
         output_path,
-        error_log_path,
         time_in_secs,
         prefill_only,
         truncate,
@@ -136,14 +131,6 @@ async fn async_main(args: Args) {
         .open(&output_path)
         .await
         .unwrap();
-    tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&error_log_path)
-        .await
-        .unwrap();
-    init_error_log(error_log_path).await;
 
     let (response_tx, response_rx) = flume::unbounded();
     let dataset = match dataset_type {

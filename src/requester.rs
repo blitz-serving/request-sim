@@ -76,31 +76,6 @@ async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
     }
 }
 
-static ERROR_LOG_FILE: OnceLock<String> = OnceLock::new();
-
-pub async fn init_error_log(error_log_path: String) {
-    ERROR_LOG_FILE.get_or_init(|| error_log_path);
-}
-
-async fn append_error_log(msg: String) {
-    if let Some(error_file_path) = ERROR_LOG_FILE.get() {
-        let mut error_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(error_file_path)
-            .await
-            .expect("Failed to open error log file");
-        error_file
-            .write(msg.as_bytes())
-            .await
-            .expect("Failed to write to error log file");
-        error_file
-            .flush()
-            .await
-            .expect("Failed to flush error log file");
-    }
-}
-
 /// Send requests in the open loop way.
 ///
 /// Note:
@@ -155,7 +130,7 @@ pub fn spawn_request_loop(
                 let response = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(100),
+                    Duration::from_secs((output_length as f64 * 0.4) as u64),
                 )
                 .await
                 .unwrap();
@@ -165,17 +140,7 @@ pub fn spawn_request_loop(
                 metrics.insert("e_time".to_string(), e_time.to_string());
                 metrics.insert("input_length".to_string(), input_length.to_string());
                 metrics.insert("output_length".to_string(), output_length.to_string());
-                if let Err(err) = response_sender.send(metrics) {
-                    let msg = format!(
-                        "{},{}, Error: {} ({}:{})\n",
-                        s_time,
-                        e_time,
-                        err.to_string(),
-                        file!(),
-                        line!(),
-                    );
-                    append_error_log(msg).await;
-                }
+                response_sender.send(metrics).unwrap();
             });
 
             tx.send_async(request_handle).await.unwrap();
@@ -252,7 +217,7 @@ pub fn spawn_request_loop_with_timestamp(
                 let response = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(100),
+                    Duration::from_secs((output_length as f64 * 0.4) as u64),
                 )
                 .await
                 .unwrap();
@@ -262,17 +227,7 @@ pub fn spawn_request_loop_with_timestamp(
                 metrics.insert("e_time".to_string(), e_time.to_string());
                 metrics.insert("input_length".to_string(), input_length.to_string());
                 metrics.insert("output_length".to_string(), output_length.to_string());
-                if let Err(err) = response_sender.send(metrics) {
-                    let msg = format!(
-                        "{},{}, Error: {} ({}:{})\n",
-                        s_time,
-                        e_time,
-                        err.to_string(),
-                        file!(),
-                        line!(),
-                    );
-                    append_error_log(msg).await;
-                }
+                response_sender.send(metrics).unwrap();
             });
 
             tx.send_async(request_handle).await.unwrap();
