@@ -13,6 +13,7 @@ use tokio::{
     task::{yield_now, JoinHandle},
     time::sleep,
 };
+use tracing::instrument;
 
 use crate::{dataset::Dataset, distribution::Distribution};
 
@@ -127,20 +128,28 @@ pub fn spawn_request_loop(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let response = request_with_timeout(
+                if let Ok(response) = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    Duration::from_secs((output_length as f64 * 0.4) as u64),
+                    Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
                 )
                 .await
-                .unwrap();
-                let e_time = get_timestamp();
-                let mut metrics = parse_response(response);
-                metrics.insert("s_time".to_string(), s_time.to_string());
-                metrics.insert("e_time".to_string(), e_time.to_string());
-                metrics.insert("input_length".to_string(), input_length.to_string());
-                metrics.insert("output_length".to_string(), output_length.to_string());
-                response_sender.send(metrics).unwrap();
+                {
+                    let e_time = get_timestamp();
+                    let mut metrics = parse_response(response);
+                    metrics.insert("s_time".to_string(), s_time.to_string());
+                    metrics.insert("e_time".to_string(), e_time.to_string());
+                    metrics.insert("input_length".to_string(), input_length.to_string());
+                    metrics.insert("output_length".to_string(), output_length.to_string());
+                    response_sender.send(metrics).unwrap();
+                } else {
+                    tracing::error!(
+                        "Request {} failed with input {} output {}",
+                        count,
+                        input_length,
+                        output_length
+                    );
+                }
             });
 
             tx.send_async(request_handle).await.unwrap();
@@ -156,6 +165,7 @@ pub fn spawn_request_loop(
     handle
 }
 
+#[instrument(skip_all)]
 pub fn spawn_request_loop_with_timestamp(
     endpoint: String,
     endpoints: Option<Vec<String>>,
@@ -214,20 +224,28 @@ pub fn spawn_request_loop_with_timestamp(
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
-                let response = request_with_timeout(
+                if let Ok(response) = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    Duration::from_secs((output_length as f64 * 0.4) as u64),
+                    Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
                 )
                 .await
-                .unwrap();
-                let e_time = get_timestamp();
-                let mut metrics = parse_response(response);
-                metrics.insert("s_time".to_string(), s_time.to_string());
-                metrics.insert("e_time".to_string(), e_time.to_string());
-                metrics.insert("input_length".to_string(), input_length.to_string());
-                metrics.insert("output_length".to_string(), output_length.to_string());
-                response_sender.send(metrics).unwrap();
+                {
+                    let e_time = get_timestamp();
+                    let mut metrics = parse_response(response);
+                    metrics.insert("s_time".to_string(), s_time.to_string());
+                    metrics.insert("e_time".to_string(), e_time.to_string());
+                    metrics.insert("input_length".to_string(), input_length.to_string());
+                    metrics.insert("output_length".to_string(), output_length.to_string());
+                    response_sender.send(metrics).unwrap();
+                } else {
+                    tracing::error!(
+                        "Request {} failed with input {} output {}",
+                        count,
+                        input_length,
+                        output_length
+                    );
+                }
             });
 
             tx.send_async(request_handle).await.unwrap();
