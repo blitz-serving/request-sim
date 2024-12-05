@@ -87,6 +87,15 @@ impl Protocol for StProtocol {
                     first_decode_token_time,
                 );
 
+                let max_time_between_tokens_except_first = response
+                    .headers()
+                    .get("x-max-time-between-tokens-except-first")
+                    .map_or("0".to_string(), |hv| hv.to_str().unwrap().to_string());
+                map.insert(
+                    "max_time_between_tokens_except_first".to_string(),
+                    max_time_between_tokens_except_first,
+                );
+
                 let max_time_between_tokens = response
                     .headers()
                     .get("x-max-time-between-tokens")
