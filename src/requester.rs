@@ -9,13 +9,17 @@ use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
     spawn,
-    sync::oneshot,
+    sync::{broadcast, oneshot},
     task::{yield_now, JoinHandle},
     time::sleep,
 };
 use tracing::instrument;
 
-use crate::{dataset::Dataset, distribution::Distribution};
+use crate::{
+    dataset::Dataset,
+    distribution::Distribution,
+    scale_event::{self, ScaleEvent},
+};
 
 pub struct IntervalGenerator {
     distribution: Box<dyn Distribution>,
@@ -121,7 +125,7 @@ pub fn spawn_request_loop(
                 true => endpoints
                     .as_ref()
                     .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
-            };
+            }.clone();
             assert!(endpoint.is_some());
             let (input_length, output_length) = dataset.next_request(prefill_only, truncate);
             let json_body = protocol.request_json_body(input_length, output_length);
@@ -175,7 +179,8 @@ pub fn spawn_request_loop_with_timestamp(
     protocol: Box<dyn crate::protocols::Protocol + Send>,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
-    mut stopped: oneshot::Receiver<()>,
+    scale_events: Option<ScaleEvent>,
+    broadcast_tx: broadcast::Sender<()>,
 ) -> JoinHandle<()> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     BASETIME.get_or_init(|| Instant::now());
@@ -191,12 +196,61 @@ pub fn spawn_request_loop_with_timestamp(
 
     let (tx, rx) = flume::unbounded();
     let handle = spawn(wait_all(rx));
+    let mut scale_rx = broadcast_tx.subscribe();
+    let mut gen_rx = broadcast_tx.subscribe();
+    let new_endpoint = endpoint.clone();
 
+    if scale_events.is_some() {
+        spawn(async move {
+            loop {
+                if scale_rx.try_recv().is_ok() {
+                    break;
+                }
+                let scale_endpoint = new_endpoint.clone()
+                    .split('/')
+                    .take(3)
+                    .collect::<Vec<&str>>()
+                    .join("/")
+                    + "/modify_cluster_state";
+                let current_timestamp = get_timestamp();
+                let (ts, src, dst, event_type) =
+                    scale_events.as_ref().unwrap().next_event_with_timestamp();
+                let next_timestamp = (ts as f64 / scale_factor) as u64;
+
+                if next_timestamp > current_timestamp + 1 {
+                    sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
+                } else {
+                    yield_now().await;
+                }
+                let json_body = scale_events
+                    .as_ref()
+                    .unwrap()
+                    .request_json_body(src, dst, event_type);
+                spawn(async move {
+                    if let Ok(_response) = request_with_timeout(
+                        scale_endpoint.as_str(),
+                        json_body.to_string(),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    {
+                    } else {
+                        tracing::error!(
+                            "Scale request failed with src {} dst {} event_type {:?}",
+                            src,
+                            dst,
+                            event_type
+                        );
+                    }
+                });
+            }
+        });
+    }
     spawn(async move {
         let mut count = 0u64;
         loop {
             count += 1;
-            if stopped.try_recv().is_ok() {
+            if gen_rx.try_recv().is_ok() {
                 break;
             }
 

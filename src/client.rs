@@ -6,9 +6,10 @@ use request_sim::{
         create_gamma_interval_generator, report_loop, spawn_request_loop,
         spawn_request_loop_with_timestamp,
     },
+    scale_event::ScaleEvent,
 };
 use tokenizers::Tokenizer;
-use tokio::{spawn, sync::oneshot};
+use tokio::{spawn, sync::{broadcast, oneshot}};
 
 #[derive(Parser)]
 struct Args {
@@ -54,6 +55,9 @@ struct Args {
     /// Note that if the replay_mode is enabled, the cv will be ignored and the requests will not be shuffled.
     #[clap(long, default_value_t = false)]
     replay_mode: bool,
+
+    #[clap(long)]
+    scale_replay_path: Option<String>,
 
     /// Request rate (request per second). It only takes effect when `replay_mode` is disabled.
     #[clap(long)]
@@ -115,6 +119,7 @@ async fn async_main(args: Args) {
         dataset_path,
         second_dataset_path,
         replay_mode,
+        scale_replay_path,
         request_rate,
         scale_factor,
         cv,
@@ -151,7 +156,18 @@ async fn async_main(args: Args) {
             Dataset::cherry_pick_burstgpt(&dataset_path.unwrap(), !replay_mode, start_ts, end_ts)
         }
     };
+    let scale_events = if scale_replay_path.is_some() {
+        assert_eq!(replay_mode, true);
+        let mut scale_event = ScaleEvent::new();
+        scale_event.parse_event_csv(&scale_replay_path.unwrap()); 
+        Some(scale_event)
+    } else {
+        None
+    };
     let (stop_tx, stop_rx) = oneshot::channel();
+    let (broad_tx, _rx) = broadcast::channel(1);
+
+
 
     let protocol: Box<dyn request_sim::protocols::Protocol + Send> = match protocol {
         Protocol::St => Box::new(StProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
@@ -173,7 +189,8 @@ async fn async_main(args: Args) {
             protocol,
             scale_factor.unwrap(),
             response_tx,
-            stop_rx,
+            scale_events,
+            broad_tx.clone(),
         )
     } else {
         spawn_request_loop(
@@ -193,6 +210,7 @@ async fn async_main(args: Args) {
 
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
     stop_tx.send(()).unwrap();
+    broad_tx.send(()).unwrap();
 
     requester_handle.await.unwrap();
     reporter_handle.await.unwrap();
