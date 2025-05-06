@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -15,11 +18,7 @@ use tokio::{
 };
 use tracing::instrument;
 
-use crate::{
-    dataset::Dataset,
-    distribution::Distribution,
-    scale_event::{self, ScaleEvent},
-};
+use crate::{dataset::Dataset, distribution::Distribution, scale_event::ScaleEvent};
 
 pub struct IntervalGenerator {
     distribution: Box<dyn Distribution>,
@@ -98,7 +97,7 @@ pub fn spawn_request_loop(
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     BASETIME.get_or_init(|| Instant::now());
 
@@ -109,7 +108,10 @@ pub fn spawn_request_loop(
     let parse_response = protocol.parse_response();
 
     let (tx, rx) = flume::unbounded();
-    let handle = spawn(wait_all(rx));
+    let handle = spawn(async move {
+        wait_all(rx).await;
+        Ok(())
+    });
 
     spawn(async move {
         let mut timestamp = get_timestamp();
@@ -125,7 +127,8 @@ pub fn spawn_request_loop(
                 true => endpoints
                     .as_ref()
                     .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
-            }.clone();
+            }
+            .clone();
             assert!(endpoint.is_some());
             let (input_length, output_length) = dataset.next_request(prefill_only, truncate);
             let json_body = protocol.request_json_body(input_length, output_length);
@@ -181,8 +184,9 @@ pub fn spawn_request_loop_with_timestamp(
     response_sender: flume::Sender<BTreeMap<String, String>>,
     scale_events: Option<ScaleEvent>,
     broadcast_tx: broadcast::Sender<()>,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
+    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
     BASETIME.get_or_init(|| Instant::now());
     fn get_timestamp() -> u64 {
         BASETIME.get().unwrap().elapsed().as_millis() as u64
@@ -195,7 +199,15 @@ pub fn spawn_request_loop_with_timestamp(
     println!("Scaled request rate: {:.3} req/s", rr * scale_factor);
 
     let (tx, rx) = flume::unbounded();
-    let handle = spawn(wait_all(rx));
+    let handle = spawn(async move {
+        wait_all(rx).await;
+        let a = RETURNCODE.load(Ordering::Relaxed);
+        if a == 0 {
+            Ok(())
+        } else {
+            Err(a)
+        }
+    });
     let mut scale_rx = broadcast_tx.subscribe();
     let mut gen_rx = broadcast_tx.subscribe();
     let new_endpoint = endpoint.clone();
@@ -206,7 +218,8 @@ pub fn spawn_request_loop_with_timestamp(
                 if scale_rx.try_recv().is_ok() {
                     break;
                 }
-                let scale_endpoint = new_endpoint.clone()
+                let scale_endpoint = new_endpoint
+                    .clone()
                     .split('/')
                     .take(3)
                     .collect::<Vec<&str>>()
@@ -227,14 +240,14 @@ pub fn spawn_request_loop_with_timestamp(
                     .unwrap()
                     .request_json_body(src, dst, event_type);
                 spawn(async move {
-                    if let Ok(_response) = request_with_timeout(
+                    if let Err(_) = request_with_timeout(
                         scale_endpoint.as_str(),
                         json_body.to_string(),
                         Duration::from_secs(10),
                     )
                     .await
                     {
-                    } else {
+                        RETURNCODE.store(-1, Ordering::Relaxed);
                         tracing::error!(
                             "Scale request failed with src {} dst {} event_type {:?}",
                             src,
@@ -281,7 +294,7 @@ pub fn spawn_request_loop_with_timestamp(
                 if let Ok(response) = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
+                    Duration::from_secs(20),
                 )
                 .await
                 {
@@ -293,6 +306,7 @@ pub fn spawn_request_loop_with_timestamp(
                     metrics.insert("output_length".to_string(), output_length.to_string());
                     response_sender.send(metrics).unwrap();
                 } else {
+                    RETURNCODE.store(-1, Ordering::Relaxed);
                     tracing::error!(
                         "Request {} failed with input {} output {}",
                         count,

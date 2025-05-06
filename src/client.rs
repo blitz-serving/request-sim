@@ -9,7 +9,10 @@ use request_sim::{
     scale_event::ScaleEvent,
 };
 use tokenizers::Tokenizer;
-use tokio::{spawn, sync::{broadcast, oneshot}};
+use tokio::{
+    spawn,
+    sync::{broadcast, oneshot},
+};
 
 #[derive(Parser)]
 struct Args {
@@ -108,7 +111,7 @@ enum Protocol {
     Mock,
 }
 
-async fn async_main(args: Args) {
+async fn async_main(args: Args) -> Result<(), i32> {
     let Args {
         tokenizer,
         threads: _,
@@ -159,15 +162,13 @@ async fn async_main(args: Args) {
     let scale_events = if scale_replay_path.is_some() {
         assert_eq!(replay_mode, true);
         let mut scale_event = ScaleEvent::new();
-        scale_event.parse_event_csv(&scale_replay_path.unwrap()); 
+        scale_event.parse_event_csv(&scale_replay_path.unwrap());
         Some(scale_event)
     } else {
         None
     };
     let (stop_tx, stop_rx) = oneshot::channel();
     let (broad_tx, _rx) = broadcast::channel(1);
-
-
 
     let protocol: Box<dyn request_sim::protocols::Protocol + Send> = match protocol {
         Protocol::St => Box::new(StProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
@@ -212,15 +213,15 @@ async fn async_main(args: Args) {
     stop_tx.send(()).unwrap();
     broad_tx.send(()).unwrap();
 
-    requester_handle.await.unwrap();
+    let returnval = requester_handle.await.unwrap();
     reporter_handle.await.unwrap();
+    return returnval;
 }
 
-fn main() {
+fn main() -> Result<(), i32> {
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
         .finish();
-
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     let args = Args::parse();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -231,5 +232,5 @@ fn main() {
     .enable_all()
     .build()
     .unwrap()
-    .block_on(async_main(args));
+    .block_on(async_main(args))
 }
