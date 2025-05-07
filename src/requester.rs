@@ -294,7 +294,7 @@ pub fn spawn_request_loop_with_timestamp(
                 if let Ok(response) = request_with_timeout(
                     endpoint.unwrap().as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(20),
+                    Duration::from_secs(15 + output_length / 10),
                 )
                 .await
                 {
