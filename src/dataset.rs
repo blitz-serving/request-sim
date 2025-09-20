@@ -3,19 +3,12 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
+    mem,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::{token_sampler::TokenSampler, SpinLock};
-use rand::{seq::SliceRandom, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
-
-pub struct Dataset {
-    dataset_size: usize,
-    requests: Vec<(u64, u64)>,
-    next_index: AtomicUsize,
-}
 
 /// jsonl of Bailian
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,41 +34,46 @@ pub(crate) struct MooncakeDataItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AzureDataItem {
-    pub input_length: u64,
-    pub output_length: u64,
+    #[serde(rename = "TIMESTAMP")]
+    pub timestamp: f32,
+    #[serde(rename = "ContextTokens")]
+    pub context_tokens: u64,
+    #[serde(rename = "GeneratedTokens")]
+    pub generated_tokens: u64,
 }
 
-pub(crate) struct DataIter<T> {
-    data: *const Vec<T>, // data never moves!
+pub struct DataIter {
+    base: *const u8, // a pinned pointer!
+    len: usize,
+    sizeof: usize,
     index: AtomicUsize,
 }
 
-impl<T> Iterator for DataIter<T> {
+impl Iterator for DataIter {
     type Item = *const u8;
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
-            let mut i = self.index.fetch_add(1, Ordering::AcqRel);
-            if i == (*self.data).len() {
-                self.index.store(0, Ordering::Release);
-                i = 0;
+            let i = self.index.fetch_add(1, Ordering::AcqRel);
+            if i == self.len {
+                // fuse the iterator
+                self.index.store(i, Ordering::Release);
+                return None;
             }
-            let p: *const T = &(*self.data)[i];
-            Some(p as *const u8)
+            Some(self.base.add(i * self.sizeof))
         }
     }
 }
 
-pub(crate) trait LLMTrace {
+pub trait LLMTrace {
     fn load(&mut self, path: &str);
-    fn inflate(&self, item: *const u8, ts: &TokenSampler) -> String;
-    type DataItem;
-    fn iter(&self) -> DataIter<Self::DataItem>;
+    fn inflate(&self, item: *const u8, ts: &TokenSampler) -> (String, u64);
+    fn iter(&self) -> DataIter;
 }
 
 //
 // ============== BailianDataset ==============
 //
-pub(crate) struct BailianDataset {
+pub struct BailianDataset {
     items: Vec<BailianDataItem>,
     user_prompts: UnsafeCell<HashMap<u64, String>>,
     mtx: SpinLock,
@@ -95,8 +93,6 @@ unsafe impl Send for BailianDataset {}
 unsafe impl Sync for BailianDataset {}
 
 impl LLMTrace for BailianDataset {
-    type DataItem = BailianDataItem;
-
     fn load(&mut self, path: &str) {
         let file = File::open(path).unwrap();
         for line in BufReader::new(file).lines() {
@@ -105,34 +101,45 @@ impl LLMTrace for BailianDataset {
         }
     }
 
-    fn iter(&self) -> DataIter<BailianDataItem> {
-        DataIter::<BailianDataItem> {
-            data: &self.items,
+    fn iter(&self) -> DataIter {
+        DataIter {
+            base: self.items.as_ptr() as *const u8,
+            len: self.items.len(),
+            sizeof: mem::size_of::<BailianDataItem>(),
             index: AtomicUsize::new(0),
         }
     }
 
-    fn inflate(&self, item: *const u8, ts: &TokenSampler) -> String {
+    fn inflate(&self, item: *const u8, ts: &TokenSampler) -> (String, u64) {
+        // NOTE: the last block hash may be hashed onto a partially filled block
+        const BLOCK_SIZE: usize = 16;
         unsafe {
-            let data_item = item as *mut BailianDataItem;
+            let data_item = item as *const BailianDataItem;
             let last_block_len =
-                (*data_item).input_length as usize - (*data_item).hash_ids.len() * 16;
-            debug_assert!(last_block_len <= 16);
+                (*data_item).input_length as usize - ((*data_item).hash_ids.len() - 1) * BLOCK_SIZE;
+            debug_assert!(last_block_len <= BLOCK_SIZE);
 
             let mut prompt = String::new();
-            for &hash_id in (*data_item).hash_ids.iter() {
+            for &hash_id in (*data_item).hash_ids.iter().rev().skip(1) {
                 self.mtx.lock();
                 if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
                     prompt.push_str(&s);
                 } else {
-                    let s = ts.gen_string(16);
+                    let s = ts.gen_string(BLOCK_SIZE);
                     prompt.push_str(&s);
                     (&mut *self.user_prompts.get()).insert(hash_id, s);
                 }
                 self.mtx.unlock();
             }
 
-            prompt
+            let last_block_prompt = ts.gen_string(last_block_len);
+            prompt.push_str(&last_block_prompt);
+            self.mtx.lock();
+            (&mut *self.user_prompts.get())
+                .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
+            self.mtx.unlock();
+
+            (prompt, (*data_item).output_length)
         }
     }
 }
@@ -140,7 +147,7 @@ impl LLMTrace for BailianDataset {
 //
 // ============== MooncakeDataset ==============
 //
-pub(crate) struct MooncakeDataset {
+pub struct MooncakeDataset {
     items: Vec<MooncakeDataItem>,
     user_prompts: UnsafeCell<HashMap<u64, String>>,
     mtx: SpinLock,
@@ -160,40 +167,53 @@ impl MooncakeDataset {
 }
 
 impl LLMTrace for MooncakeDataset {
-    type DataItem = MooncakeDataItem;
-
     fn load(&mut self, path: &str) {
         let file = File::open(path).unwrap();
         for line in BufReader::new(file).lines() {
-            let item: MooncakeDataItem =
-                serde_json::from_str(line.unwrap().as_str()).unwrap();
+            let item: MooncakeDataItem = serde_json::from_str(line.unwrap().as_str()).unwrap();
             self.items.push(item);
         }
     }
 
-    fn iter(&self) -> DataIter<MooncakeDataItem> {
-        DataIter::<MooncakeDataItem> {
-            data: &self.items,
+    fn iter(&self) -> DataIter {
+        DataIter {
+            base: self.items.as_ptr() as *const u8,
+            len: self.items.len(),
+            sizeof: mem::size_of::<MooncakeDataItem>(),
             index: AtomicUsize::new(0),
         }
     }
 
-    fn inflate(&self, item: *const u8, ts: &TokenSampler) -> String {
+    fn inflate(&self, item: *const u8, ts: &TokenSampler) -> (String, u64) {
+        // NOTE: the last block hash may be hashed onto a partially filled block
+        const BLOCK_SIZE: usize = 512;
         unsafe {
-            let data_item = item as *mut MooncakeDataItem;
+            let data_item = item as *const MooncakeDataItem;
+            let last_block_len =
+                (*data_item).input_length as usize - ((*data_item).hash_ids.len() - 1) * BLOCK_SIZE;
+            debug_assert!(last_block_len <= BLOCK_SIZE);
+
             let mut prompt = String::new();
-            for &hash_id in (*data_item).hash_ids.iter() {
+            for &hash_id in (*data_item).hash_ids.iter().rev().skip(1) {
                 self.mtx.lock();
                 if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
                     prompt.push_str(&s);
                 } else {
-                    let s = ts.gen_string(16);
+                    let s = ts.gen_string(BLOCK_SIZE);
                     prompt.push_str(&s);
                     (&mut *self.user_prompts.get()).insert(hash_id, s);
                 }
                 self.mtx.unlock();
             }
-            prompt
+
+            let last_block_prompt = ts.gen_string(last_block_len);
+            prompt.push_str(&last_block_prompt);
+            self.mtx.lock();
+            (&mut *self.user_prompts.get())
+                .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
+            self.mtx.unlock();
+
+            (prompt, (*data_item).output_length)
         }
     }
 }
@@ -201,8 +221,10 @@ impl LLMTrace for MooncakeDataset {
 //
 // ============== AzureDataset ==============
 //
-pub(crate) struct AzureDataset {
+pub struct AzureDataset {
     items: Vec<AzureDataItem>,
+    user_prompts: UnsafeCell<Vec<String>>, // each string represents 16 tokens
+    mtx: SpinLock,
 }
 
 unsafe impl Send for AzureDataset {}
@@ -210,13 +232,15 @@ unsafe impl Sync for AzureDataset {}
 
 impl AzureDataset {
     pub fn new() -> Self {
-        Self { items: Vec::new() }
+        Self {
+            items: Vec::new(),
+            user_prompts: UnsafeCell::new(Vec::with_capacity(1024)),
+            mtx: SpinLock::new(),
+        }
     }
 }
 
 impl LLMTrace for AzureDataset {
-    type DataItem = AzureDataItem;
-
     fn load(&mut self, path: &str) {
         let mut rdr = csv::Reader::from_path(path).unwrap();
         for result in rdr.deserialize() {
@@ -225,21 +249,51 @@ impl LLMTrace for AzureDataset {
         }
     }
 
-    fn iter(&self) -> DataIter<AzureDataItem> {
-        DataIter::<AzureDataItem> {
-            data: &self.items,
+    fn iter(&self) -> DataIter {
+        DataIter {
+            base: self.items.as_ptr() as *const u8,
+            len: self.items.len(),
+            sizeof: mem::size_of::<AzureDataItem>(),
             index: AtomicUsize::new(0),
         }
     }
 
-    fn inflate(&self, item: *const u8, _ts: &TokenSampler) -> String {
+    fn inflate(&self, item: *const u8, ts: &TokenSampler) -> (String, u64) {
         unsafe {
-            let data_item = item as *mut AzureDataItem;
-            format!(
-                "[Azure] in={} out={}",
-                (*data_item).input_length,
-                (*data_item).output_length
-            )
+            let AzureDataItem {
+                timestamp: _,
+                context_tokens,
+                generated_tokens,
+            } = *(item as *const AzureDataItem);
+
+            let last_block_len = (context_tokens % 16) as usize;
+            let num_blocks = (context_tokens as usize - last_block_len) / 16;
+
+            let mut prompt = String::new();
+            self.mtx.lock();
+            let n = (&*self.user_prompts.get()).len();
+            if n >= num_blocks {
+                for s in &(*self.user_prompts.get())[0..num_blocks] {
+                    prompt.push_str(s);
+                }
+            } else {
+                for s in &(*self.user_prompts.get())[0..n] {
+                    prompt.push_str(s);
+                }
+                self.mtx.unlock();
+                let new_prompts: Vec<String> = (n..num_blocks).map(|_| ts.gen_string(16)).collect();
+                for s in new_prompts.iter() {
+                    prompt.push_str(s);
+                }
+                self.mtx.lock();
+                (&mut *self.user_prompts.get()).extend(new_prompts);
+            }
+            self.mtx.unlock();
+
+            let last_block_prompt = ts.gen_string(last_block_len);
+            prompt.push_str(&last_block_prompt);
+
+            (prompt, generated_tokens)
         }
     }
 }
@@ -247,72 +301,69 @@ impl LLMTrace for AzureDataset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
+    use crate::token_sampler::TokenSampler;
+    use tokenizers::Tokenizer;
 
-    struct DummySampler;
-    impl DummySampler {
-        fn new() -> Self { DummySampler }
-        fn gen_string(&self, n: usize) -> String {
-            format!("dummy_{n}")
+    #[test]
+    fn test_bailian_dataset() {
+        let path = "./data/test/bailian.jsonl";
+        let mut ds = BailianDataset::new();
+        ds.load(path);
+
+        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
+
+        let ts = TokenSampler::new(tokenizer);
+        let mut iter = ds.iter();
+
+        for _ in 0..5 {
+            if let Some(ptr) = iter.next() {
+                let (prompt, out_len) = ds.inflate(ptr, &ts);
+                println!(
+                    "Bailian prompt = \"{}\", output length = {}",
+                    prompt, out_len
+                );
+            }
         }
     }
 
     #[test]
-    fn test_bailian_dataset() {
-        let mut tmp = NamedTempFile::new().unwrap();
-        writeln!(
-            tmp,
-            r#"{{"chat_id":1,"parent_chat_id":0,"timestamp":0.0,"input_length":16,"output_length":4,"type":"test","turn":1,"hash_ids":[42]}}"#
-        )
-        .unwrap();
-
-        let mut ds = BailianDataset::new();
-        ds.load(tmp.path().to_str().unwrap());
-
-        let mut it = ds.iter();
-        let sampler = DummySampler::new();
-
-        let item_ptr = it.next().unwrap();
-        let s = ds.inflate(item_ptr, &sampler);
-        assert!(s.contains("dummy_16"));
-    }
-
-    #[test]
     fn test_mooncake_dataset() {
-        let mut tmp = NamedTempFile::new().unwrap();
-        writeln!(
-            tmp,
-            r#"{{"timestamp":123,"input_length":16,"output_length":8,"hash_ids":[7,8]}}"#
-        )
-        .unwrap();
-
+        let path = "./data/test/mooncake.jsonl";
         let mut ds = MooncakeDataset::new();
-        ds.load(tmp.path().to_str().unwrap());
+        ds.load(path);
 
-        let mut it = ds.iter();
-        let sampler = DummySampler::new();
+        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
-        let item_ptr = it.next().unwrap();
-        let s = ds.inflate(item_ptr, &sampler);
-        assert!(s.contains("dummy_16"));
+        let ts = TokenSampler::new(tokenizer);
+        let mut iter = ds.iter();
+
+        for _ in 0..5 {
+            if let Some(ptr) = iter.next() {
+                let (prompt, out_len) = ds.inflate(ptr, &ts);
+                println!(
+                    "Mooncake prompt = \"{}\", output length = {}",
+                    prompt, out_len
+                );
+            }
+        }
     }
 
     #[test]
     fn test_azure_dataset() {
-        let mut tmp = NamedTempFile::new().unwrap();
-        writeln!(tmp, "input_length,output_length").unwrap();
-        writeln!(tmp, "10,20").unwrap();
-
+        let path = "./data/test/azure.csv";
         let mut ds = AzureDataset::new();
-        ds.load(tmp.path().to_str().unwrap());
+        ds.load(path);
 
-        let mut it = ds.iter();
-        let sampler = DummySampler::new();
+        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
-        let item_ptr = it.next().unwrap();
-        let s = ds.inflate(item_ptr, &sampler);
-        assert!(s.contains("in=10"));
-        assert!(s.contains("out=20"));
+        let ts = TokenSampler::new(tokenizer);
+        let mut iter = ds.iter();
+
+        for _ in 0..5 {
+            if let Some(ptr) = iter.next() {
+                let (prompt, out_len) = ds.inflate(ptr, &ts);
+                println!("Azure prompt = \"{}\", output length = {}", prompt, out_len);
+            }
+        }
     }
 }

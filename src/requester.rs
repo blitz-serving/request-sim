@@ -14,7 +14,7 @@ use tokio::{
     time::sleep,
 };
 
-use crate::{dataset::Dataset, distribution::Distribution, protocols::Protocol};
+use crate::{dataset::LLMTrace, distribution::Distribution, protocols::Protocol};
 
 pub struct IntervalGenerator {
     distribution: Box<dyn Distribution>,
@@ -63,7 +63,7 @@ async fn request(endpoint: &str, json_body: String) -> Response {
 /// Await on the returned handle to wait for the loop to finish.
 pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     endpoint: String,
-    dataset: Dataset,
+    dataset: Box<dyn LLMTrace>,
     protocol: P,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
@@ -87,7 +87,8 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
                 break;
             }
             let endpoint = endpoint.clone();
-            let (input_length, output_length) = dataset.next_request();
+            let (input_length, output_length) = (0, 0);
+            // let (input_length, output_length) = dataset.next_request();
             let json_body = protocol.request_json_body(input_length, output_length);
             let response_sender = response_sender.clone();
             let request_handle = spawn(async move {

@@ -1,6 +1,6 @@
 use clap::Parser;
 use request_sim::{
-    dataset::Dataset,
+    dataset::{AzureDataset, BailianDataset, LLMTrace, MooncakeDataset},
     protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol, Protocol},
     requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
 };
@@ -61,7 +61,7 @@ async fn async_main(args: Args) {
         dataset_type,
         dataset_path,
         time_in_secs,
-        protocol
+        protocol,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -73,9 +73,22 @@ async fn async_main(args: Args) {
         .unwrap();
 
     let (tx, rx) = flume::unbounded();
-    let dataset = match dataset_type.to_lowercase().as_str() {
-        "mooncake" => Dataset::load_mooncake_jsonl(dataset_path.as_str()),
-        "burstgpt" => Dataset::load_burstgpt_csv(dataset_path.as_str()),
+    let dataset: Box<dyn LLMTrace> = match dataset_type.to_lowercase().as_str() {
+        "mooncake" => {
+            let mut dataset = Box::new(MooncakeDataset::new());
+            dataset.load(dataset_path.as_str());
+            dataset
+        }
+        "burstgpt" => {
+            let mut dataset = Box::new(AzureDataset::new());
+            dataset.load(dataset_path.as_str());
+            dataset
+        }
+        "bailian" => {
+            let mut dataset = Box::new(BailianDataset::new());
+            dataset.load(dataset_path.as_str());
+            dataset
+        }
         _ => panic!("Invalid dataset type"),
     };
     let interval_generator = create_gamma_interval_generator(request_rate, cv);
@@ -83,12 +96,26 @@ async fn async_main(args: Args) {
     let handle_1 = match protocol.to_lowercase().as_str() {
         "tgi" => {
             let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(endpoint, dataset, tgi_protocol, interval_generator, tx, stop_rx)
-        },
+            spawn_request_loop(
+                endpoint,
+                dataset,
+                tgi_protocol,
+                interval_generator,
+                tx,
+                stop_rx,
+            )
+        }
         "vllm" => {
             let vllm_protocol = VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(endpoint, dataset, vllm_protocol, interval_generator, tx, stop_rx)
-        },
+            spawn_request_loop(
+                endpoint,
+                dataset,
+                vllm_protocol,
+                interval_generator,
+                tx,
+                stop_rx,
+            )
+        }
         _ => panic!("Unsupported protocol type"),
     };
     let handle_2 = spawn(report_loop(output_file, rx));
