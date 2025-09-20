@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{token_sampler::TokenSampler, SpinLock};
+use crate::{token_sampler::TokenSampler, SpinLock, SpinRwLock};
 use serde::{Deserialize, Serialize};
 
 /// jsonl of Bailian
@@ -76,7 +76,7 @@ pub trait LLMTrace {
 pub struct BailianDataset {
     items: Vec<BailianDataItem>,
     user_prompts: UnsafeCell<HashMap<u64, String>>,
-    mtx: SpinLock,
+    rwlock: SpinRwLock,
 }
 
 impl BailianDataset {
@@ -84,7 +84,7 @@ impl BailianDataset {
         Self {
             items: Vec::new(),
             user_prompts: UnsafeCell::new(HashMap::new()),
-            mtx: SpinLock::new(),
+            rwlock: SpinRwLock::new(),
         }
     }
 }
@@ -120,24 +120,32 @@ impl LLMTrace for BailianDataset {
             debug_assert!(last_block_len <= BLOCK_SIZE);
 
             let mut prompt = String::new();
-            for &hash_id in (*data_item).hash_ids.iter().rev().skip(1) {
-                self.mtx.lock();
+            for &hash_id in (*data_item)
+                .hash_ids
+                .iter()
+                .take((*data_item).hash_ids.len() - 1)
+            {
+                // loop invariant: rwlock is free
+                self.rwlock.read_lock();
                 if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
                     prompt.push_str(&s);
+                    self.rwlock.read_unlock();
                 } else {
+                    self.rwlock.read_unlock();
                     let s = ts.gen_string(BLOCK_SIZE);
                     prompt.push_str(&s);
+                    self.rwlock.write_lock();
                     (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    self.rwlock.write_unlock();
                 }
-                self.mtx.unlock();
             }
 
             let last_block_prompt = ts.gen_string(last_block_len);
             prompt.push_str(&last_block_prompt);
-            self.mtx.lock();
+            self.rwlock.write_lock();
             (&mut *self.user_prompts.get())
                 .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
-            self.mtx.unlock();
+            self.rwlock.write_unlock();
 
             (prompt, (*data_item).output_length)
         }
@@ -150,7 +158,7 @@ impl LLMTrace for BailianDataset {
 pub struct MooncakeDataset {
     items: Vec<MooncakeDataItem>,
     user_prompts: UnsafeCell<HashMap<u64, String>>,
-    mtx: SpinLock,
+    rwlock: SpinRwLock,
 }
 
 unsafe impl Send for MooncakeDataset {}
@@ -161,7 +169,7 @@ impl MooncakeDataset {
         Self {
             items: Vec::new(),
             user_prompts: UnsafeCell::new(HashMap::new()),
-            mtx: SpinLock::new(),
+            rwlock: SpinRwLock::new(),
         }
     }
 }
@@ -194,24 +202,33 @@ impl LLMTrace for MooncakeDataset {
             debug_assert!(last_block_len <= BLOCK_SIZE);
 
             let mut prompt = String::new();
-            for &hash_id in (*data_item).hash_ids.iter().rev().skip(1) {
-                self.mtx.lock();
+            for &hash_id in (*data_item)
+                .hash_ids
+                .iter()
+                .take((*data_item).hash_ids.len() - 1)
+            {
+                // loop invariant: rwlock is free
+                self.rwlock.read_lock();
                 if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
                     prompt.push_str(&s);
+                    self.rwlock.read_unlock();
                 } else {
+                    self.rwlock.read_unlock();
                     let s = ts.gen_string(BLOCK_SIZE);
                     prompt.push_str(&s);
+                    self.rwlock.write_lock();
                     (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    self.rwlock.write_unlock();
                 }
-                self.mtx.unlock();
             }
+            // postcond: rwlock is free
 
             let last_block_prompt = ts.gen_string(last_block_len);
             prompt.push_str(&last_block_prompt);
-            self.mtx.lock();
+            self.rwlock.write_lock();
             (&mut *self.user_prompts.get())
                 .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
-            self.mtx.unlock();
+            self.rwlock.write_unlock();
 
             (prompt, (*data_item).output_length)
         }
@@ -224,7 +241,7 @@ impl LLMTrace for MooncakeDataset {
 pub struct AzureDataset {
     items: Vec<AzureDataItem>,
     user_prompts: UnsafeCell<Vec<String>>, // each string represents 16 tokens
-    mtx: SpinLock,
+    rwlock: SpinRwLock,
 }
 
 unsafe impl Send for AzureDataset {}
@@ -235,7 +252,7 @@ impl AzureDataset {
         Self {
             items: Vec::new(),
             user_prompts: UnsafeCell::new(Vec::with_capacity(1024)),
-            mtx: SpinLock::new(),
+            rwlock: SpinRwLock::new(),
         }
     }
 }
@@ -270,25 +287,27 @@ impl LLMTrace for AzureDataset {
             let num_blocks = (context_tokens as usize - last_block_len) / 16;
 
             let mut prompt = String::new();
-            self.mtx.lock();
+            self.rwlock.read_lock();
             let n = (&*self.user_prompts.get()).len();
             if n >= num_blocks {
-                for s in &(*self.user_prompts.get())[0..num_blocks] {
+                for s in &(&(*self.user_prompts.get()))[0..num_blocks] {
                     prompt.push_str(s);
                 }
+                self.rwlock.read_unlock();
             } else {
-                for s in &(*self.user_prompts.get())[0..n] {
+                for s in &(&(*self.user_prompts.get()))[0..n] {
                     prompt.push_str(s);
                 }
-                self.mtx.unlock();
+                self.rwlock.read_unlock();
                 let new_prompts: Vec<String> = (n..num_blocks).map(|_| ts.gen_string(16)).collect();
                 for s in new_prompts.iter() {
                     prompt.push_str(s);
                 }
-                self.mtx.lock();
+                self.rwlock.write_lock();
                 (&mut *self.user_prompts.get()).extend(new_prompts);
+                self.rwlock.write_unlock();
             }
-            self.mtx.unlock();
+            // postcond: self.rwlock is unlocked
 
             let last_block_prompt = ts.gen_string(last_block_len);
             prompt.push_str(&last_block_prompt);
@@ -313,16 +332,14 @@ mod tests {
         let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
         let ts = TokenSampler::new(tokenizer);
-        let mut iter = ds.iter();
+        let iter = ds.iter();
 
-        for _ in 0..5 {
-            if let Some(ptr) = iter.next() {
-                let (prompt, out_len) = ds.inflate(ptr, &ts);
-                println!(
-                    "Bailian prompt = \"{}\", output length = {}",
-                    prompt, out_len
-                );
-            }
+        for p in iter {
+            let (prompt, out_len) = ds.inflate(p, &ts);
+            println!(
+                "Bailian prompt = \"{}\", output length = {}",
+                prompt, out_len
+            );
         }
     }
 
@@ -335,16 +352,14 @@ mod tests {
         let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
         let ts = TokenSampler::new(tokenizer);
-        let mut iter = ds.iter();
+        let iter = ds.iter();
 
-        for _ in 0..5 {
-            if let Some(ptr) = iter.next() {
-                let (prompt, out_len) = ds.inflate(ptr, &ts);
-                println!(
-                    "Mooncake prompt = \"{}\", output length = {}",
-                    prompt, out_len
-                );
-            }
+        for p in iter {
+            let (prompt, out_len) = ds.inflate(p, &ts);
+            println!(
+                "Mooncake prompt = \"{}\", output length = {}",
+                prompt, out_len
+            );
         }
     }
 
@@ -357,13 +372,11 @@ mod tests {
         let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
         let ts = TokenSampler::new(tokenizer);
-        let mut iter = ds.iter();
+        let iter = ds.iter();
 
-        for _ in 0..5 {
-            if let Some(ptr) = iter.next() {
-                let (prompt, out_len) = ds.inflate(ptr, &ts);
-                println!("Azure prompt = \"{}\", output length = {}", prompt, out_len);
-            }
+        for p in iter {
+            let (prompt, out_len) = ds.inflate(p, &ts);
+            println!("Azure prompt = \"{}\", output length = {}", prompt, out_len);
         }
     }
 }
