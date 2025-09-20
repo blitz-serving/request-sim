@@ -17,6 +17,7 @@ pub struct SpinLock {
 unsafe impl Send for SpinLock {}
 unsafe impl Sync for SpinLock {}
 
+#[allow(unused)]
 impl SpinLock {
     pub const fn new() -> Self {
         Self {
@@ -76,6 +77,9 @@ fn backoff(spins: u32) -> u32 {
         spins.saturating_add(1)
     }
 }
+
+unsafe impl Send for SpinRwLock {}
+unsafe impl Sync for SpinRwLock {}
 
 pub struct SpinRwLock {
     state: AtomicUsize,

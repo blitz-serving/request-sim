@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{token_sampler::TokenSampler, SpinLock, SpinRwLock};
+use crate::{token_sampler::TokenSampler, SpinRwLock};
 use serde::{Deserialize, Serialize};
 
 /// jsonl of Bailian
@@ -52,19 +52,20 @@ pub struct DataIter {
 impl Iterator for DataIter {
     type Item = *const u8;
     fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
-            let i = self.index.fetch_add(1, Ordering::AcqRel);
-            if i == self.len {
-                // fuse the iterator
-                self.index.store(i, Ordering::Release);
-                return None;
-            }
-            Some(self.base.add(i * self.sizeof))
+        let i = self.index.fetch_add(1, Ordering::AcqRel);
+        if i == self.len {
+            // fuse the iterator
+            self.index.store(i, Ordering::Release);
+            return None;
         }
+        Some(unsafe { self.base.add(i * self.sizeof) })
     }
 }
 
-pub trait LLMTrace {
+unsafe impl Send for DataIter {}
+unsafe impl Sync for DataIter {}
+
+pub trait LLMTrace: Send + Sync {
     fn load(&mut self, path: &str);
     fn inflate(&self, item: *const u8, ts: &TokenSampler) -> (String, u64);
     fn iter(&self) -> DataIter;

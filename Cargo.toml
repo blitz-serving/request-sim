@@ -5,9 +5,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[[bin]]
-name = "trace_generator"
-path = "src/trace_generator.rs"
+# [[bin]]
+# name = "trace_generator"
+# path = "src/trace_generator.rs"
 
 [[bin]]
 name = "client"

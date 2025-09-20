@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    sync::OnceLock,
+    pin::Pin,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -14,7 +15,9 @@ use tokio::{
     time::sleep,
 };
 
-use crate::{dataset::LLMTrace, distribution::Distribution, protocols::Protocol};
+use crate::{
+    dataset::LLMTrace, distribution::Distribution, protocols::LLMApi, token_sampler::TokenSampler,
+};
 
 pub struct IntervalGenerator {
     distribution: Box<dyn Distribution>,
@@ -61,10 +64,11 @@ async fn request(endpoint: &str, json_body: String) -> Response {
 /// - Use [`request_loop_with_timestamp`] instead if you want to control the intervals.
 ///
 /// Await on the returned handle to wait for the loop to finish.
-pub fn spawn_request_loop<P: 'static + Protocol + Send>(
+pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     endpoint: String,
-    dataset: Box<dyn LLMTrace>,
-    protocol: P,
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>, // Dataset is pinned on the heap
+    token_sampler: Arc<TokenSampler>,
+    llm_api: A,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
@@ -82,21 +86,27 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     let handle = spawn(wait_all(rx));
 
     spawn(async move {
-        loop {
+        let data_iter = dataset.iter();
+        for data_inner in data_iter {
             if stopped.try_recv().is_ok() {
                 break;
             }
+            // data to move into closure
+            let dataset = dataset.clone();
+            let ts = token_sampler.clone();
             let endpoint = endpoint.clone();
-            let (input_length, output_length) = (0, 0);
-            // let (input_length, output_length) = dataset.next_request();
-            let json_body = protocol.request_json_body(input_length, output_length);
             let response_sender = response_sender.clone();
+            let tmp = data_inner as usize;
+            // parse in another coroutine
             let request_handle = spawn(async move {
+                let (prompt, output_length) = dataset.inflate(tmp as *const u8, ts.as_ref());
+                let json_body = llm_api.request_json_body(prompt, output_length);
+
                 let s_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
                 let response = request(endpoint.as_str(), json_body.to_string()).await;
                 let e_time = BASETIME.get().unwrap().elapsed().as_millis() as u64;
 
-                let mut metrics = P::parse_response(response);
+                let mut metrics = A::parse_response(response);
                 metrics.insert("s_time".to_string(), s_time.to_string());
                 metrics.insert("e_time".to_string(), e_time.to_string());
 
@@ -111,7 +121,7 @@ pub fn spawn_request_loop<P: 'static + Protocol + Send>(
     handle
 }
 
-pub async fn request_loop_with_timestamp<P: Protocol>() {
+pub async fn request_loop_with_timestamp<P: LLMApi>() {
     unimplemented!("request_loop_with_timestamp");
 }
 

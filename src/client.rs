@@ -1,8 +1,11 @@
+use std::{pin::Pin, sync::Arc};
+
 use clap::Parser;
 use request_sim::{
     dataset::{AzureDataset, BailianDataset, LLMTrace, MooncakeDataset},
-    protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol, Protocol},
+    protocols::tgi_api::TGIApi,
     requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
+    token_sampler::TokenSampler,
 };
 use tokenizers::Tokenizer;
 use tokio::{spawn, sync::oneshot};
@@ -73,19 +76,19 @@ async fn async_main(args: Args) {
         .unwrap();
 
     let (tx, rx) = flume::unbounded();
-    let dataset: Box<dyn LLMTrace> = match dataset_type.to_lowercase().as_str() {
+    let dataset: Pin<Box<dyn LLMTrace>> = match dataset_type.to_lowercase().as_str() {
         "mooncake" => {
-            let mut dataset = Box::new(MooncakeDataset::new());
+            let mut dataset = Box::pin(MooncakeDataset::new());
             dataset.load(dataset_path.as_str());
             dataset
         }
         "burstgpt" => {
-            let mut dataset = Box::new(AzureDataset::new());
+            let mut dataset = Box::pin(AzureDataset::new());
             dataset.load(dataset_path.as_str());
             dataset
         }
         "bailian" => {
-            let mut dataset = Box::new(BailianDataset::new());
+            let mut dataset = Box::pin(BailianDataset::new());
             dataset.load(dataset_path.as_str());
             dataset
         }
@@ -95,22 +98,12 @@ async fn async_main(args: Args) {
     let (stop_tx, stop_rx) = oneshot::channel();
     let handle_1 = match protocol.to_lowercase().as_str() {
         "tgi" => {
-            let tgi_protocol = TgiProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
+            let token_sampler = TokenSampler::new(Tokenizer::from_file(tokenizer).unwrap());
             spawn_request_loop(
                 endpoint,
-                dataset,
-                tgi_protocol,
-                interval_generator,
-                tx,
-                stop_rx,
-            )
-        }
-        "vllm" => {
-            let vllm_protocol = VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop(
-                endpoint,
-                dataset,
-                vllm_protocol,
+                Arc::new(dataset),
+                Arc::new(token_sampler),
+                TGIApi,
                 interval_generator,
                 tx,
                 stop_rx,
