@@ -136,7 +136,9 @@ impl LLMTrace for BailianDataset {
                     let s = ts.gen_string(BLOCK_SIZE);
                     prompt.push_str(&s);
                     self.rwlock.write_lock();
-                    (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    if (*self.user_prompts.get()).get(&hash_id).is_none() {
+                        (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    }
                     self.rwlock.write_unlock();
                 }
             }
@@ -218,7 +220,9 @@ impl LLMTrace for MooncakeDataset {
                     let s = ts.gen_string(BLOCK_SIZE);
                     prompt.push_str(&s);
                     self.rwlock.write_lock();
-                    (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    if (*self.user_prompts.get()).get(&hash_id).is_none() {
+                        (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    }
                     self.rwlock.write_unlock();
                 }
             }
