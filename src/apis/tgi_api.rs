@@ -15,13 +15,13 @@ impl Clone for TGIApi {
 }
 
 impl LLMApi for TGIApi {
-    fn request_json_body(&self, prompt: String, output_length: u64) -> String {
+    fn request_json_body(prompt: String, output_length: u64) -> String {
         let json_body =
             serde_json::json!({"input":prompt,"parameter":{"max_new_tokens":output_length}});
         json_body.to_string()
     }
 
-    fn parse_response(&self, response: Response) -> BTreeMap<String, String> {
+    fn parse_response(response: Response) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {

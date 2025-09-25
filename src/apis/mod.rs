@@ -9,6 +9,6 @@ pub use distserve_api::DistserveApi;
 pub use tgi_api::TGIApi;
 
 pub trait LLMApi: Copy + Clone {
-    fn request_json_body(&self, prompt: String, output_length: u64) -> String;
+    fn request_json_body(prompt: String, output_length: u64) -> String;
     fn parse_response(response: Response) -> BTreeMap<String, String>;
 }

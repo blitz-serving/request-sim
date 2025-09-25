@@ -15,7 +15,7 @@ impl Clone for DistserveApi {
 }
 
 impl LLMApi for DistserveApi {
-    fn request_json_body(&self, prompt: String, output_length: u64) -> String {
+    fn request_json_body(prompt: String, output_length: u64) -> String {
         unimplemented!("this api maybe out dated, checkout for a new one!");
         let json_body = serde_json::json!({
             "prompt": prompt,
@@ -31,7 +31,7 @@ impl LLMApi for DistserveApi {
         json_body.to_string()
     }
 
-    fn parse_response(&self, response: Response) -> BTreeMap<String, String> {
+    fn parse_response(response: Response) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         map.insert("status".to_string(), response.status().as_str().to_string());
         if response.status().is_success() {

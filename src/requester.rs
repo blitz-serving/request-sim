@@ -1,11 +1,10 @@
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicI32, Ordering},
-        OnceLock,
-    },
     pin::Pin,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -21,7 +20,7 @@ use tokio::{
 use tracing::instrument;
 
 use crate::{
-    dataset::LLMTrace, distribution::Distribution, apis::LLMApi, token_sampler::TokenSampler,
+    apis::LLMApi, dataset::LLMTrace, distribution::Distribution, token_sampler::TokenSampler,
 };
 
 pub struct IntervalGenerator {
@@ -94,9 +93,7 @@ async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
 pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     endpoint: String,
     dataset: Arc<Pin<Box<dyn LLMTrace>>>,
-    prefill_only: bool,
-    truncate: Option<u64>,
-    llm_api: A,
+    token_sampler: Arc<TokenSampler>,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
@@ -117,7 +114,7 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     spawn(async move {
         let mut timestamp = get_timestamp();
         let data_iter = dataset.iter();
-        for data_inner in data_iter {
+        for data_index in data_iter {
             if stopped.try_recv().is_ok() {
                 break;
             }
@@ -126,11 +123,11 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
             let ts = token_sampler.clone();
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
-            let tmp = data_inner as usize;
             // parse in another coroutine
             let request_handle = spawn(async move {
-                let (prompt, output_length) = dataset.inflate(tmp as *const u8, ts.as_ref());
-                let json_body = llm_api.request_json_body(prompt, output_length);
+                let (prompt, input_length, output_length) =
+                    dataset.inflate(data_index, ts.as_ref());
+                let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
                 if let Ok(response) = request_with_timeout(
                     endpoint.as_str(),
@@ -141,7 +138,7 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
                 {
                     let e_time = get_timestamp();
 
-                    let mut metrics = parse_response(response);
+                    let mut metrics = A::parse_response(response);
                     metrics.insert("s_time".to_string(), s_time.to_string());
                     metrics.insert("e_time".to_string(), e_time.to_string());
                     metrics.insert("input_length".to_string(), input_length.to_string());
@@ -149,10 +146,9 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
 
                     response_sender.send(metrics).unwrap();
                 } else {
-                    todo!("match error type!");
                     tracing::error!(
-                        "Request {} failed with input {} output {}",
-                        count,
+                        "Request {} timeout with input {} output {}",
+                        data_index,
                         input_length,
                         output_length
                     );
@@ -173,15 +169,12 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
 }
 
 #[instrument(skip_all)]
-pub fn spawn_request_loop_with_timestamp(
+pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     endpoint: String,
-    dataset: Dataset,
-    prefill_only: bool,
-    truncate: Option<u64>,
-    protocol: Box<dyn crate::apis::Protocol + Send>,
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>,
+    token_sampler: Arc<TokenSampler>,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
-    scale_events: Option<ScaleEvent>,
     broadcast_tx: broadcast::Sender<()>,
 ) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
@@ -191,9 +184,7 @@ pub fn spawn_request_loop_with_timestamp(
         BASETIME.get().unwrap().elapsed().as_millis() as u64
     }
 
-    let parse_response = protocol.parse_response();
-
-    let rr = dataset.request_rate();
+    let rr = dataset.rps();
     println!("Origin request rate: {:.3} req/s", rr);
     println!("Scaled request rate: {:.3} req/s", rr * scale_factor);
 
@@ -207,62 +198,55 @@ pub fn spawn_request_loop_with_timestamp(
             Err(a)
         }
     });
-    let mut scale_rx = broadcast_tx.subscribe();
     let mut gen_rx = broadcast_tx.subscribe();
-    let new_endpoint = endpoint.clone();
 
-    todo!("Use new dataset API!");
     spawn(async move {
-        let mut count = 0u64;
-        loop {
-            count += 1;
+        let data_iter = dataset.iter();
+        let endpoint = Arc::new(endpoint);
+        for data_index in data_iter {
             if gen_rx.try_recv().is_ok() {
                 break;
             }
+            let dataset = dataset.clone();
+            let endpoint = endpoint.clone();
+            let ts = token_sampler.clone();
+            let response_sender = response_sender.clone();
 
-            // Get next request and its timestamp
-            let endpoint = match cfg!(feature = "bypass_router") {
-                false => Some(endpoint.clone()),
-                true => endpoints
-                    .as_ref()
-                    .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
-            };
-            assert!(endpoint.is_some());
+            let curr_timestamp = get_timestamp();
+            let next_timestamp =
+                ((*dataset).timestamp(data_index) as f64 / scale_factor).round() as u64;
 
-            let current_timestamp = get_timestamp();
-            let (ts, input_length, output_length) =
-                dataset.next_request_with_timestamp(prefill_only, truncate);
-            let next_timestamp = (ts as f64 / scale_factor) as u64;
-
-            if next_timestamp > current_timestamp + 1 {
-                sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
-            } else {
-                yield_now().await;
+            if next_timestamp > curr_timestamp {
+                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
 
-            let json_body = protocol.request_json_body(input_length, output_length);
-            let response_sender = response_sender.clone();
+            // parse in another coroutine
             let request_handle = spawn(async move {
+                let (prompt, input_length, output_length) =
+                    dataset.inflate(data_index, ts.as_ref());
+                let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
                 if let Ok(response) = request_with_timeout(
-                    endpoint.unwrap().as_str(),
+                    endpoint.as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(15 + output_length),
+                    Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
                 )
                 .await
                 {
                     let e_time = get_timestamp();
-                    let mut metrics = parse_response(response);
+
+                    let mut metrics = A::parse_response(response);
                     metrics.insert("s_time".to_string(), s_time.to_string());
                     metrics.insert("e_time".to_string(), e_time.to_string());
                     metrics.insert("input_length".to_string(), input_length.to_string());
                     metrics.insert("output_length".to_string(), output_length.to_string());
+
                     response_sender.send(metrics).unwrap();
                 } else {
-                    RETURNCODE.store(-1, Ordering::Relaxed);
+                    RETURNCODE.store(-1, Ordering::Release);
                     tracing::error!(
                         "Request {} failed with input {} output {}",
-                        count,
+                        data_index,
                         input_length,
                         output_length
                     );
@@ -288,23 +272,5 @@ pub async fn report_loop(
         buf_writer.write_all(line.as_bytes()).await.unwrap();
         buf_writer.write_all(b"\n").await.unwrap();
         buf_writer.flush().await.unwrap();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_serde_json() {
-        let mut map = BTreeMap::new();
-        map.insert("a", "a");
-        map.insert("b", "a");
-        map.insert("c", "a");
-        map.insert("d", "a");
-        map.insert("e", "a");
-        map.insert("f", "a");
-        let line = serde_json::to_string(&map).unwrap();
-        println!("{}", line);
     }
 }

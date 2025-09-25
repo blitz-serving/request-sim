@@ -7,10 +7,10 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::{token_sampler::TokenSampler, SpinRwLock};
 use chrono::NaiveDateTime;
 use rand::seq::SliceRandom;
 use regex::Regex;
-use crate::{token_sampler::TokenSampler, SpinRwLock};
 use serde::{Deserialize, Serialize};
 
 /// jsonl of Bailian
@@ -51,7 +51,7 @@ pub struct DataIter {
 }
 
 impl Iterator for DataIter {
-    type Item = *const u8;
+    type Item = usize;
     fn next(&mut self) -> Option<Self::Item> {
         let i = self.index.fetch_add(1, Ordering::AcqRel);
         if i >= self.size {
@@ -69,8 +69,9 @@ unsafe impl Sync for DataIter {}
 pub trait LLMTrace: Send + Sync {
     fn load(&mut self, path: &str);
     fn timestamp(&self, index: usize) -> u64;
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64);
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64);
     fn iter(&self) -> DataIter;
+    fn rps(&self) -> f64;
 }
 
 //
@@ -112,11 +113,16 @@ impl LLMTrace for BailianDataset {
         }
     }
 
+    fn rps(&self) -> f64 {
+        self.items.len() as f64
+            / (self.items.last().unwrap().timestamp - self.items.first().unwrap().timestamp)
+    }
+
     fn timestamp(&self, index: usize) -> u64 {
         (self.items[index].timestamp * 1000.) as u64
     }
 
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64) {
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
         // NOTE: the last block hash may be hashed onto a partially filled block
         const BLOCK_SIZE: usize = 16;
         unsafe {
@@ -157,7 +163,11 @@ impl LLMTrace for BailianDataset {
                 .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
             self.rwlock.write_unlock();
 
-            (prompt, (*data_item).output_length)
+            (
+                prompt,
+                (*data_item).input_length,
+                (*data_item).output_length,
+            )
         }
     }
 }
@@ -200,11 +210,17 @@ impl LLMTrace for MooncakeDataset {
         }
     }
 
-    fn timestamp(&self, index: usize) -> u64 {
-        self.items[index].timestamp   
+    fn rps(&self) -> f64 {
+        self.items.len() as f64
+            / (self.items.last().unwrap().timestamp as f64
+                - self.items.first().unwrap().timestamp as f64)
     }
 
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64) {
+    fn timestamp(&self, index: usize) -> u64 {
+        self.items[index].timestamp
+    }
+
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
         // NOTE: the last block hash may be hashed onto a partially filled block
         const BLOCK_SIZE: usize = 512;
         unsafe {
@@ -246,7 +262,11 @@ impl LLMTrace for MooncakeDataset {
                 .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
             self.rwlock.write_unlock();
 
-            (prompt, (*data_item).output_length)
+            (
+                prompt,
+                (*data_item).input_length,
+                (*data_item).output_length,
+            )
         }
     }
 }
@@ -289,11 +309,16 @@ impl LLMTrace for AzureDataset {
         }
     }
 
+    fn rps(&self) -> f64 {
+        self.items.len() as f64
+            / (self.items.last().unwrap().timestamp - self.items.first().unwrap().timestamp) as f64
+    }
+
     fn timestamp(&self, index: usize) -> u64 {
         (self.items[index].timestamp * 1000.) as u64
     }
 
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64) {
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
         unsafe {
             let AzureDataItem {
                 timestamp: _,
@@ -330,7 +355,7 @@ impl LLMTrace for AzureDataset {
             let last_block_prompt = ts.gen_string(last_block_len);
             prompt.push_str(&last_block_prompt);
 
-            (prompt, generated_tokens)
+            (prompt, context_tokens, generated_tokens)
         }
     }
 }
@@ -351,8 +376,8 @@ mod tests {
         let ts = TokenSampler::new(tokenizer);
         let iter = ds.iter();
 
-        for p in iter {
-            let (prompt, out_len) = ds.inflate(p, &ts);
+        for idx in iter {
+            let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
             println!(
                 "Bailian prompt = \"{}\", output length = {}",
                 prompt, out_len
@@ -371,8 +396,8 @@ mod tests {
         let ts = TokenSampler::new(tokenizer);
         let iter = ds.iter();
 
-        for p in iter {
-            let (prompt, out_len) = ds.inflate(p, &ts);
+        for idx in iter {
+            let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
             println!(
                 "Mooncake prompt = \"{}\", output length = {}",
                 prompt, out_len
@@ -391,8 +416,8 @@ mod tests {
         let ts = TokenSampler::new(tokenizer);
         let iter = ds.iter();
 
-        for p in iter {
-            let (prompt, out_len) = ds.inflate(p, &ts);
+        for idx in iter {
+            let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
             println!("Azure prompt = \"{}\", output length = {}", prompt, out_len);
         }
     }

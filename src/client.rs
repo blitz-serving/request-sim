@@ -2,15 +2,16 @@ use std::{pin::Pin, sync::Arc};
 
 use clap::Parser;
 use request_sim::{
-    dataset::Dataset,
-    protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol, Protocol},
-    requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
+    apis::TGIApi,
+    dataset::{AzureDataset, BailianDataset, LLMTrace, MooncakeDataset},
+    requester::{
+        create_gamma_interval_generator, report_loop, spawn_request_loop,
+        spawn_request_loop_with_timestamp,
+    },
+    token_sampler::TokenSampler,
 };
 use tokenizers::Tokenizer;
-use tokio::{
-    spawn,
-    sync::{broadcast, oneshot},
-};
+use tokio::{spawn, sync::broadcast};
 
 #[derive(Parser)]
 struct Args {
@@ -27,12 +28,9 @@ struct Args {
     #[clap(long, required = true)]
     endpoint: String,
 
-    #[clap(long)]
-    endpoints: Option<Vec<String>>,
-
-    /// Protocol type. Either "st", "vllm", "distserve" or "mock".
-    #[clap(long, short, required = true, value_parser = parse_protocol)]
-    protocol: Protocol,
+    /// LLM API server type. Either "tgi" (text-generation-inference), or "distserve"
+    #[clap(long, short, required = true)]
+    api: String,
 
     /// Dataset type. Either "bailian", "mooncake", "azure", "uniform($input,$output)".
     ///
@@ -50,10 +48,10 @@ struct Args {
     #[clap(long)]
     second_dataset_path: Option<String>,
 
-    /// If the replay_mode is enabled, the client will send requests following
+    /// If the `replay_mode` is enabled, the client will send requests following
     /// the sequence and input/output length of provided dataset above.
     ///
-    /// Note that if the replay_mode is enabled, the cv will be ignored and the requests will not be shuffled.
+    /// Note that if the `replay_mode` is enabled, the cv will be ignored and the requests will not be shuffled.
     #[clap(long, default_value_t = false)]
     replay_mode: bool,
 
@@ -81,32 +79,6 @@ struct Args {
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
-
-    /// If prefill_only is enabled, the output length will be set to the 1.
-    #[clap(long, default_value_t = false)]
-    prefill_only: bool,
-
-    /// Truncate the request if the sum of input and output token length is greater than the specified value.
-    #[clap(long)]
-    truncate: Option<u64>,
-}
-
-fn parse_protocol(s: &str) -> Result<Protocol, String> {
-    match s.to_lowercase().as_ref() {
-        "st" => Ok(Protocol::St),
-        "vllm" => Ok(Protocol::Vllm),
-        "distserve" => Ok(Protocol::Distserve),
-        "mock" => Ok(Protocol::Mock),
-        _ => Err("Invalid protocol type".to_string()),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Protocol {
-    St,
-    Vllm,
-    Distserve,
-    Mock,
 }
 
 async fn async_main(args: Args) -> Result<(), i32> {
@@ -114,8 +86,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         tokenizer,
         threads: _,
         endpoint,
-        endpoints,
-        protocol,
+        api,
         dataset,
         dataset_path,
         second_dataset_path,
@@ -126,8 +97,6 @@ async fn async_main(args: Args) -> Result<(), i32> {
         cv,
         output_path,
         time_in_secs,
-        prefill_only,
-        truncate,
     } = args;
 
     let output_file = tokio::fs::OpenOptions::new()
@@ -138,20 +107,32 @@ async fn async_main(args: Args) -> Result<(), i32> {
         .await
         .unwrap();
 
-    let dataset: Pin<Box<dyn LLMTrace>> = match dataset_type.to_lowercase().as_str() {
+    let dataset: Pin<Box<dyn LLMTrace>> = match dataset.to_lowercase().as_str() {
         "mooncake" => {
             let mut dataset = Box::pin(MooncakeDataset::new());
-            dataset.load(dataset_path.as_str());
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided in replay mode!")
+                    .as_str(),
+            );
             dataset
         }
         "burstgpt" => {
             let mut dataset = Box::pin(AzureDataset::new());
-            dataset.load(dataset_path.as_str());
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided in replay mode!")
+                    .as_str(),
+            );
             dataset
         }
         "bailian" => {
             let mut dataset = Box::pin(BailianDataset::new());
-            dataset.load(dataset_path.as_str());
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided in replay mode!")
+                    .as_str(),
+            );
             dataset
         }
         "uniform" => {
@@ -161,25 +142,22 @@ async fn async_main(args: Args) -> Result<(), i32> {
     };
 
     let (tx, rx) = flume::unbounded();
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let (broad_tx, _rx) = broadcast::channel(1);
+    let (broadcast_tx, _rx) = broadcast::channel(1);
 
     tracing::info!("Client start");
     // TODO: check `spawn_request_loop_with_timestamp` API
-    let requester_handle = match protocol.to_lowercase().as_str() {
+    let requester_handle = match api.to_lowercase().as_str() {
         "tgi" => {
-            let token_sampler = TokenSampler::new(Tokenizer::from_file(tokenizer).unwrap());
-            spawn_request_loop_with_timestamp(
+            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
+            let token_sampler =
+                Arc::new(TokenSampler::new(Tokenizer::from_file(tokenizer).unwrap()));
+            spawn_request_loop_with_timestamp::<TGIApi>(
                 endpoint,
-                endpoints,
                 dataset,
-                prefill_only,
-                truncate,
-                protocol,
+                token_sampler,
                 scale_factor.unwrap(),
                 tx,
-                scale_events,
-                broad_tx.clone(),
+                broadcast_tx.clone(),
             )
         }
         _ => unimplemented!("Unsupported protocol type"),
@@ -188,8 +166,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
 
     // start test!
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
-    stop_tx.send(()).unwrap();
-    broad_tx.send(()).unwrap();
+    broadcast_tx.send(()).unwrap(); // terminate test
 
     let returnval = requester_handle.await.unwrap();
     reporter_handle.await.unwrap();
