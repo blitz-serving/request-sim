@@ -1,9 +1,11 @@
 use std::{
     collections::BTreeMap,
     sync::{
+        Arc,
         atomic::{AtomicI32, Ordering},
         OnceLock,
     },
+    pin::Pin,
     time::{Duration, Instant},
 };
 
@@ -18,7 +20,9 @@ use tokio::{
 };
 use tracing::instrument;
 
-use crate::{dataset::Dataset, distribution::Distribution, scale_event::ScaleEvent};
+use crate::{
+    dataset::LLMTrace, distribution::Distribution, apis::LLMApi, token_sampler::TokenSampler,
+};
 
 pub struct IntervalGenerator {
     distribution: Box<dyn Distribution>,
@@ -87,13 +91,12 @@ async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
 /// - Use [`spawn_request_loop_with_timestamp`] instead if you want to control the intervals.
 ///
 /// Await on the returned handle to wait for the loop to finish.
-pub fn spawn_request_loop(
+pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     endpoint: String,
-    endpoints: Option<Vec<String>>,
-    dataset: Dataset,
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>,
     prefill_only: bool,
     truncate: Option<u64>,
-    protocol: Box<dyn crate::protocols::Protocol + Send>,
+    llm_api: A,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     mut stopped: oneshot::Receiver<()>,
@@ -105,8 +108,6 @@ pub fn spawn_request_loop(
         BASETIME.get().unwrap().elapsed().as_millis() as u64
     }
 
-    let parse_response = protocol.parse_response();
-
     let (tx, rx) = flume::unbounded();
     let handle = spawn(async move {
         wait_all(rx).await;
@@ -115,41 +116,40 @@ pub fn spawn_request_loop(
 
     spawn(async move {
         let mut timestamp = get_timestamp();
-        let mut count = 0u64;
-        loop {
-            count += 1;
+        let data_iter = dataset.iter();
+        for data_inner in data_iter {
             if stopped.try_recv().is_ok() {
                 break;
             }
-
-            let endpoint = match cfg!(feature = "bypass_router") {
-                false => Some(endpoint.clone()),
-                true => endpoints
-                    .as_ref()
-                    .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
-            }
-            .clone();
-            assert!(endpoint.is_some());
-            let (input_length, output_length) = dataset.next_request(prefill_only, truncate);
-            let json_body = protocol.request_json_body(input_length, output_length);
+            // data to move into closure
+            let dataset = dataset.clone();
+            let ts = token_sampler.clone();
+            let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
+            let tmp = data_inner as usize;
+            // parse in another coroutine
             let request_handle = spawn(async move {
+                let (prompt, output_length) = dataset.inflate(tmp as *const u8, ts.as_ref());
+                let json_body = llm_api.request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
                 if let Ok(response) = request_with_timeout(
-                    endpoint.unwrap().as_str(),
+                    endpoint.as_str(),
                     json_body.to_string(),
                     Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
                 )
                 .await
                 {
                     let e_time = get_timestamp();
+
                     let mut metrics = parse_response(response);
                     metrics.insert("s_time".to_string(), s_time.to_string());
                     metrics.insert("e_time".to_string(), e_time.to_string());
                     metrics.insert("input_length".to_string(), input_length.to_string());
                     metrics.insert("output_length".to_string(), output_length.to_string());
+
                     response_sender.send(metrics).unwrap();
                 } else {
+                    todo!("match error type!");
                     tracing::error!(
                         "Request {} failed with input {} output {}",
                         count,
@@ -175,11 +175,10 @@ pub fn spawn_request_loop(
 #[instrument(skip_all)]
 pub fn spawn_request_loop_with_timestamp(
     endpoint: String,
-    endpoints: Option<Vec<String>>,
     dataset: Dataset,
     prefill_only: bool,
     truncate: Option<u64>,
-    protocol: Box<dyn crate::protocols::Protocol + Send>,
+    protocol: Box<dyn crate::apis::Protocol + Send>,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     scale_events: Option<ScaleEvent>,
@@ -212,53 +211,7 @@ pub fn spawn_request_loop_with_timestamp(
     let mut gen_rx = broadcast_tx.subscribe();
     let new_endpoint = endpoint.clone();
 
-    if scale_events.is_some() {
-        spawn(async move {
-            loop {
-                if scale_rx.try_recv().is_ok() {
-                    break;
-                }
-                let scale_endpoint = new_endpoint
-                    .clone()
-                    .split('/')
-                    .take(3)
-                    .collect::<Vec<&str>>()
-                    .join("/")
-                    + "/modify_cluster_state";
-                let current_timestamp = get_timestamp();
-                let (ts, src, dst, event_type) =
-                    scale_events.as_ref().unwrap().next_event_with_timestamp();
-                let next_timestamp = (ts as f64 / scale_factor) as u64;
-
-                if next_timestamp > current_timestamp + 1 {
-                    sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
-                } else {
-                    yield_now().await;
-                }
-                let json_body = scale_events
-                    .as_ref()
-                    .unwrap()
-                    .request_json_body(src, dst, event_type);
-                spawn(async move {
-                    if let Err(_) = request_with_timeout(
-                        scale_endpoint.as_str(),
-                        json_body.to_string(),
-                        Duration::from_secs(10),
-                    )
-                    .await
-                    {
-                        RETURNCODE.store(-1, Ordering::Relaxed);
-                        tracing::error!(
-                            "Scale request failed with src {} dst {} event_type {:?}",
-                            src,
-                            dst,
-                            event_type
-                        );
-                    }
-                });
-            }
-        });
-    }
+    todo!("Use new dataset API!");
     spawn(async move {
         let mut count = 0u64;
         loop {

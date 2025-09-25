@@ -1,541 +1,399 @@
 use std::{
+    cell::UnsafeCell,
+    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
-    sync::atomic::AtomicUsize,
+    mem,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use chrono::NaiveDateTime;
 use rand::seq::SliceRandom;
 use regex::Regex;
+use crate::{token_sampler::TokenSampler, SpinRwLock};
+use serde::{Deserialize, Serialize};
 
-pub struct Dataset {
-    dataset_size: usize,
-
-    /// Each request is a tuple of (input_length, output_length).
-    requests: Vec<(u64, u64)>,
-
-    timestamps: Vec<u64>,
-
-    /// The time it takes to complete a round of requests in milliseconds.
-    round_time: u64,
-
-    next: AtomicUsize,
+/// jsonl of Bailian
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BailianDataItem {
+    pub chat_id: i64,
+    pub parent_chat_id: i64,
+    pub timestamp: f64,
+    pub input_length: u64,
+    pub output_length: u64,
+    pub r#type: String,
+    pub turn: u64,
+    pub hash_ids: Vec<u64>,
 }
 
-impl Dataset {
-    /// If `shuffle` is true, the dataset will be shuffled and the requests returned by [`Self::next_request`] is in random order.
-    pub fn load_mooncake_jsonl(path: &str, shuffle: bool) -> Self {
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
-        pub struct MooncakeRecord {
-            pub timestamp: u64,
-            pub input_length: u64,
-            pub output_length: u64,
-            pub hash_ids: Vec<u64>,
+/// jsonl of Mooncake
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MooncakeDataItem {
+    pub timestamp: u64,
+    pub input_length: u64,
+    pub output_length: u64,
+    pub hash_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AzureDataItem {
+    #[serde(rename = "TIMESTAMP")]
+    pub timestamp: f32,
+    #[serde(rename = "ContextTokens")]
+    pub context_tokens: u64,
+    #[serde(rename = "GeneratedTokens")]
+    pub generated_tokens: u64,
+}
+
+pub struct DataIter {
+    size: usize,
+    index: AtomicUsize,
+}
+
+impl Iterator for DataIter {
+    type Item = *const u8;
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.index.fetch_add(1, Ordering::AcqRel);
+        if i >= self.size {
+            // fuse the iterator
+            self.index.store(i, Ordering::Release);
+            return None;
         }
+        Some(i)
+    }
+}
 
-        let mut requests = Vec::new();
-        let mut timestamps = Vec::new();
+unsafe impl Send for DataIter {}
+unsafe impl Sync for DataIter {}
 
+pub trait LLMTrace: Send + Sync {
+    fn load(&mut self, path: &str);
+    fn timestamp(&self, index: usize) -> u64;
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64);
+    fn iter(&self) -> DataIter;
+}
+
+//
+// ============== BailianDataset ==============
+//
+pub struct BailianDataset {
+    items: Vec<BailianDataItem>,
+    user_prompts: UnsafeCell<HashMap<u64, String>>,
+    rwlock: SpinRwLock,
+}
+
+impl BailianDataset {
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            user_prompts: UnsafeCell::new(HashMap::new()),
+            rwlock: SpinRwLock::new(),
+        }
+    }
+}
+
+unsafe impl Send for BailianDataset {}
+unsafe impl Sync for BailianDataset {}
+
+impl LLMTrace for BailianDataset {
+    fn load(&mut self, path: &str) {
         let file = File::open(path).unwrap();
 
         for line in BufReader::new(file).lines() {
-            let record: MooncakeRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
-            requests.push((record.input_length, 1));
-            timestamps.push(record.timestamp);
-        }
-
-        if shuffle {
-            requests.shuffle(&mut rand::thread_rng());
-        }
-
-        let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
-
-        Self {
-            dataset_size: requests.len(),
-            round_time,
-            requests,
-            timestamps,
-            next: AtomicUsize::new(0),
+            let item: BailianDataItem = serde_json::from_str(line.unwrap().as_str()).unwrap();
+            self.items.push(item);
         }
     }
 
-    /// If `shuffle` is true, the dataset will be shuffled and the requests returned by [`Self::next_request`] is in random order.
-    pub fn load_burstgpt_csv(path: &str, shuffle: bool) -> Self {
-        let mut requests = Vec::new();
-        let mut timestamps = Vec::new();
-        let mut reader = BufReader::new(File::open(path).unwrap());
+    fn iter(&self) -> DataIter {
+        DataIter {
+            size: self.items.len(),
+            index: AtomicUsize::new(0),
+        }
+    }
 
-        // Skip header
-        let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
+    fn timestamp(&self, index: usize) -> u64 {
+        (self.items[index].timestamp * 1000.) as u64
+    }
 
-        for line in reader.lines() {
-            let parts = line
-                .unwrap()
-                .split(',')
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            let timestamp = parts[0].parse::<f64>().unwrap() as u64;
-            let input_length = parts[2].parse().unwrap();
-            let output_length = parts[3].parse().unwrap();
-            let log_type = &parts[5];
-            if log_type == "Conversation log" || log_type == "API log" {
-                timestamps.push(timestamp);
-                requests.push((input_length, output_length));
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64) {
+        // NOTE: the last block hash may be hashed onto a partially filled block
+        const BLOCK_SIZE: usize = 16;
+        unsafe {
+            let data_item = self.items.get(index).unwrap();
+            let last_block_len =
+                (*data_item).input_length as usize - ((*data_item).hash_ids.len() - 1) * BLOCK_SIZE;
+            debug_assert!(last_block_len <= BLOCK_SIZE);
+
+            let mut prompt = String::new();
+            for &hash_id in (*data_item)
+                .hash_ids
+                .iter()
+                .take((*data_item).hash_ids.len() - 1)
+            {
+                // loop invariant: rwlock is free
+                self.rwlock.read_lock();
+                if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
+                    prompt.push_str(&s);
+                    self.rwlock.read_unlock();
+                } else {
+                    self.rwlock.read_unlock();
+                    let s = ts.gen_string(BLOCK_SIZE);
+                    self.rwlock.write_lock();
+                    if let Some(s0) = (*self.user_prompts.get()).get(&hash_id) {
+                        prompt.push_str(&s0);
+                    } else {
+                        prompt.push_str(&s);
+                        (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    }
+                    self.rwlock.write_unlock();
+                }
             }
-        }
 
-        let base_timestamp = timestamps[0];
-        timestamps
-            .iter_mut()
-            .for_each(|timestamp| *timestamp = (*timestamp - base_timestamp) * 1000);
+            let last_block_prompt = ts.gen_string(last_block_len);
+            prompt.push_str(&last_block_prompt);
+            self.rwlock.write_lock();
+            (&mut *self.user_prompts.get())
+                .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
+            self.rwlock.write_unlock();
 
-        if shuffle {
-            requests.shuffle(&mut rand::thread_rng());
-        }
-
-        let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
-
-        Self {
-            dataset_size: requests.len(),
-            round_time,
-            requests,
-            timestamps,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    // ts: mooncake, input&output length: burstgpt
-    pub fn load_mooncake_ts_burst_data(
-        mooncake_path: &str,
-        burstgpt_path: &str,
-        shuffle: bool,
-    ) -> Self {
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
-        pub struct MoonCakeInfoRecord {
-            pub timestamp: u64,
-            pub input_length: u64,
-            pub output_length: u64,
-            pub hash_ids: Vec<u64>,
-        }
-
-        let mut requests = Vec::new();
-        let mut timestamps = Vec::new();
-
-        let file_mooncake = File::open(mooncake_path).unwrap();
-        for line in BufReader::new(file_mooncake).lines() {
-            let record: MoonCakeInfoRecord = serde_json::from_str(line.unwrap().as_str()).unwrap();
-            timestamps.push(record.timestamp);
-        }
-        // fill requests with burstgpt data, each mooncake request has a corresponding burstgpt request
-        let file_burstgpt = File::open(burstgpt_path).unwrap();
-        let mut reader = BufReader::new(file_burstgpt);
-        let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
-        let mut burstgpt_requests = Vec::new();
-        for line in reader.lines() {
-            let parts = line
-                .unwrap()
-                .split(',')
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            let input_length = parts[2].parse().unwrap();
-            let output_length = parts[3].parse().unwrap();
-            let log_type = &parts[5];
-            if log_type == "Conversation log" {
-                burstgpt_requests.push((input_length, output_length));
-            }
-        }
-        let mut burstgpt_iter = burstgpt_requests.iter();
-        for _ in timestamps.iter() {
-            let (input_length, output_length) = burstgpt_iter.next().unwrap();
-            requests.push((*input_length, *output_length));
-        }
-
-        if shuffle {
-            requests.shuffle(&mut rand::thread_rng());
-        }
-
-        let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
-
-        Self {
-            dataset_size: requests.len(),
-            round_time,
-            requests,
-            timestamps,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn load_azure_csv(path: &str, shuffle: bool) -> Self {
-        let mut requests = Vec::new();
-        let mut timestamps = Vec::new();
-        let mut reader = BufReader::new(File::open(path).unwrap());
-
-        // skip header
-        let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
-
-        let mut initial_timestamp: Option<NaiveDateTime> = None;
-
-        for line in reader.lines() {
-            let parts = line
-                .unwrap()
-                .split(',')
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            let timestamp_str = &parts[0];
-            let timestamp =
-                NaiveDateTime::parse_from_str(&timestamp_str, "%Y-%m-%d %H:%M:%S%.f").unwrap();
-            if initial_timestamp.is_none() {
-                initial_timestamp = Some(timestamp);
-            }
-            let elapsed = timestamp - initial_timestamp.unwrap();
-            let elapsed_millis = elapsed.num_milliseconds() as u64;
-
-            let input_length = parts[1].parse().unwrap();
-            let output_length = parts[2].parse().unwrap();
-            timestamps.push(elapsed_millis);
-            requests.push((input_length, output_length));
-        }
-
-        if shuffle {
-            requests.shuffle(&mut rand::thread_rng());
-        }
-        let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
-        Self {
-            dataset_size: requests.len(),
-            round_time,
-            requests,
-            timestamps,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn load_processed_csv(path: &str, shuffle: bool) -> Self {
-        let mut requests = Vec::new();
-        let mut timestamps = Vec::new();
-        let mut reader = BufReader::new(File::open(path).unwrap());
-
-        // skip header
-        let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
-
-        for line in reader.lines() {
-            let parts = line
-                .unwrap()
-                .split(',')
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            let timestamp: u64 = parts[0].parse().unwrap();
-            let input_length = parts[1].parse().unwrap();
-            let output_length = parts[2].parse().unwrap();
-            timestamps.push(timestamp);
-            requests.push((input_length, output_length));
-        }
-
-        if shuffle {
-            requests.shuffle(&mut rand::thread_rng());
-        }
-        let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
-        Self {
-            dataset_size: requests.len(),
-            round_time,
-            requests,
-            timestamps,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn cherry_pick_burstgpt(path: &str, shuffle: bool, start_ts: u64, end_ts: u64) -> Self {
-        let mut requests = Vec::new();
-        let mut timestamps = Vec::new();
-        let mut reader = BufReader::new(File::open(path).unwrap());
-
-        // skip header
-        let mut header = String::new();
-        reader.read_line(&mut header).unwrap();
-
-        let mut initial_timestamp: Option<u64> = None;
-
-        for line in reader.lines() {
-            let parts = line
-                .unwrap()
-                .split(',')
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            let timestamp = parts[0].parse::<f64>().unwrap() as u64;
-            if initial_timestamp.is_none() {
-                initial_timestamp = Some(timestamp);
-            }
-            if timestamp - initial_timestamp.unwrap() < start_ts {
-                continue;
-            }
-            if timestamp - initial_timestamp.unwrap() > end_ts {
-                break;
-            }
-            let input_length = parts[2].parse().unwrap();
-            let output_length = parts[3].parse().unwrap();
-
-            let log_type = &parts[5];
-            if log_type == "Conversation log" || log_type == "API log" {
-                timestamps.push(timestamp);
-                requests.push((input_length, output_length));
-            }
-        }
-
-        let base_timestamp = timestamps[0];
-        timestamps
-            .iter_mut()
-            .for_each(|timestamp| *timestamp = (*timestamp - base_timestamp) * 1000);
-
-        if shuffle {
-            requests.shuffle(&mut rand::thread_rng());
-        }
-
-        let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
-
-        Self {
-            dataset_size: requests.len(),
-            round_time,
-            requests,
-            timestamps,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn load_mock_dataset() -> Self {
-        let requests = (0..1000)
-            .into_iter()
-            .map(|_| {
-                (
-                    rand::random::<u64>() % 100 + 1,
-                    rand::random::<u64>() % 100 + 1,
-                )
-            })
-            .collect::<Vec<_>>();
-        let timestamps = (0..1000).into_iter().map(|i| i * 1000).collect::<Vec<_>>();
-        let round_time =
-            timestamps.last().unwrap() + timestamps.last().unwrap() / (requests.len() as u64 - 1);
-
-        Self {
-            dataset_size: requests.len(),
-            requests,
-            timestamps,
-            round_time,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn load_uniform_dataset(input_length: u64, output_length: u64) -> Self {
-        let dataset_size = 1000;
-        let requests = vec![(input_length, output_length); dataset_size];
-        let timestamps = (0..dataset_size)
-            .into_iter()
-            .map(|i| i as u64 * 1000)
-            .collect::<Vec<_>>();
-        let round_time = 1000000;
-
-        Self {
-            dataset_size,
-            requests,
-            timestamps,
-            round_time,
-            next: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn next_request(&self, prefill_only: bool, truncate: Option<u64>) -> (u64, u64) {
-        let next_index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (mut input_length, mut output_length) = self.requests[next_index % self.dataset_size];
-        if prefill_only {
-            output_length = 1;
-        }
-        if let Some(truncate) = truncate {
-            if input_length + output_length > truncate {
-                input_length = truncate - output_length;
-            }
-        }
-        (input_length, output_length)
-    }
-
-    /// Returned tuple is (timestamp, input_length, output_length).
-    pub fn next_request_with_timestamp(
-        &self,
-        prefill_only: bool,
-        truncate: Option<u64>,
-    ) -> (u64, u64, u64) {
-        let next_index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let round = next_index / self.dataset_size;
-        let index = next_index % self.dataset_size;
-
-        let (mut input_length, mut output_length) = self.requests[next_index % self.dataset_size];
-        if prefill_only {
-            output_length = 1;
-        }
-        if let Some(truncate) = truncate {
-            if input_length + output_length > truncate {
-                input_length = truncate - output_length;
-            }
-        }
-
-        let ts = round as u64 * self.round_time + self.timestamps[index % self.dataset_size];
-        (ts, input_length, output_length)
-    }
-
-    pub fn dataset_size(&self) -> usize {
-        self.dataset_size
-    }
-
-    pub fn round_time(&self) -> u64 {
-        self.round_time
-    }
-
-    pub fn request_rate(&self) -> f64 {
-        self.dataset_size() as f64 * 1000.0 / self.round_time() as f64
-    }
-}
-
-pub fn parse_dataset_type(s: &str) -> Result<DatasetType, String> {
-    fn parse_u64(text: &str) -> Result<Vec<u64>, String> {
-        let mut integers = Vec::new();
-        let re = Regex::new(r"\b\d+\b").map_err(|e| e.to_string())?;
-        for cap in re.captures_iter(text) {
-            integers.push(cap[0].parse::<u64>().map_err(|e| e.to_string())?);
-        }
-        Ok(integers)
-    }
-
-    let s = s.to_lowercase();
-    if s.starts_with("uniform") {
-        let integers = parse_u64(s.as_str())?;
-        Ok(DatasetType::Uniform {
-            input: integers[0],
-            output: integers[1],
-        })
-    } else if s.starts_with("cherry_pick_burstgpt") {
-        let integers = parse_u64(s.as_str())?;
-        Ok(DatasetType::CherryPickBurstgpt {
-            start_ts: integers[0],
-            end_ts: integers[1],
-        })
-    } else {
-        match s.as_ref() {
-            "mooncake" => Ok(DatasetType::Mooncake),
-            "burstgpt" => Ok(DatasetType::Burstgpt),
-            "azure" => Ok(DatasetType::Azure),
-            "mooncake_sampled" => Ok(DatasetType::MooncakeSampled),
-            "mock" => Ok(DatasetType::Mock),
-            "processed" => Ok(DatasetType::ProcessedCsv),
-            _ => Err("Invalid dataset type.".to_string()),
+            (prompt, (*data_item).output_length)
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum DatasetType {
-    Mooncake,
-    Burstgpt,
-    Azure,
-    MooncakeSampled,
-    Mock,
-    Uniform { input: u64, output: u64 },
-    CherryPickBurstgpt { start_ts: u64, end_ts: u64 },
-    ProcessedCsv,
+//
+// ============== MooncakeDataset ==============
+//
+pub struct MooncakeDataset {
+    items: Vec<MooncakeDataItem>,
+    user_prompts: UnsafeCell<HashMap<u64, String>>,
+    rwlock: SpinRwLock,
 }
 
+unsafe impl Send for MooncakeDataset {}
+unsafe impl Sync for MooncakeDataset {}
+
+impl MooncakeDataset {
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            user_prompts: UnsafeCell::new(HashMap::new()),
+            rwlock: SpinRwLock::new(),
+        }
+    }
+}
+
+impl LLMTrace for MooncakeDataset {
+    fn load(&mut self, path: &str) {
+        let file = File::open(path).unwrap();
+        for line in BufReader::new(file).lines() {
+            let item: MooncakeDataItem = serde_json::from_str(line.unwrap().as_str()).unwrap();
+            self.items.push(item);
+        }
+    }
+
+    fn iter(&self) -> DataIter {
+        DataIter {
+            size: self.items.len(),
+            index: AtomicUsize::new(0),
+        }
+    }
+
+    fn timestamp(&self, index: usize) -> u64 {
+        self.items[index].timestamp   
+    }
+
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64) {
+        // NOTE: the last block hash may be hashed onto a partially filled block
+        const BLOCK_SIZE: usize = 512;
+        unsafe {
+            let data_item = self.items.get(index).unwrap();
+            let last_block_len =
+                (*data_item).input_length as usize - ((*data_item).hash_ids.len() - 1) * BLOCK_SIZE;
+            debug_assert!(last_block_len <= BLOCK_SIZE);
+
+            let mut prompt = String::new();
+            for &hash_id in (*data_item)
+                .hash_ids
+                .iter()
+                .take((*data_item).hash_ids.len() - 1)
+            {
+                // loop invariant: rwlock is free
+                self.rwlock.read_lock();
+                if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
+                    prompt.push_str(&s);
+                    self.rwlock.read_unlock();
+                } else {
+                    self.rwlock.read_unlock();
+                    let s = ts.gen_string(BLOCK_SIZE);
+                    self.rwlock.write_lock();
+                    if let Some(s0) = (*self.user_prompts.get()).get(&hash_id) {
+                        prompt.push_str(&s0);
+                    } else {
+                        prompt.push_str(&s);
+                        (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    }
+                    self.rwlock.write_unlock();
+                }
+            }
+            // postcond: rwlock is free
+
+            let last_block_prompt = ts.gen_string(last_block_len);
+            prompt.push_str(&last_block_prompt);
+            self.rwlock.write_lock();
+            (&mut *self.user_prompts.get())
+                .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
+            self.rwlock.write_unlock();
+
+            (prompt, (*data_item).output_length)
+        }
+    }
+}
+
+//
+// ============== AzureDataset ==============
+//
+pub struct AzureDataset {
+    items: Vec<AzureDataItem>,
+    user_prompts: UnsafeCell<Vec<String>>, // each string represents 16 tokens
+    rwlock: SpinRwLock,
+}
+
+unsafe impl Send for AzureDataset {}
+unsafe impl Sync for AzureDataset {}
+
+impl AzureDataset {
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            user_prompts: UnsafeCell::new(Vec::with_capacity(1024)),
+            rwlock: SpinRwLock::new(),
+        }
+    }
+}
+
+impl LLMTrace for AzureDataset {
+    fn load(&mut self, path: &str) {
+        let mut rdr = csv::Reader::from_path(path).unwrap();
+        for result in rdr.deserialize() {
+            let record: AzureDataItem = result.unwrap();
+            self.items.push(record);
+        }
+    }
+
+    fn iter(&self) -> DataIter {
+        DataIter {
+            size: self.items.len(),
+            index: AtomicUsize::new(0),
+        }
+    }
+
+    fn timestamp(&self, index: usize) -> u64 {
+        (self.items[index].timestamp * 1000.) as u64
+    }
+
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64) {
+        unsafe {
+            let AzureDataItem {
+                timestamp: _,
+                context_tokens,
+                generated_tokens,
+            } = self.items.get(index).unwrap().clone();
+
+            let last_block_len = (context_tokens % 16) as usize;
+            let num_blocks = (context_tokens as usize - last_block_len) / 16;
+
+            let mut prompt = String::new();
+            self.rwlock.read_lock();
+            let n = (&*self.user_prompts.get()).len();
+            if n >= num_blocks {
+                for s in &(&(*self.user_prompts.get()))[0..num_blocks] {
+                    prompt.push_str(s);
+                }
+                self.rwlock.read_unlock();
+            } else {
+                for s in &(&(*self.user_prompts.get()))[0..n] {
+                    prompt.push_str(s);
+                }
+                self.rwlock.read_unlock();
+                let new_prompts: Vec<String> = (n..num_blocks).map(|_| ts.gen_string(16)).collect();
+                for s in new_prompts.iter() {
+                    prompt.push_str(s);
+                }
+                self.rwlock.write_lock();
+                (&mut *self.user_prompts.get()).extend(new_prompts);
+                self.rwlock.write_unlock();
+            }
+            // postcond: self.rwlock is unlocked
+
+            let last_block_prompt = ts.gen_string(last_block_len);
+            prompt.push_str(&last_block_prompt);
+
+            (prompt, generated_tokens)
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::token_sampler::TokenSampler;
+    use tokenizers::Tokenizer;
 
     #[test]
-    fn test_load_mooncake() {
-        let dataset_path = std::path::Path::new("./data/mooncake_trace.jsonl");
-        if dataset_path.exists() {
-            let dataset = Dataset::load_mooncake_jsonl(dataset_path.to_str().unwrap(), false);
-            for _ in 0..10 {
-                println!("(input, output): {:?}", dataset.next_request(false, None));
-            }
-        } else {
-            eprintln!("Dataset not found");
+    fn test_bailian_dataset() {
+        let path = "./data/test/bailian.jsonl";
+        let mut ds = BailianDataset::new();
+        ds.load(path);
+
+        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
+
+        let ts = TokenSampler::new(tokenizer);
+        let iter = ds.iter();
+
+        for p in iter {
+            let (prompt, out_len) = ds.inflate(p, &ts);
+            println!(
+                "Bailian prompt = \"{}\", output length = {}",
+                prompt, out_len
+            );
         }
     }
 
     #[test]
-    fn test_load_burstgpt() {
-        let dataset_path = std::path::Path::new("./data/BurstGPT_without_fails_2.csv");
-        if dataset_path.exists() {
-            let dataset = Dataset::load_burstgpt_csv(dataset_path.to_str().unwrap(), false);
-            for _ in 0..10 {
-                println!("(input, output): {:?}", dataset.next_request(false, None));
-            }
-        } else {
-            eprintln!("Dataset not found");
+    fn test_mooncake_dataset() {
+        let path = "./data/test/mooncake.jsonl";
+        let mut ds = MooncakeDataset::new();
+        ds.load(path);
+
+        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
+
+        let ts = TokenSampler::new(tokenizer);
+        let iter = ds.iter();
+
+        for p in iter {
+            let (prompt, out_len) = ds.inflate(p, &ts);
+            println!(
+                "Mooncake prompt = \"{}\", output length = {}",
+                prompt, out_len
+            );
         }
     }
 
     #[test]
-    fn test_dataset_timestamp() {
-        let dataset = Dataset::load_mock_dataset();
-        let dataset_size = dataset.dataset_size();
-        for _ in 0..(dataset_size - 5) {
-            dataset.next_request_with_timestamp(false, None);
-        }
-        for _ in 0..10 {
-            println!("{}", dataset.next_request_with_timestamp(false, None).0);
-        }
-    }
+    fn test_azure_dataset() {
+        let path = "./data/test/azure.csv";
+        let mut ds = AzureDataset::new();
+        ds.load(path);
 
-    #[test]
-    fn test_load_azure() {
-        let dataset_path = std::path::Path::new("/nvme/ly/dataset/AzureLLMInferenceTrace_code.csv");
-        if dataset_path.exists() {
-            let dataset = Dataset::load_azure_csv(dataset_path.to_str().unwrap(), false);
-            for _ in 0..10 {
-                println!(
-                    "(timestamp, input, output): {:?}",
-                    dataset.next_request_with_timestamp(false, None)
-                );
-            }
-        } else {
-            eprintln!("Dataset not found");
-        }
-    }
+        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
-    #[test]
-    fn test_load_uniform_dataset() {
-        let dataset_type = parse_dataset_type("Uniform(10,1)").unwrap();
-        println!("{:?}", dataset_type);
-        let dataset = Dataset::load_uniform_dataset(10, 1);
-        println!(
-            "{} {} {}",
-            dataset.request_rate(),
-            dataset.round_time(),
-            dataset.dataset_size()
-        );
-    }
+        let ts = TokenSampler::new(tokenizer);
+        let iter = ds.iter();
 
-    #[test]
-    fn test_cherry_pick_burstgpt() {
-        let dataset_type = parse_dataset_type("cherry_pick_burstgpt(0, 1000)").unwrap();
-        println!("{:?}", dataset_type);
-        let dataset_path = std::path::Path::new("/nvme/wht/dataset/BurstGPT_without_fails_2.csv");
-        if dataset_path.exists() {
-            let dataset =
-                Dataset::cherry_pick_burstgpt(dataset_path.to_str().unwrap(), false, 0, 1000);
-            for _ in 0..10 {
-                println!("(input, output): {:?}", dataset.next_request(false, None));
-            }
-        } else {
-            eprintln!("Dataset not found");
+        for p in iter {
+            let (prompt, out_len) = ds.inflate(p, &ts);
+            println!("Azure prompt = \"{}\", output length = {}", prompt, out_len);
         }
     }
 }

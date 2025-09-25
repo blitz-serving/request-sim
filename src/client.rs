@@ -1,12 +1,10 @@
+use std::{pin::Pin, sync::Arc};
+
 use clap::Parser;
 use request_sim::{
-    dataset::{parse_dataset_type, Dataset, DatasetType},
-    protocols::{DistserveProtocol, MockProtocol, StProtocol, VllmProtocol},
-    requester::{
-        create_gamma_interval_generator, report_loop, spawn_request_loop,
-        spawn_request_loop_with_timestamp,
-    },
-    scale_event::ScaleEvent,
+    dataset::Dataset,
+    protocols::{tgi_protocol::TgiProtocol, vllm_protocol::VllmProtocol, Protocol},
+    requester::{create_gamma_interval_generator, report_loop, spawn_request_loop},
 };
 use tokenizers::Tokenizer;
 use tokio::{
@@ -36,13 +34,13 @@ struct Args {
     #[clap(long, short, required = true, value_parser = parse_protocol)]
     protocol: Protocol,
 
-    /// Dataset type. Either "mooncake", "burstgpt", "mooncake_sampled", "azure", "uniform($input,$output)" or "mock".
+    /// Dataset type. Either "bailian", "mooncake", "azure", "uniform($input,$output)".
     ///
     /// The uniform dataset requires input and output length arguments and its default request rate is 1.0 rps.
     ///
     /// To adjust the request rate, use the `request_rate` argument for non-replay mode and the `scale_factor` argument for replay mode instead.
-    #[clap(long, short, required = true, value_parser = parse_dataset_type)]
-    dataset_type: DatasetType,
+    #[clap(long, short, required = true)]
+    dataset: String,
 
     /// Path to dataset file. This argument is required only when dataset_type is not "mock" or "uniform".
     #[clap(long)]
@@ -118,7 +116,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         endpoint,
         endpoints,
         protocol,
-        dataset_type,
+        dataset,
         dataset_path,
         second_dataset_path,
         replay_mode,
@@ -140,75 +138,55 @@ async fn async_main(args: Args) -> Result<(), i32> {
         .await
         .unwrap();
 
-    let (response_tx, response_rx) = flume::unbounded();
-    let dataset = match dataset_type {
-        DatasetType::ProcessedCsv => {
-            Dataset::load_processed_csv(&dataset_path.unwrap(), !replay_mode)
+    let dataset: Pin<Box<dyn LLMTrace>> = match dataset_type.to_lowercase().as_str() {
+        "mooncake" => {
+            let mut dataset = Box::pin(MooncakeDataset::new());
+            dataset.load(dataset_path.as_str());
+            dataset
         }
-        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::Azure => Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(
-            &dataset_path.unwrap(),
-            &second_dataset_path.unwrap(),
-            !replay_mode,
-        ),
-        DatasetType::Mock => Dataset::load_mock_dataset(),
-        DatasetType::Uniform { input, output } => Dataset::load_uniform_dataset(input, output),
-        DatasetType::CherryPickBurstgpt { start_ts, end_ts } => {
-            Dataset::cherry_pick_burstgpt(&dataset_path.unwrap(), !replay_mode, start_ts, end_ts)
+        "burstgpt" => {
+            let mut dataset = Box::pin(AzureDataset::new());
+            dataset.load(dataset_path.as_str());
+            dataset
         }
+        "bailian" => {
+            let mut dataset = Box::pin(BailianDataset::new());
+            dataset.load(dataset_path.as_str());
+            dataset
+        }
+        "uniform" => {
+            unimplemented!("Uniform length dataset is unimplemented!");
+        }
+        _ => panic!("Invalid dataset type"),
     };
-    let scale_events = if scale_replay_path.is_some() {
-        assert_eq!(replay_mode, true);
-        let mut scale_event = ScaleEvent::new();
-        scale_event.parse_event_csv(&scale_replay_path.unwrap());
-        Some(scale_event)
-    } else {
-        None
-    };
+
+    let (tx, rx) = flume::unbounded();
     let (stop_tx, stop_rx) = oneshot::channel();
     let (broad_tx, _rx) = broadcast::channel(1);
 
-    let protocol: Box<dyn request_sim::protocols::Protocol + Send> = match protocol {
-        Protocol::St => Box::new(StProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
-        Protocol::Vllm => Box::new(VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
-        Protocol::Distserve => Box::new(DistserveProtocol::new(
-            Tokenizer::from_file(tokenizer).unwrap(),
-        )),
-        Protocol::Mock => Box::new(MockProtocol),
-    };
-
     tracing::info!("Client start");
-    let requester_handle = if replay_mode {
-        spawn_request_loop_with_timestamp(
-            endpoint,
-            endpoints,
-            dataset,
-            prefill_only,
-            truncate,
-            protocol,
-            scale_factor.unwrap(),
-            response_tx,
-            scale_events,
-            broad_tx.clone(),
-        )
-    } else {
-        spawn_request_loop(
-            endpoint,
-            endpoints,
-            dataset,
-            prefill_only,
-            truncate,
-            protocol,
-            create_gamma_interval_generator(request_rate.unwrap(), cv),
-            response_tx,
-            stop_rx,
-        )
+    // TODO: check `spawn_request_loop_with_timestamp` API
+    let requester_handle = match protocol.to_lowercase().as_str() {
+        "tgi" => {
+            let token_sampler = TokenSampler::new(Tokenizer::from_file(tokenizer).unwrap());
+            spawn_request_loop_with_timestamp(
+                endpoint,
+                endpoints,
+                dataset,
+                prefill_only,
+                truncate,
+                protocol,
+                scale_factor.unwrap(),
+                tx,
+                scale_events,
+                broad_tx.clone(),
+            )
+        }
+        _ => unimplemented!("Unsupported protocol type"),
     };
+    let reporter_handle = spawn(report_loop(output_file, rx));
 
-    let reporter_handle = spawn(report_loop(output_file, response_rx));
-
+    // start test!
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
     stop_tx.send(()).unwrap();
     broad_tx.send(()).unwrap();
