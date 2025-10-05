@@ -35,10 +35,19 @@ pub(crate) struct MooncakeDataItem {
     pub hash_ids: Vec<u64>,
 }
 
+fn from_timestamp<'de, D>(deserializer: D) -> Result<NaiveDateTime, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    // 支持 "2023-11-16 18:15:46.6805900" 这种格式
+    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AzureDataItem {
-    #[serde(rename = "TIMESTAMP")]
-    pub timestamp: f32,
+    #[serde(rename = "TIMESTAMP", deserialize_with = "from_timestamp")]
+    pub timestamp: NaiveDateTime,
     #[serde(rename = "ContextTokens")]
     pub context_tokens: u64,
     #[serde(rename = "GeneratedTokens")]
@@ -310,12 +319,22 @@ impl LLMTrace for AzureDataset {
     }
 
     fn rps(&self) -> f64 {
-        self.items.len() as f64
-            / (self.items.last().unwrap().timestamp - self.items.first().unwrap().timestamp) as f64
+        let first = self.items.first().unwrap().timestamp;
+        let last = self.items.last().unwrap().timestamp;
+        let duration = last - first;
+        let seconds = duration.num_milliseconds() as f64 / 1000.0;
+        if seconds > 0.0 {
+            self.items.len() as f64 / seconds
+        } else {
+            0.0
+        }
+        // self.items.len() as f64
+        //     / (self.items.last().unwrap().timestamp - self.items.first().unwrap().timestamp) as f64
     }
 
     fn timestamp(&self, index: usize) -> u64 {
-        (self.items[index].timestamp * 1000.) as u64
+        // (self.items[index].timestamp * 1000.) as u64
+        self.items[index].timestamp.and_utc().timestamp_millis() as u64
     }
 
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {

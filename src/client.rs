@@ -138,6 +138,11 @@ async fn async_main(args: Args) -> Result<(), i32> {
         "uniform" => {
             unimplemented!("Uniform length dataset is unimplemented!");
         }
+        "azure" =>{
+            let mut dataset = Box::pin(AzureDataset::new());
+            dataset.load(dataset_path.expect("A dataset path must be provided in replay mode!").as_str());
+            dataset
+        }
         _ => panic!("Invalid dataset type"),
     };
 
