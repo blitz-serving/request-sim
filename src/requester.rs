@@ -215,7 +215,12 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let curr_timestamp = get_timestamp();
             let next_timestamp =
                 ((*dataset).timestamp(data_index) as f64 / scale_factor).round() as u64;
-
+            tracing::info!(
+                "Request {} scheduled at {}, current time {}",
+                data_index,
+                next_timestamp,
+                curr_timestamp
+            );
             if next_timestamp > curr_timestamp {
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }

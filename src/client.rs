@@ -187,7 +187,7 @@ fn main() -> Result<(), i32> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     match args.threads {
         Some(threads) => builder.worker_threads(threads),
-        None => &mut builder,
+        None => builder.worker_threads(60),
     }
     .enable_all()
     .build()
