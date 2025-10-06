@@ -17,7 +17,7 @@ impl Clone for TGIApi {
 impl LLMApi for TGIApi {
     fn request_json_body(prompt: String, output_length: u64) -> String {
         let json_body =
-            serde_json::json!({"input":prompt,"parameter":{"max_new_tokens":output_length}});
+            serde_json::json!({"inputs":prompt,"parameter":{"max_new_tokens":output_length}});
         json_body.to_string()
     }
 

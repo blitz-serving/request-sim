@@ -47,11 +47,13 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AzureDataItem {
     #[serde(rename = "TIMESTAMP", deserialize_with = "from_timestamp")]
-    pub timestamp: NaiveDateTime,
+    pub naive_timestamp: NaiveDateTime,
     #[serde(rename = "ContextTokens")]
     pub context_tokens: u64,
     #[serde(rename = "GeneratedTokens")]
     pub generated_tokens: u64,
+    #[serde(skip)]
+    pub timestamp: u64,
 }
 
 pub struct DataIter {
@@ -284,6 +286,7 @@ impl LLMTrace for MooncakeDataset {
 // ============== AzureDataset ==============
 //
 pub struct AzureDataset {
+    start_time: u64,
     items: Vec<AzureDataItem>,
     user_prompts: UnsafeCell<Vec<String>>, // each string represents 16 tokens
     rwlock: SpinRwLock,
@@ -298,6 +301,7 @@ impl AzureDataset {
             items: Vec::new(),
             user_prompts: UnsafeCell::new(Vec::with_capacity(1024)),
             rwlock: SpinRwLock::new(),
+            start_time: 0,
         }
     }
 }
@@ -306,7 +310,12 @@ impl LLMTrace for AzureDataset {
     fn load(&mut self, path: &str) {
         let mut rdr = csv::Reader::from_path(path).unwrap();
         for result in rdr.deserialize() {
-            let record: AzureDataItem = result.unwrap();
+            let mut record: AzureDataItem = result.unwrap();
+            if self.start_time == 0 {
+                self.start_time = record.naive_timestamp.and_utc().timestamp_millis() as u64;
+            }
+            record.timestamp =
+                record.naive_timestamp.and_utc().timestamp_millis() as u64 - self.start_time;
             self.items.push(record);
         }
     }
@@ -322,7 +331,7 @@ impl LLMTrace for AzureDataset {
         let first = self.items.first().unwrap().timestamp;
         let last = self.items.last().unwrap().timestamp;
         let duration = last - first;
-        let seconds = duration.num_milliseconds() as f64 / 1000.0;
+        let seconds = duration as f64 / 1000.0;
         if seconds > 0.0 {
             self.items.len() as f64 / seconds
         } else {
@@ -334,7 +343,7 @@ impl LLMTrace for AzureDataset {
 
     fn timestamp(&self, index: usize) -> u64 {
         // (self.items[index].timestamp * 1000.) as u64
-        self.items[index].timestamp.and_utc().timestamp_millis() as u64
+        self.items[index].timestamp
     }
 
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
@@ -343,6 +352,7 @@ impl LLMTrace for AzureDataset {
                 timestamp: _,
                 context_tokens,
                 generated_tokens,
+                naive_timestamp: _,
             } = self.items.get(index).unwrap().clone();
 
             let last_block_len = (context_tokens % 16) as usize;
