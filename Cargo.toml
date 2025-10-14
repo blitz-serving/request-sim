@@ -36,6 +36,7 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1.10.6"
 tracing = "^0.1"
 tracing-subscriber = "0.3"
+crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
 
 
 [features]

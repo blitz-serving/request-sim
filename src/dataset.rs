@@ -7,11 +7,17 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{token_sampler::TokenSampler, SpinRwLock};
+use crate::{
+    metrics::{self, SystemMetrics},
+    token_sampler::TokenSampler,
+    SpinRwLock,
+};
 use chrono::NaiveDateTime;
 use rand::seq::SliceRandom;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// jsonl of Bailian
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +86,7 @@ unsafe impl Sync for DataIter {}
 pub trait LLMTrace: Send + Sync {
     fn load(&mut self, path: &str);
     fn timestamp(&self, index: usize) -> u64;
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64);
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64, SystemMetrics);
     fn iter(&self) -> DataIter;
     fn rps(&self) -> f64;
 }
@@ -133,7 +139,7 @@ impl LLMTrace for BailianDataset {
         (self.items[index].timestamp * 1000.) as u64
     }
 
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64, SystemMetrics) {
         // NOTE: the last block hash may be hashed onto a partially filled block
         const BLOCK_SIZE: usize = 16;
         unsafe {
@@ -178,6 +184,15 @@ impl LLMTrace for BailianDataset {
                 prompt,
                 (*data_item).input_length,
                 (*data_item).output_length,
+                SystemMetrics {
+                    generate_time: None,
+                    get_prompt_time: None,
+                    sample_time: None,
+                    inflate_time: None,
+                    send_gap: None,
+                    prev_sample_time: None,
+                    post_sample_time: None,
+                },
             )
         }
     }
@@ -231,7 +246,7 @@ impl LLMTrace for MooncakeDataset {
         self.items[index].timestamp
     }
 
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64, SystemMetrics) {
         // NOTE: the last block hash may be hashed onto a partially filled block
         const BLOCK_SIZE: usize = 512;
         unsafe {
@@ -277,6 +292,15 @@ impl LLMTrace for MooncakeDataset {
                 prompt,
                 (*data_item).input_length,
                 (*data_item).output_length,
+                SystemMetrics {
+                    generate_time: None,
+                    get_prompt_time: None,
+                    sample_time: None,
+                    inflate_time: None,
+                    send_gap: None,
+                    prev_sample_time: None,
+                    post_sample_time: None,
+                },
             )
         }
     }
@@ -290,6 +314,7 @@ pub struct AzureDataset {
     items: Vec<AzureDataItem>,
     user_prompts: UnsafeCell<Vec<String>>, // each string represents 16 tokens
     rwlock: SpinRwLock,
+    // user_prompts_map: UnsafeCell<HashMap<usize, String>>,
 }
 
 unsafe impl Send for AzureDataset {}
@@ -302,6 +327,7 @@ impl AzureDataset {
             user_prompts: UnsafeCell::new(Vec::with_capacity(1024)),
             rwlock: SpinRwLock::new(),
             start_time: 0,
+            // user_prompts_map: UnsafeCell::new(HashMap::new()),
         }
     }
 }
@@ -346,8 +372,19 @@ impl LLMTrace for AzureDataset {
         self.items[index].timestamp
     }
 
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64, SystemMetrics) {
         unsafe {
+            let inflate_start_time = std::time::Instant::now();
+            let mut metrics = SystemMetrics {
+                generate_time: None,
+                get_prompt_time: None,
+                sample_time: None,
+                inflate_time: None,
+                send_gap: None,
+                prev_sample_time: None,
+                post_sample_time: None,
+            };
+            // tracing::info!("Inflating index {}", index);
             let AzureDataItem {
                 timestamp: _,
                 context_tokens,
@@ -361,30 +398,65 @@ impl LLMTrace for AzureDataset {
             let mut prompt = String::new();
             self.rwlock.read_lock();
             let n = (&*self.user_prompts.get()).len();
+
+            let read_lock_time = inflate_start_time.elapsed().as_millis();
+            metrics.prev_sample_time = Some(read_lock_time as u64);
             if n >= num_blocks {
+                let get_prompt_start_time = std::time::Instant::now();
                 for s in &(&(*self.user_prompts.get()))[0..num_blocks] {
                     prompt.push_str(s);
                 }
+                // tracing::info!("no need to generate new blocks, current blocks = {}", n);
                 self.rwlock.read_unlock();
+                let end_time = get_prompt_start_time.elapsed().as_millis();
+                metrics.get_prompt_time = Some(end_time as u64);
             } else {
+                let generate_start_time = std::time::Instant::now();
                 for s in &(&(*self.user_prompts.get()))[0..n] {
                     prompt.push_str(s);
                 }
+                // tracing::info!(
+                //     "need to generate {} new blocks, current blocks = {}",
+                //     num_blocks - n,
+                //     n
+                // );
                 self.rwlock.read_unlock();
                 let new_prompts: Vec<String> = (n..num_blocks).map(|_| ts.gen_string(16)).collect();
                 for s in new_prompts.iter() {
                     prompt.push_str(s);
                 }
+
+                // tracing::info!("waiting for write lock, index = {}", index);
                 self.rwlock.write_lock();
                 (&mut *self.user_prompts.get()).extend(new_prompts);
                 self.rwlock.write_unlock();
+                let end_time = generate_start_time.elapsed().as_millis();
+                metrics.generate_time = Some(end_time as u64);
             }
             // postcond: self.rwlock is unlocked
+            // tracing::info!("generating last block of length {}", last_block_len);
+            let post_sample_time = std::time::Instant::now();
+            if last_block_len != 0 {
+                let last_block_prompt = ts.gen_string(last_block_len);
+                prompt.push_str(&last_block_prompt);
+            }
+            // self.rwlock.read_lock();
+            // if let Some(s) = &(&(*self.user_prompts_map.get())).get(&last_block_len) {
+            //     prompt.push_str(s);
+            //     self.rwlock.read_unlock();
+            // } else {
+            //     self.rwlock.read_unlock();
+            //     let last_block_prompt = ts.gen_string(last_block_len);
+            //     prompt.push_str(&last_block_prompt);
+            //     self.rwlock.write_lock();
+            //     (&mut *self.user_prompts_map.get()).insert(last_block_len, last_block_prompt);
+            //     self.rwlock.write_unlock();
+            // }
 
-            let last_block_prompt = ts.gen_string(last_block_len);
-            prompt.push_str(&last_block_prompt);
-
-            (prompt, context_tokens, generated_tokens)
+            let end_time = inflate_start_time.elapsed().as_millis();
+            metrics.inflate_time = Some(end_time as u64);
+            metrics.post_sample_time = Some(post_sample_time.elapsed().as_millis() as u64);
+            (prompt, context_tokens, generated_tokens, metrics)
         }
     }
 }

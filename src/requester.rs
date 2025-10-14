@@ -20,7 +20,8 @@ use tokio::{
 use tracing::instrument;
 
 use crate::{
-    apis::LLMApi, dataset::LLMTrace, distribution::Distribution, token_sampler::TokenSampler,
+    apis::LLMApi, dataset::LLMTrace, distribution::Distribution, metrics,
+    token_sampler::TokenSampler,
 };
 
 pub struct IntervalGenerator {
@@ -125,7 +126,7 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
             let response_sender = response_sender.clone();
             // parse in another coroutine
             let request_handle = spawn(async move {
-                let (prompt, input_length, output_length) =
+                let (prompt, input_length, output_length, system_metrics) =
                     dataset.inflate(data_index, ts.as_ref());
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
@@ -213,21 +214,21 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let response_sender = response_sender.clone();
 
             let curr_timestamp = get_timestamp();
-            let next_timestamp =
-                ((*dataset).timestamp(data_index) as f64 / scale_factor).round() as u64;
-            tracing::info!(
-                "Request {} scheduled at {}, current time {}",
-                data_index,
-                next_timestamp,
-                curr_timestamp
-            );
-            if next_timestamp > curr_timestamp {
+            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
+            // tracing::info!(
+            //     "Request {} scheduled at {}, current time {}",
+            //     data_index,
+            //     next_timestamp,
+            //     curr_timestamp
+            // );
+
+            if next_timestamp > curr_timestamp + 1 {
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
-
+            // tracing::info!("Request {} sent at {}", data_index, get_timestamp());
             // parse in another coroutine
             let request_handle = spawn(async move {
-                let (prompt, input_length, output_length) =
+                let (prompt, input_length, output_length, system_metrics) =
                     dataset.inflate(data_index, ts.as_ref());
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
@@ -241,10 +242,37 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                     let e_time = get_timestamp();
 
                     let mut metrics = A::parse_response(response);
+                    let send_gap = s_time.saturating_sub(next_timestamp);
+                    metrics.insert(
+                        "generate_time".to_string(),
+                        system_metrics.generate_time.unwrap_or(0).to_string(),
+                    );
+                    metrics.insert("send_gap".to_string(), send_gap.to_string());
+                    metrics.insert(
+                        "get_prompt_time".to_string(),
+                        system_metrics.get_prompt_time.unwrap_or(0).to_string(),
+                    );
+                    metrics.insert(
+                        "sample_time".to_string(),
+                        system_metrics.sample_time.unwrap_or(0).to_string(),
+                    );
+                    metrics.insert(
+                        "inflate_time".to_string(),
+                        system_metrics.inflate_time.unwrap_or(0).to_string(),
+                    );
+                    metrics.insert(
+                        "prev_sample_time".to_string(),
+                        system_metrics.prev_sample_time.unwrap_or(0).to_string(),
+                    );
+                    metrics.insert(
+                        "post_sample_time".to_string(),
+                        system_metrics.post_sample_time.unwrap_or(0).to_string(),
+                    );
                     metrics.insert("s_time".to_string(), s_time.to_string());
                     metrics.insert("e_time".to_string(), e_time.to_string());
                     metrics.insert("input_length".to_string(), input_length.to_string());
                     metrics.insert("output_length".to_string(), output_length.to_string());
+                    metrics.insert("client_id".to_string(), data_index.to_string());
 
                     response_sender.send(metrics).unwrap();
                 } else {

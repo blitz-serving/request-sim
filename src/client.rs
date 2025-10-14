@@ -19,6 +19,17 @@ struct Args {
     #[clap(long, required = true)]
     tokenizer: String,
 
+    #[clap(long, required = true)]
+    tokenizer_config: String,
+
+    /// Number of producer threads in TokenSampler.
+    #[clap(long)]
+    num_producer: Option<usize>,
+
+    /// Capacity of the channel between producers and consumers in TokenSampler.
+    #[clap(long)]
+    channel_capacity: Option<usize>,
+
     /// Worker threads to use for tokio runime. Default is set to the number of cores.
     #[clap(long)]
     threads: Option<usize>,
@@ -84,6 +95,9 @@ struct Args {
 async fn async_main(args: Args) -> Result<(), i32> {
     let Args {
         tokenizer,
+        tokenizer_config,
+        num_producer,
+        channel_capacity,
         threads: _,
         endpoint,
         api,
@@ -107,9 +121,12 @@ async fn async_main(args: Args) -> Result<(), i32> {
         .await
         .unwrap();
 
+    let mut block_size = 0;
+
     let dataset: Pin<Box<dyn LLMTrace>> = match dataset.to_lowercase().as_str() {
         "mooncake" => {
             let mut dataset = Box::pin(MooncakeDataset::new());
+            block_size = 128;
             dataset.load(
                 dataset_path
                     .expect("A dataset path must be provided in replay mode!")
@@ -119,6 +136,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         }
         "burstgpt" => {
             let mut dataset = Box::pin(AzureDataset::new());
+            block_size = 16;
             dataset.load(
                 dataset_path
                     .expect("A dataset path must be provided in replay mode!")
@@ -128,6 +146,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         }
         "bailian" => {
             let mut dataset = Box::pin(BailianDataset::new());
+            block_size = 16;
             dataset.load(
                 dataset_path
                     .expect("A dataset path must be provided in replay mode!")
@@ -138,9 +157,14 @@ async fn async_main(args: Args) -> Result<(), i32> {
         "uniform" => {
             unimplemented!("Uniform length dataset is unimplemented!");
         }
-        "azure" =>{
+        "azure" => {
             let mut dataset = Box::pin(AzureDataset::new());
-            dataset.load(dataset_path.expect("A dataset path must be provided in replay mode!").as_str());
+            block_size = 16;
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided in replay mode!")
+                    .as_str(),
+            );
             dataset
         }
         _ => panic!("Invalid dataset type"),
@@ -154,8 +178,13 @@ async fn async_main(args: Args) -> Result<(), i32> {
     let requester_handle = match api.to_lowercase().as_str() {
         "tgi" => {
             let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
-            let token_sampler =
-                Arc::new(TokenSampler::new(Tokenizer::from_file(tokenizer).unwrap()));
+            let token_sampler = Arc::new(TokenSampler::new(
+                Tokenizer::from_file(tokenizer).unwrap(),
+                tokenizer_config,
+                num_producer.unwrap_or(1),
+                channel_capacity.unwrap_or(128),
+                block_size,
+            ));
             spawn_request_loop_with_timestamp::<TGIApi>(
                 endpoint,
                 dataset,
@@ -187,7 +216,7 @@ fn main() -> Result<(), i32> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     match args.threads {
         Some(threads) => builder.worker_threads(threads),
-        None => builder.worker_threads(60),
+        None => builder.worker_threads(55),
     }
     .enable_all()
     .build()
