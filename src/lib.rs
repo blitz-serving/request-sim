@@ -3,6 +3,7 @@ pub mod distribution;
 pub mod apis;
 pub mod requester;
 pub mod token_sampler;
+pub mod metrics;
 
 use core::hint::spin_loop;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
