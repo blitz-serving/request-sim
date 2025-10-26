@@ -124,10 +124,11 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
             let ts = token_sampler.clone();
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
+            let (prompt, input_length, output_length, _) =
+                dataset.inflate(data_index, ts.as_ref());
+
             // parse in another coroutine
             let request_handle = spawn(async move {
-                let (prompt, input_length, output_length, system_metrics) =
-                    dataset.inflate(data_index, ts.as_ref());
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
                 if let Ok(response) = request_with_timeout(
