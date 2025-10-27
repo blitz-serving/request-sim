@@ -227,9 +227,9 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             }
             // tracing::info!("Request {} sent at {}", data_index, get_timestamp());
             // parse in another coroutine
+            let (prompt, input_length, output_length, system_metrics) =
+                dataset.inflate(data_index, ts.as_ref());
             let request_handle = spawn(async move {
-                let (prompt, input_length, output_length, system_metrics) =
-                    dataset.inflate(data_index, ts.as_ref());
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
                 if let Ok(response) = request_with_timeout(

@@ -78,9 +78,21 @@ impl TokenSampler {
             });
         }
 
+        let rx_arc_clone = Arc::clone(&rx_arc);
+        thread::spawn(move || {
+            tracing::info!("TokenSampler initialized");
+            loop {
+                tracing::info!(
+                    "Waiting for TokenSampler to fill the channel..., cur_len: {}",
+                    rx_arc_clone.lock().unwrap().len()
+                );
+                thread::sleep(Duration::from_millis(1000));
+            }
+        });
+
         for i in 1..block_size {
             let (tx, rx) = channel::bounded::<String>(channel_capacity);
-            for _ in 1..20 {
+            for _ in 1..200 {
                 let prompt = Self::generate_block(&tokenizer, &splitter, i as usize);
                 tx.send(prompt).unwrap();
             }

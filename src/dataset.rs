@@ -141,6 +141,7 @@ impl LLMTrace for BailianDataset {
 
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64, SystemMetrics) {
         // NOTE: the last block hash may be hashed onto a partially filled block
+        let generate_time = std::time::Instant::now();
         const BLOCK_SIZE: usize = 16;
         unsafe {
             let data_item = self.items.get(index).unwrap();
@@ -149,20 +150,31 @@ impl LLMTrace for BailianDataset {
             debug_assert!(last_block_len <= BLOCK_SIZE);
 
             let mut prompt = String::new();
-            for &hash_id in (*data_item)
-                .hash_ids
-                .iter()
-                .take((*data_item).hash_ids.len() - 1)
-            {
+            let mut get_prompt_time = 0;
+
+            let mut read_lock_time = 0;
+            let mut sample_time = 0;
+            let mut write_lock_time = 0;
+            for &hash_id in (*data_item).hash_ids.iter().take((*data_item).hash_ids.len() - 1) {
                 // loop invariant: rwlock is free
+                let start_read_lock = std::time::Instant::now();
                 self.rwlock.read_lock();
+                let get_read_lock_time = std::time::Instant::now();
+                read_lock_time += get_read_lock_time.duration_since(start_read_lock).as_millis();
                 if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
                     prompt.push_str(&s);
+                    get_prompt_time +=
+                        std::time::Instant::now().duration_since(get_read_lock_time).as_millis();
                     self.rwlock.read_unlock();
                 } else {
                     self.rwlock.read_unlock();
                     let s = ts.gen_string(BLOCK_SIZE);
+                    let sample_done_time = std::time::Instant::now();
+                    sample_time += sample_done_time.duration_since(get_read_lock_time).as_millis();
                     self.rwlock.write_lock();
+                    let get_write_lock_time = std::time::Instant::now();
+                    write_lock_time +=
+                        get_write_lock_time.duration_since(sample_done_time).as_millis();
                     if let Some(s0) = (*self.user_prompts.get()).get(&hash_id) {
                         prompt.push_str(&s0);
                     } else {
@@ -172,26 +184,27 @@ impl LLMTrace for BailianDataset {
                     self.rwlock.write_unlock();
                 }
             }
-
             let last_block_prompt = ts.gen_string(last_block_len);
             prompt.push_str(&last_block_prompt);
+            let earlier = std::time::Instant::now();
             self.rwlock.write_lock();
             (&mut *self.user_prompts.get())
                 .insert(*(*data_item).hash_ids.last().unwrap(), last_block_prompt);
             self.rwlock.write_unlock();
-
+            let post_sample_time = std::time::Instant::now().duration_since(earlier).as_millis();
+            let inflate_time = generate_time.elapsed().as_millis();
             (
                 prompt,
                 (*data_item).input_length,
                 (*data_item).output_length,
                 SystemMetrics {
-                    generate_time: None,
-                    get_prompt_time: None,
-                    sample_time: None,
-                    inflate_time: None,
+                    generate_time: Some(write_lock_time as u64),
+                    get_prompt_time: Some(get_prompt_time as u64),
+                    sample_time: Some(sample_time as u64),
+                    inflate_time: Some(inflate_time as u64),
                     send_gap: None,
-                    prev_sample_time: None,
-                    post_sample_time: None,
+                    prev_sample_time: Some(read_lock_time as u64),
+                    post_sample_time: Some(post_sample_time as u64),
                 },
             )
         }
