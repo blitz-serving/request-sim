@@ -4,14 +4,15 @@ use clap::Parser;
 use request_sim::{
     apis::TGIApi,
     dataset::{AzureDataset, BailianDataset, LLMTrace, MooncakeDataset},
-    requester::{
-        create_gamma_interval_generator, report_loop, spawn_request_loop,
-        spawn_request_loop_with_timestamp,
-    },
+    requester::{report_loop, spawn_request_loop_debug, spawn_request_loop_with_timestamp},
     token_sampler::TokenSampler,
 };
 use tokenizers::Tokenizer;
 use tokio::{spawn, sync::broadcast};
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::fmt::{self, format::FmtSpan};
+use tracing_subscriber::{prelude::*, Layer, Registry};
 
 #[derive(Parser)]
 struct Args {
@@ -87,6 +88,10 @@ struct Args {
     #[clap(long, short, default_value = "./log/output.jsonl")]
     output_path: String,
 
+    /// Tracing path. Only used by tracing
+    #[clap(long)]
+    tracing_path: Option<String>,
+
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
@@ -110,6 +115,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         scale_factor,
         cv,
         output_path,
+        tracing_path: _,
         time_in_secs,
     } = args;
 
@@ -173,7 +179,6 @@ async fn async_main(args: Args) -> Result<(), i32> {
     let (tx, rx) = flume::unbounded();
     let (broadcast_tx, _rx) = broadcast::channel(1);
 
-    tracing::info!("Client start");
     // TODO: check `spawn_request_loop_with_timestamp` API
     let requester_handle = match api.to_lowercase().as_str() {
         "tgi" => {
@@ -185,7 +190,27 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 channel_capacity.unwrap_or(128),
                 block_size,
             ));
+            tracing::info!("Client start");
             spawn_request_loop_with_timestamp::<TGIApi>(
+                endpoint,
+                dataset,
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                broadcast_tx.clone(),
+            )
+        }
+        "release-with-debug" => {
+            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
+            let token_sampler = Arc::new(TokenSampler::new(
+                Tokenizer::from_file(tokenizer).unwrap(),
+                tokenizer_config,
+                num_producer.unwrap_or(1),
+                channel_capacity.unwrap_or(128),
+                block_size,
+            ));
+            tracing::info!("Client start");
+            spawn_request_loop_debug::<TGIApi>(
                 endpoint,
                 dataset,
                 token_sampler,
@@ -208,11 +233,31 @@ async fn async_main(args: Args) -> Result<(), i32> {
 }
 
 fn main() -> Result<(), i32> {
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     let args = Args::parse();
+    let console_layer = fmt::layer()
+        .compact()
+        .with_target(false)
+        .with_filter(filter_fn(|meta| {
+            // meta.target() 是模块路径
+            // meta.name() 是 span 名称
+            !meta.name().contains("inflate")
+        }))
+        .with_filter(LevelFilter::INFO);
+    if args.tracing_path.is_some() {
+        let file = std::fs::File::create(args.tracing_path.as_ref().unwrap()).unwrap();
+        let file_layer = fmt::layer()
+            .with_writer(file)
+            .with_ansi(false)
+            .with_span_events(FmtSpan::CLOSE)
+            .with_filter(filter_fn(|meta| meta.name().contains("inflate")));
+        Registry::default()
+            .with(console_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        Registry::default().with(console_layer).init();
+    }
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     match args.threads {
         Some(threads) => builder.worker_threads(threads),

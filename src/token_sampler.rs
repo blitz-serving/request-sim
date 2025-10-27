@@ -2,6 +2,7 @@ use core::panic;
 use crossbeam::channel;
 use rand::Rng;
 use serde_json::Value;
+use tracing::{instrument, span, Level};
 use std::{
     collections::HashMap,
     fs,
@@ -78,6 +79,7 @@ impl TokenSampler {
             });
         }
 
+        tracing::info!("Warmup start...");
         for i in 1..block_size {
             let (tx, rx) = channel::bounded::<String>(channel_capacity);
             for _ in 1..20 {
@@ -87,6 +89,7 @@ impl TokenSampler {
             ragged_block_sender.lock().unwrap().insert(i as usize, tx);
             ragged_block_cache.lock().unwrap().insert(i as usize, rx);
         }
+        tracing::info!("Warmup finished!");
 
         Self {
             tokenizer,
@@ -125,7 +128,7 @@ impl TokenSampler {
                 Ok(_) => continue, // 成功填充 -> 继续下一轮
                 Err(channel::TrySendError::Full(_)) => {
                     // 主通道已满 -> 去监听通知
-                    match notify_rx.recv_timeout(Duration::from_millis(50)) {
+                    match notify_rx.recv_timeout(Duration::from_millis(5)) {
                         Ok(size) => {
                             // 收到通知 -> 生成对应样本并发送到 ragged 通道
                             let ragged_sample = Self::generate_block(&tokenizer, &splitter, size);
@@ -219,6 +222,7 @@ impl TokenSampler {
     ///
     /// 若 n == block_size，则尝试从缓存中取出；
     /// 否则即时生成。
+    #[instrument(skip_all, fields(block_size = n), level = Level::TRACE)]
     pub fn gen_string(&self, n: usize) -> String {
         // let bs_guard = self.block_size.lock().unwrap();
         // if let Some(bs) = *bs_guard {

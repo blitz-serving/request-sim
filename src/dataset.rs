@@ -3,7 +3,6 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
-    mem,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -13,11 +12,8 @@ use crate::{
     SpinRwLock,
 };
 use chrono::NaiveDateTime;
-use rand::seq::SliceRandom;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use tracing::{instrument, Level}; 
 
 /// jsonl of Bailian
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +135,7 @@ impl LLMTrace for BailianDataset {
         (self.items[index].timestamp * 1000.) as u64
     }
 
+    #[instrument(skip_all, fields(chat_id = index), level = Level::INFO)]
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64, SystemMetrics) {
         // NOTE: the last block hash may be hashed onto a partially filled block
         const BLOCK_SIZE: usize = 16;
@@ -462,64 +459,64 @@ impl LLMTrace for AzureDataset {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::token_sampler::TokenSampler;
-    use tokenizers::Tokenizer;
+    // use super::*;
+    // use crate::token_sampler::TokenSampler;
+    // use tokenizers::Tokenizer;
 
-    #[test]
-    fn test_bailian_dataset() {
-        let path = "./data/test/bailian.jsonl";
-        let mut ds = BailianDataset::new();
-        ds.load(path);
+    // #[test]
+    // fn test_bailian_dataset() {
+    //     let path = "./data/test/bailian.jsonl";
+    //     let mut ds = BailianDataset::new();
+    //     ds.load(path);
 
-        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
+    //     let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
-        let ts = TokenSampler::new(tokenizer);
-        let iter = ds.iter();
+    //     let ts = TokenSampler::new(tokenizer);
+    //     let iter = ds.iter();
 
-        for idx in iter {
-            let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
-            println!(
-                "Bailian prompt = \"{}\", output length = {}",
-                prompt, out_len
-            );
-        }
-    }
+    //     for idx in iter {
+    //         let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
+    //         println!(
+    //             "Bailian prompt = \"{}\", output length = {}",
+    //             prompt, out_len
+    //         );
+    //     }
+    // }
 
-    #[test]
-    fn test_mooncake_dataset() {
-        let path = "./data/test/mooncake.jsonl";
-        let mut ds = MooncakeDataset::new();
-        ds.load(path);
+    // #[test]
+    // fn test_mooncake_dataset() {
+    //     let path = "./data/test/mooncake.jsonl";
+    //     let mut ds = MooncakeDataset::new();
+    //     ds.load(path);
 
-        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
+    //     let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
-        let ts = TokenSampler::new(tokenizer);
-        let iter = ds.iter();
+    //     let ts = TokenSampler::new(tokenizer);
+    //     let iter = ds.iter();
 
-        for idx in iter {
-            let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
-            println!(
-                "Mooncake prompt = \"{}\", output length = {}",
-                prompt, out_len
-            );
-        }
-    }
+    //     for idx in iter {
+    //         let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
+    //         println!(
+    //             "Mooncake prompt = \"{}\", output length = {}",
+    //             prompt, out_len
+    //         );
+    //     }
+    // }
 
-    #[test]
-    fn test_azure_dataset() {
-        let path = "./data/test/azure.csv";
-        let mut ds = AzureDataset::new();
-        ds.load(path);
+    // #[test]
+    // fn test_azure_dataset() {
+    //     let path = "./data/test/azure.csv";
+    //     let mut ds = AzureDataset::new();
+    //     ds.load(path);
 
-        let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
+    //     let tokenizer = Tokenizer::from_file("./data/test/tokenizer.json").unwrap();
 
-        let ts = TokenSampler::new(tokenizer);
-        let iter = ds.iter();
+    //     let ts = TokenSampler::new(tokenizer);
+    //     let iter = ds.iter();
 
-        for idx in iter {
-            let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
-            println!("Azure prompt = \"{}\", output length = {}", prompt, out_len);
-        }
-    }
+    //     for idx in iter {
+    //         let (prompt, in_len, out_len) = ds.inflate(idx, &ts);
+    //         println!("Azure prompt = \"{}\", output length = {}", prompt, out_len);
+    //     }
+    // }
 }

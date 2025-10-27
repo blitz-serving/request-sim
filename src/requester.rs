@@ -17,7 +17,6 @@ use tokio::{
     task::{yield_now, JoinHandle},
     time::sleep,
 };
-use tracing::instrument;
 
 use crate::{
     apis::LLMApi, dataset::LLMTrace, distribution::Distribution, metrics,
@@ -120,12 +119,11 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
                 break;
             }
             // data to move into closure
-            let dataset = dataset.clone();
-            let ts = token_sampler.clone();
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
+            // TODO: add new span
             let (prompt, input_length, output_length, _) =
-                dataset.inflate(data_index, ts.as_ref());
+                dataset.inflate(data_index, token_sampler.as_ref());
 
             // parse in another coroutine
             let request_handle = spawn(async move {
@@ -170,7 +168,6 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     handle
 }
 
-#[instrument(skip_all)]
 pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     endpoint: String,
     dataset: Arc<Pin<Box<dyn LLMTrace>>>,
@@ -209,28 +206,21 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             if gen_rx.try_recv().is_ok() {
                 break;
             }
-            let dataset = dataset.clone();
             let endpoint = endpoint.clone();
-            let ts = token_sampler.clone();
             let response_sender = response_sender.clone();
 
             let curr_timestamp = get_timestamp();
             let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
-            // tracing::info!(
-            //     "Request {} scheduled at {}, current time {}",
-            //     data_index,
-            //     next_timestamp,
-            //     curr_timestamp
-            // );
 
             if next_timestamp > curr_timestamp + 1 {
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
-            // tracing::info!("Request {} sent at {}", data_index, get_timestamp());
-            // parse in another coroutine
+
+            // Do not parse in another coroutine to avoid sync/async lock contention 
+            let (prompt, input_length, output_length, _) =
+                dataset.inflate(data_index, token_sampler.as_ref());
+            
             let request_handle = spawn(async move {
-                let (prompt, input_length, output_length, system_metrics) =
-                    dataset.inflate(data_index, ts.as_ref());
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
                 if let Ok(response) = request_with_timeout(
@@ -243,32 +233,6 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                     let e_time = get_timestamp();
 
                     let mut metrics = A::parse_response(response);
-                    let send_gap = s_time.saturating_sub(next_timestamp);
-                    metrics.insert(
-                        "generate_time".to_string(),
-                        system_metrics.generate_time.unwrap_or(0).to_string(),
-                    );
-                    metrics.insert("send_gap".to_string(), send_gap.to_string());
-                    metrics.insert(
-                        "get_prompt_time".to_string(),
-                        system_metrics.get_prompt_time.unwrap_or(0).to_string(),
-                    );
-                    metrics.insert(
-                        "sample_time".to_string(),
-                        system_metrics.sample_time.unwrap_or(0).to_string(),
-                    );
-                    metrics.insert(
-                        "inflate_time".to_string(),
-                        system_metrics.inflate_time.unwrap_or(0).to_string(),
-                    );
-                    metrics.insert(
-                        "prev_sample_time".to_string(),
-                        system_metrics.prev_sample_time.unwrap_or(0).to_string(),
-                    );
-                    metrics.insert(
-                        "post_sample_time".to_string(),
-                        system_metrics.post_sample_time.unwrap_or(0).to_string(),
-                    );
                     metrics.insert("s_time".to_string(), s_time.to_string());
                     metrics.insert("e_time".to_string(), e_time.to_string());
                     metrics.insert("input_length".to_string(), input_length.to_string());
@@ -293,6 +257,86 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     handle
 }
 
+
+pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
+    _endpoint: String, // 保留参数，为了接口一致
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>,
+    token_sampler: Arc<TokenSampler>,
+    scale_factor: f64,
+    response_sender: flume::Sender<BTreeMap<String, String>>,
+    broadcast_tx: broadcast::Sender<()>,
+) -> JoinHandle<Result<(), i32>> {
+    use std::time::Instant;
+    static BASETIME: OnceLock<Instant> = OnceLock::new();
+    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
+    BASETIME.get_or_init(|| Instant::now());
+
+    fn get_timestamp() -> u64 {
+        BASETIME.get().unwrap().elapsed().as_millis() as u64
+    }
+
+    let rr = dataset.rps();
+    println!("Origin request rate: {:.3} req/s", rr);
+    println!(
+        "Scaled request rate (release-with-debug mode, no HTTP): {:.3} req/s",
+        rr * scale_factor
+    );
+
+    let (tx, rx) = flume::unbounded();
+    let handle = spawn(async move {
+        wait_all(rx).await;
+        let a = RETURNCODE.load(Ordering::Relaxed);
+        if a == 0 {
+            Ok(())
+        } else {
+            Err(a)
+        }
+    });
+
+    let mut gen_rx = broadcast_tx.subscribe();
+
+    spawn(async move {
+        let data_iter = dataset.iter();
+        for data_index in data_iter {
+            if gen_rx.try_recv().is_ok() {
+                break;
+            }
+
+            let response_sender = response_sender.clone();
+
+            let curr_timestamp = get_timestamp();
+            // milisecond
+            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
+
+            if next_timestamp > curr_timestamp + 1 {
+                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
+            }
+
+            let (_, input_length, output_length, _) =
+                dataset.inflate(data_index, token_sampler.as_ref());
+
+            let request_handle = spawn(async move {
+                let s_time = get_timestamp();
+                let s_time_drift = s_time.saturating_sub(next_timestamp);
+
+                // 构造 metrics 结构，但不发 HTTP
+                let mut metrics = BTreeMap::new();
+                metrics.insert("chat_id".to_string(), data_index.to_string());
+                metrics.insert("input_length".to_string(), input_length.to_string());
+                metrics.insert("output_length".to_string(), output_length.to_string());
+                metrics.insert("s_time".to_string(), s_time.to_string());
+                metrics.insert("s_time_drift".to_string(), s_time_drift.to_string());
+
+                response_sender.send(metrics).unwrap();
+            });
+
+            tx.send_async(request_handle).await.unwrap();
+        }
+    });
+
+    handle
+}
+
 /// The report loop writes the metrics to a file in JSONL format.
 ///
 /// Report loop exits when the response receiver is closed.
@@ -306,5 +350,66 @@ pub async fn report_loop(
         buf_writer.write_all(line.as_bytes()).await.unwrap();
         buf_writer.write_all(b"\n").await.unwrap();
         buf_writer.flush().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        dataset::{BailianDataset, LLMTrace},
+        token_sampler::TokenSampler,
+    };
+    use tokenizers::Tokenizer;
+    use std::sync::Arc;
+    use tokio::fs::File;
+
+    #[tokio::test]
+    async fn test_inflate_latency() {
+        // 初始化 tracing 输出
+        let subscriber = tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        // ====== 准备 dataset ======
+        let mut dataset = BailianDataset::new();
+        dataset.load("/Users/zdy/Workspace/Rust/request-sim/data/qwen-bailian-usagetraces-anon-main/qwen_traceA_blksz_16.jsonl"); // 你要准备一个小的测试文件
+
+        let dataset = Arc::new(Box::pin(dataset) as Pin<Box<dyn LLMTrace>>);
+
+        // ====== 准备 TokenSampler ======
+        let token_sampler = Arc::new(TokenSampler::new(
+            Tokenizer::from_file("/Users/zdy/Workspace/Rust/request-sim/data/tokenizer.json").unwrap(),
+            "/Users/zdy/Workspace/Rust/request-sim/data/tokenizer_config.json".to_string(),
+            4,     // num_producer
+            128,   // capacity
+            16,    // block size
+        ));
+
+        // ====== 准备输出通道 ======
+        let (tx, rx) = flume::unbounded();
+        let output_file = File::create("tmp/inflate_latency.jsonl").await.unwrap();
+        let reporter = tokio::spawn(report_loop(output_file, rx));
+
+        // ====== 测试循环 ======
+        let iter = dataset.iter();
+        for index in iter.take(10) { // 只测前10条
+            let start = std::time::Instant::now();
+            let (_prompt, input_len, output_len, _) = dataset.inflate(index, &token_sampler);
+            let elapsed_us = start.elapsed().as_micros() as u64;
+
+            let mut metrics = std::collections::BTreeMap::new();
+            metrics.insert("index".to_string(), index.to_string());
+            metrics.insert("input_length".to_string(), input_len.to_string());
+            metrics.insert("output_length".to_string(), output_len.to_string());
+            metrics.insert("inflate_time_us".to_string(), elapsed_us.to_string());
+            tx.send_async(metrics).await.unwrap();
+        }
+
+        drop(tx);
+        reporter.await.unwrap();
+
+        tracing::info!("Inflate latency test completed");
     }
 }
