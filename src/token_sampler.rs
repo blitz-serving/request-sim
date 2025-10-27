@@ -119,14 +119,20 @@ impl TokenSampler {
         notify_rx: channel::Receiver<usize>,
         ragged_block_sender: Arc<Mutex<HashMap<usize, channel::Sender<String>>>>,
     ) {
+        let mut local_sample = Vec::new();
         loop {
             // 1️⃣ 优先尝试生成主 block_size 样本
-            let sample = Self::generate_block(&tokenizer, &splitter, block_size as usize);
+            let sample = if local_sample.is_empty() {
+                Self::generate_block(&tokenizer, &splitter, block_size as usize)
+            } else {
+                local_sample.pop().unwrap()
+            };
 
             // 2️⃣ 尝试发送主样本（不会阻塞）
             match tx.try_send(sample) {
                 Ok(_) => continue, // 成功填充 -> 继续下一轮
-                Err(channel::TrySendError::Full(_)) => {
+                Err(channel::TrySendError::Full(x)) => {
+                    local_sample.push(x);
                     // 主通道已满 -> 去监听通知
                     match notify_rx.recv_timeout(Duration::from_millis(5)) {
                         Ok(size) => {
@@ -247,5 +253,120 @@ impl TokenSampler {
         } else {
             panic!("No cache for block size {n}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    const QWEN2_EOS_TOKEN: u32 = 151645;
+    const QWEN2_BOS_TOKEN: u32 = 151644;
+    const QWEM2_PAD_TOKEN: u32 = 151643;
+
+    fn validate_block_generation(tokenizer: &Tokenizer, size: usize, stride: usize) -> (String, usize) {
+        let mut rng = rand::thread_rng();
+        let vocab_size = tokenizer.get_vocab_size(true) as u32;
+        let tokens: Vec<u32> = (0..2 * size).map(|_| rng.gen_range(0..vocab_size)).collect();
+        let decoded = tokenizer.decode(&tokens, false).unwrap_or_default();
+        let encoded = tokenizer.encode(decoded, false).unwrap();
+        let mut all_tokens = encoded.get_ids().to_vec();
+        all_tokens.truncate(size);
+
+        let mut ret = String::with_capacity(size);
+        let mut cnt = 0;
+        let mut begin = 0;
+        let mut end = begin + stride - 2;
+
+        while end <= all_tokens.len() {
+            let mut miss = 0;
+            loop {
+                let tokens = &all_tokens[begin..end];
+                let mut asm_tokens = Vec::with_capacity(stride + miss);
+                asm_tokens.push(QWEN2_BOS_TOKEN);
+                asm_tokens.extend_from_slice(tokens);
+                asm_tokens.push(QWEN2_EOS_TOKEN);
+                let result = tokenizer.decode(&asm_tokens, false).unwrap_or_default();
+                let reencoded_len = tokenizer
+                    .encode(result.clone(), false)
+                    .unwrap()
+                    .get_ids()
+                    .len();
+                if reencoded_len < stride {
+                    miss += 1;
+                    end += 1;
+                    if end > all_tokens.len() {
+                        break;
+                    }
+                } else if reencoded_len > stride {
+                    // NOTE: non-unit stepping
+                    begin = end;
+                    end += stride - 2;
+                    break;
+                } else {
+                    begin = end;
+                    end += stride - 2;
+                    cnt += 1;
+                    ret.push_str(&result);
+                    break;
+                }
+            }
+        }
+        (ret, cnt)
+    }
+
+    /// 这个测试测量 encode/decode 随 token 数 n 增加的时延。
+    ///
+    /// 输出格式：
+    /// ```
+    /// n=16, time=1.23ms
+    /// n=32, time=2.12ms
+    /// ...
+    /// ```
+    #[test]
+    fn test_gen_string_latency_scaling() {
+        // 加载 tokenizer
+        let tokenizer_path = "data/tokenizer.json"; // 你自己的路径
+        let tokenizer = Tokenizer::from_file(tokenizer_path).expect("Failed to load tokenizer");
+
+        // tokenizer_config.json 路径
+        let tokenizer_config_path = "data/tokenizer_config.json".to_string();
+
+        // 测试 token 数范围
+        let test_sizes: Vec<usize> = (16..=1024).step_by(32).collect();
+
+        println!("==== TokenSampler decode latency test ====");
+        println!("{:<8} | {:<12}", "n", "time (ms)");
+        println!("--------------------------------");
+
+        let mut total_cnt = 0;
+        let mut total_elapsed = 0.;
+        let stride = 16;
+        for &n in &test_sizes {
+            let start = Instant::now();
+            for _ in 0..5 {
+                // let _ = generate_block(&tokenizer, n);
+                let (result, cnt) = validate_block_generation(&tokenizer, 2048, stride);
+                let elapsed = start.elapsed();
+                let elapsed_ms = (elapsed.as_secs_f64() * 1000.0 * 100.0).round() / 100.0; // 保留两位小数
+                let reencoded_len = tokenizer
+                    .encode(result.clone(), false)
+                    .unwrap()
+                    .get_ids()
+                    .len();
+                let s = if reencoded_len == cnt * 16 {
+                    "OK"
+                } else {
+                    println!("encode len: {reencoded_len} | expected: {}", cnt * 16);
+                    "Err"
+                };
+                println!("{s}:> {:<8} | {:<12.2}", cnt, elapsed_ms);
+                total_cnt += cnt;
+                total_elapsed += elapsed_ms;
+            }
+        }
+        println!("--------------------------------");
+        println!("Speed: {:<4}ms/block | block size: {stride}", total_elapsed / total_cnt as f64);
     }
 }
