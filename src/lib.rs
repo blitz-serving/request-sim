@@ -3,11 +3,12 @@ pub mod distribution;
 pub mod apis;
 pub mod requester;
 pub mod token_sampler;
-pub mod metrics;
 
 use core::hint::spin_loop;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::yield_now;
+
+use tracing::{instrument, Level};
 
 /// Light weighted spinlock, for extremely short critical section
 /// do not abuse it
@@ -99,6 +100,7 @@ impl SpinRwLock {
     }
 
     /// Get read lock, while writer is priorized
+    #[instrument(skip_all, level = Level::DEBUG, target = "spin_rwlck::read")]
     pub fn read_lock(&self) {
         let mut spins = 0u32;
         loop {
@@ -135,6 +137,7 @@ impl SpinRwLock {
     }
 
     /// Get write lock, while writer is priorized
+    #[instrument(skip_all, level = Level::DEBUG, target = "spin_rwlck::write")]
     pub fn write_lock(&self) {
         let mut spins = 0u32;
         // mark self as waiter

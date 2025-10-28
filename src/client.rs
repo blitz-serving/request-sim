@@ -243,13 +243,15 @@ fn main() -> Result<(), i32> {
             !meta.name().contains("inflate")
         }))
         .with_filter(LevelFilter::INFO);
-    if args.tracing_path.is_some() {
+    if args.tracing_path.is_some() && args.api.to_lowercase().as_str() == "release-with-debug" {
         let file = std::fs::File::create(args.tracing_path.as_ref().unwrap()).unwrap();
         let file_layer = fmt::layer()
             .with_writer(file)
             .with_ansi(false)
-            .with_span_events(FmtSpan::CLOSE)
-            .with_filter(filter_fn(|meta| meta.name().contains("inflate")));
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+            .with_thread_ids(true)
+            .with_filter(filter_fn(|meta| meta.target().starts_with("inflate") || meta.target().starts_with("spin_rwlck")))
+            .with_filter(LevelFilter::DEBUG);
         Registry::default()
             .with(console_layer)
             .with(file_layer)

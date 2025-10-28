@@ -19,7 +19,7 @@ use tokio::{
 };
 
 use crate::{
-    apis::LLMApi, dataset::LLMTrace, distribution::Distribution, metrics,
+    apis::LLMApi, dataset::LLMTrace, distribution::Distribution,
     token_sampler::TokenSampler,
 };
 
@@ -122,7 +122,7 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
             // TODO: add new span
-            let (prompt, input_length, output_length, _) =
+            let (prompt, input_length, output_length) =
                 dataset.inflate(data_index, token_sampler.as_ref());
 
             // parse in another coroutine
@@ -217,7 +217,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             }
 
             // Do not parse in another coroutine to avoid sync/async lock contention 
-            let (prompt, input_length, output_length, _) =
+            let (prompt, input_length, output_length) =
                 dataset.inflate(data_index, token_sampler.as_ref());
             
             let request_handle = spawn(async move {
@@ -294,6 +294,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     });
 
     let mut gen_rx = broadcast_tx.subscribe();
+    let validate_tokenizer = Arc::new(token_sampler.get_tokenizer());
 
     spawn(async move {
         let data_iter = dataset.iter();
@@ -301,7 +302,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
             if gen_rx.try_recv().is_ok() {
                 break;
             }
-
+            let tokenizer = validate_tokenizer.clone();
             let response_sender = response_sender.clone();
 
             let curr_timestamp = get_timestamp();
@@ -312,14 +313,22 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
 
-            let (_, input_length, output_length, _) =
+            let (sample, input_length, output_length) =
                 dataset.inflate(data_index, token_sampler.as_ref());
 
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
                 let s_time_drift = s_time.saturating_sub(next_timestamp);
 
-                // 构造 metrics 结构，但不发 HTTP
+                let validate_len = tokenizer
+                    .encode(sample.clone(), false)
+                    .unwrap()
+                    .get_ids()
+                    .len();
+                if validate_len != input_length as usize {
+                    tracing::error!("Validation error: {input_length} :> {validate_len}");
+                }
+                
                 let mut metrics = BTreeMap::new();
                 metrics.insert("chat_id".to_string(), data_index.to_string());
                 metrics.insert("input_length".to_string(), input_length.to_string());
@@ -396,7 +405,7 @@ mod tests {
         let iter = dataset.iter();
         for index in iter.take(10) { // 只测前10条
             let start = std::time::Instant::now();
-            let (_prompt, input_len, output_len, _) = dataset.inflate(index, &token_sampler);
+            let (_prompt, input_len, output_len) = dataset.inflate(index, &token_sampler);
             let elapsed_us = start.elapsed().as_micros() as u64;
 
             let mut metrics = std::collections::BTreeMap::new();
