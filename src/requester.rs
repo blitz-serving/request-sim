@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reqwest::Response;
+use reqwest::{ClientBuilder, Response};
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
@@ -58,17 +58,15 @@ async fn request(endpoint: &str, json_body: String) -> Result<Response, reqwest:
         .await?)
 }
 
-#[allow(dead_code)]
-async fn request_with_timeout(
+async fn post_with_timeout(
+    client: reqwest::Client,
     endpoint: &str,
     json_body: String,
     timeout: Duration,
 ) -> Result<Response, reqwest::Error> {
-    Ok(reqwest::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
-        .build()?
+    Ok(client
         .post(endpoint)
+        .timeout(timeout)
         .body(json_body)
         .header("Content-Type", "application/json")
         .send()
@@ -112,11 +110,18 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     spawn(async move {
         let mut timestamp = get_timestamp();
         let data_iter = dataset.iter();
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(32)
+            .no_proxy()
+            .timeout(Duration::from_secs(15)) // default timeout, can be overrided
+            .build()
+            .unwrap();
         for data_index in data_iter {
             if stopped.try_recv().is_ok() {
                 break;
             }
             // data to move into closure
+            let client = http_client.clone();
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
             // TODO: add new span
@@ -127,7 +132,8 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
-                match request_with_timeout(
+                match post_with_timeout(
+                    client,
                     endpoint.as_str(),
                     json_body.to_string(),
                     Duration::from_secs(timeout_secs_upon_slo(output_length)),
@@ -213,11 +219,19 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
 
     spawn(async move {
         let data_iter = dataset.iter();
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .no_proxy()
+            .timeout(Duration::from_secs(15)) // default timeout, can be overrided
+            .build()
+            .unwrap();
         let endpoint = Arc::new(endpoint);
         for data_index in data_iter {
             if gen_rx.try_recv().is_ok() {
                 break;
             }
+            let client = http_client.clone();
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
 
@@ -235,7 +249,9 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
-                match request_with_timeout(
+                let s_time_drift = s_time.saturating_sub(next_timestamp);
+                match post_with_timeout(
+                    client,
                     endpoint.as_str(),
                     json_body.to_string(),
                     Duration::from_secs(timeout_secs_upon_slo(output_length)),
@@ -247,6 +263,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
 
                         let mut metrics = A::parse_response(response);
                         metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("s_time_drift".to_string(), s_time_drift.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
                         metrics.insert("input_length".to_string(), input_length.to_string());
                         metrics.insert("output_length".to_string(), output_length.to_string());
@@ -261,6 +278,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             "timeout".to_owned(),
                         )]);
                         metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("s_time_drift".to_string(), s_time_drift.to_string());
                         metrics.insert("e_time".to_string(), e_time.to_string());
                         metrics.insert("input_length".to_string(), input_length.to_string());
                         metrics.insert("output_length".to_string(), output_length.to_string());
