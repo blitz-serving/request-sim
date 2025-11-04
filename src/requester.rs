@@ -19,7 +19,7 @@ use tokio::{
 };
 
 use crate::{
-    apis::LLMApi, dataset::LLMTrace, distribution::Distribution,
+    apis::LLMApi, dataset::LLMTrace, distribution::Distribution, timeout_secs_upon_slo,
     token_sampler::TokenSampler,
 };
 
@@ -29,9 +29,7 @@ pub struct IntervalGenerator {
 
 impl IntervalGenerator {
     pub fn new<D: Distribution + 'static>(distribution: D) -> Self {
-        Self {
-            distribution: Box::new(distribution),
-        }
+        Self { distribution: Box::new(distribution) }
     }
 
     pub fn interval_in_millis(&self) -> f64 {
@@ -129,29 +127,43 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
-                if let Ok(response) = request_with_timeout(
+                match request_with_timeout(
                     endpoint.as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
+                    Duration::from_secs(timeout_secs_upon_slo(output_length)),
                 )
                 .await
                 {
-                    let e_time = get_timestamp();
+                    Ok(response) => {
+                        let e_time = get_timestamp();
 
-                    let mut metrics = A::parse_response(response);
-                    metrics.insert("s_time".to_string(), s_time.to_string());
-                    metrics.insert("e_time".to_string(), e_time.to_string());
-                    metrics.insert("input_length".to_string(), input_length.to_string());
-                    metrics.insert("output_length".to_string(), output_length.to_string());
+                        let mut metrics = A::parse_response(response);
+                        metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("e_time".to_string(), e_time.to_string());
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
 
-                    response_sender.send(metrics).unwrap();
-                } else {
-                    tracing::error!(
-                        "Request {} timeout with input {} output {}",
-                        data_index,
-                        input_length,
-                        output_length
-                    );
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(error) if error.is_timeout() => {
+                        let e_time = get_timestamp();
+
+                        let mut metrics = BTreeMap::<String, String>::from([(
+                            "status".to_owned(),
+                            "timeout".to_owned(),
+                        )]);
+                        metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("e_time".to_string(), e_time.to_string());
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) error: {error}",
+                        );
+                    }
                 }
             });
 
@@ -216,38 +228,50 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
 
-            // Do not parse in another coroutine to avoid sync/async lock contention 
+            // Do not parse in another coroutine to avoid sync/async lock contention
             let (prompt, input_length, output_length) =
                 dataset.inflate(data_index, token_sampler.as_ref());
-            
+
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, output_length);
                 let s_time = get_timestamp();
-                if let Ok(response) = request_with_timeout(
+                match request_with_timeout(
                     endpoint.as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
+                    Duration::from_secs(timeout_secs_upon_slo(output_length)),
                 )
                 .await
                 {
-                    let e_time = get_timestamp();
+                    Ok(response) => {
+                        let e_time = get_timestamp();
 
-                    let mut metrics = A::parse_response(response);
-                    metrics.insert("s_time".to_string(), s_time.to_string());
-                    metrics.insert("e_time".to_string(), e_time.to_string());
-                    metrics.insert("input_length".to_string(), input_length.to_string());
-                    metrics.insert("output_length".to_string(), output_length.to_string());
-                    metrics.insert("client_id".to_string(), data_index.to_string());
+                        let mut metrics = A::parse_response(response);
+                        metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("e_time".to_string(), e_time.to_string());
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
 
-                    response_sender.send(metrics).unwrap();
-                } else {
-                    RETURNCODE.store(-1, Ordering::Release);
-                    tracing::error!(
-                        "Request {} failed with input {} output {}",
-                        data_index,
-                        input_length,
-                        output_length
-                    );
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(error) if error.is_timeout() => {
+                        let e_time = get_timestamp();
+
+                        let mut metrics = BTreeMap::<String, String>::from([(
+                            "status".to_owned(),
+                            "timeout".to_owned(),
+                        )]);
+                        metrics.insert("s_time".to_string(), s_time.to_string());
+                        metrics.insert("e_time".to_string(), e_time.to_string());
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) error: {error}",
+                        );
+                    }
                 }
             });
 
@@ -256,7 +280,6 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     });
     handle
 }
-
 
 pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     _endpoint: String, // 保留参数，为了接口一致
@@ -320,15 +343,11 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
                 let s_time = get_timestamp();
                 let s_time_drift = s_time.saturating_sub(next_timestamp);
 
-                let validate_len = tokenizer
-                    .encode(sample.clone(), false)
-                    .unwrap()
-                    .get_ids()
-                    .len();
+                let validate_len = tokenizer.encode(sample.clone(), false).unwrap().get_ids().len();
                 if validate_len != input_length as usize {
                     tracing::error!("Validation error: {input_length} :> {validate_len}");
                 }
-                
+
                 let mut metrics = BTreeMap::new();
                 metrics.insert("chat_id".to_string(), data_index.to_string());
                 metrics.insert("input_length".to_string(), input_length.to_string());
@@ -369,8 +388,8 @@ mod tests {
         dataset::{BailianDataset, LLMTrace},
         token_sampler::TokenSampler,
     };
-    use tokenizers::Tokenizer;
     use std::sync::Arc;
+    use tokenizers::Tokenizer;
     use tokio::fs::File;
 
     #[tokio::test]
@@ -389,11 +408,12 @@ mod tests {
 
         // ====== 准备 TokenSampler ======
         let token_sampler = Arc::new(TokenSampler::new(
-            Tokenizer::from_file("/Users/zdy/Workspace/Rust/request-sim/data/tokenizer.json").unwrap(),
+            Tokenizer::from_file("/Users/zdy/Workspace/Rust/request-sim/data/tokenizer.json")
+                .unwrap(),
             "/Users/zdy/Workspace/Rust/request-sim/data/tokenizer_config.json".to_string(),
-            4,     // num_producer
-            128,   // capacity
-            16,    // block size
+            4,   // num_producer
+            128, // capacity
+            16,  // block size
         ));
 
         // ====== 准备输出通道 ======
@@ -403,7 +423,8 @@ mod tests {
 
         // ====== 测试循环 ======
         let iter = dataset.iter();
-        for index in iter.take(10) { // 只测前10条
+        for index in iter.take(10) {
+            // 只测前10条
             let start = std::time::Instant::now();
             let (_prompt, input_len, output_len) = dataset.inflate(index, &token_sampler);
             let elapsed_us = start.elapsed().as_micros() as u64;

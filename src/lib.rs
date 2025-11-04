@@ -10,6 +10,13 @@ use std::thread::yield_now;
 
 use tracing::{instrument, Level};
 
+pub const TTFT: f32 = 5.;   // 5s
+pub const TPOT: f32 = 0.06; // 60ms
+
+pub fn timeout_secs_upon_slo(output_length: u64) -> u64 {
+    15.max((TTFT + TPOT * output_length as f32) as u64)
+}
+
 /// Light weighted spinlock, for extremely short critical section
 /// do not abuse it
 pub struct SpinLock {
