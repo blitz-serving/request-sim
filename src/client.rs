@@ -1,4 +1,5 @@
-use std::{pin::Pin, sync::Arc};
+use std::pin::Pin;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
 use clap::Parser;
 use request_sim::{
@@ -8,7 +9,7 @@ use request_sim::{
     token_sampler::TokenSampler,
 };
 use tokenizers::Tokenizer;
-use tokio::{spawn, sync::broadcast};
+use tokio::spawn;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::{self, format::FmtSpan};
@@ -177,7 +178,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
     };
 
     let (tx, rx) = flume::unbounded();
-    let (broadcast_tx, _rx) = broadcast::channel(1);
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
 
     // TODO: check `spawn_request_loop_with_timestamp` API
     let requester_handle = match api.to_lowercase().as_str() {
@@ -197,7 +198,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,
-                broadcast_tx.clone(),
+                interrupt_flag.clone(),
             )
         }
         "release-with-debug" => {
@@ -216,7 +217,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,
-                broadcast_tx.clone(),
+                interrupt_flag.clone(),
             )
         }
         _ => unimplemented!("Unsupported protocol type"),
@@ -225,11 +226,11 @@ async fn async_main(args: Args) -> Result<(), i32> {
 
     // start test!
     tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
-    broadcast_tx.send(()).unwrap(); // terminate test
+    interrupt_flag.store(true, Ordering::SeqCst); // terminate test
 
-    let returnval = requester_handle.await.unwrap();
+    let ret_val = requester_handle.await.unwrap();
     reporter_handle.await.unwrap();
-    return returnval;
+    return ret_val;
 }
 
 fn main() -> Result<(), i32> {

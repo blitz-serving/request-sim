@@ -2,18 +2,17 @@ use std::{
     collections::BTreeMap,
     pin::Pin,
     sync::{
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
 
-use reqwest::{ClientBuilder, Response};
+use reqwest::Response;
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
     spawn,
-    sync::{broadcast, oneshot},
     task::{yield_now, JoinHandle},
     time::sleep,
 };
@@ -73,9 +72,12 @@ async fn post_with_timeout(
         .await?)
 }
 
-async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
-    while let Ok(handle) = response_receiver.recv_async().await {
+async fn wait_all(handle_rx: flume::Receiver<JoinHandle<()>>, interrupt_flag: Arc<AtomicBool>) {
+    while let Ok(handle) = handle_rx.recv_async().await {
         handle.await.unwrap();
+        if interrupt_flag.load(Ordering::Relaxed) {
+            tracing::info!("{} requests has not yet finished!", handle_rx.len());
+        }
     }
 }
 
@@ -92,7 +94,7 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     token_sampler: Arc<TokenSampler>,
     interval_generator: IntervalGenerator,
     response_sender: flume::Sender<BTreeMap<String, String>>,
-    mut stopped: oneshot::Receiver<()>,
+    interrupt_flag: Arc<AtomicBool>,
 ) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     BASETIME.get_or_init(|| Instant::now());
@@ -102,8 +104,9 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
     }
 
     let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
     let handle = spawn(async move {
-        wait_all(rx).await;
+        wait_all(rx, flag).await;
         Ok(())
     });
 
@@ -117,7 +120,7 @@ pub fn spawn_request_loop<A: 'static + LLMApi + Send>(
             .build()
             .unwrap();
         for data_index in data_iter {
-            if stopped.try_recv().is_ok() {
+            if interrupt_flag.load(Ordering::Relaxed) {
                 break;
             }
             // data to move into closure
@@ -192,7 +195,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     token_sampler: Arc<TokenSampler>,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
-    broadcast_tx: broadcast::Sender<()>,
+    interrupt_flag: Arc<AtomicBool>,
 ) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     static RETURNCODE: AtomicI32 = AtomicI32::new(0);
@@ -206,8 +209,9 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     println!("Scaled request rate: {:.3} req/s", rr * scale_factor);
 
     let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
     let handle = spawn(async move {
-        wait_all(rx).await;
+        wait_all(rx, flag).await;
         let a = RETURNCODE.load(Ordering::Relaxed);
         if a == 0 {
             Ok(())
@@ -215,7 +219,6 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             Err(a)
         }
     });
-    let mut gen_rx = broadcast_tx.subscribe();
 
     spawn(async move {
         let data_iter = dataset.iter();
@@ -228,7 +231,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             .unwrap();
         let endpoint = Arc::new(endpoint);
         for data_index in data_iter {
-            if gen_rx.try_recv().is_ok() {
+            if interrupt_flag.load(Ordering::Relaxed) {
                 break;
             }
             let client = http_client.clone();
@@ -295,6 +298,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
 
             tx.send_async(request_handle).await.unwrap();
         }
+        tracing::info!("Requester exited.");
     });
     handle
 }
@@ -305,7 +309,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     token_sampler: Arc<TokenSampler>,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
-    broadcast_tx: broadcast::Sender<()>,
+    interrupt_flag: Arc<AtomicBool>,
 ) -> JoinHandle<Result<(), i32>> {
     use std::time::Instant;
     static BASETIME: OnceLock<Instant> = OnceLock::new();
@@ -324,8 +328,9 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     );
 
     let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
     let handle = spawn(async move {
-        wait_all(rx).await;
+        wait_all(rx, flag).await;
         let a = RETURNCODE.load(Ordering::Relaxed);
         if a == 0 {
             Ok(())
@@ -334,13 +339,12 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
         }
     });
 
-    let mut gen_rx = broadcast_tx.subscribe();
     let validate_tokenizer = Arc::new(token_sampler.get_tokenizer());
 
     spawn(async move {
         let data_iter = dataset.iter();
         for data_index in data_iter {
-            if gen_rx.try_recv().is_ok() {
+            if interrupt_flag.load(Ordering::Relaxed) {
                 break;
             }
             let tokenizer = validate_tokenizer.clone();
@@ -378,6 +382,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
 
             tx.send_async(request_handle).await.unwrap();
         }
+        tracing::info!("Requester exited.");
     });
 
     handle
