@@ -1,4 +1,5 @@
 pub mod apis;
+pub mod cache;
 pub mod dataset;
 pub mod requester;
 pub mod token_sampler;
