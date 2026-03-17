@@ -1,24 +1,40 @@
+use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use clap::Parser;
+use request_sim::apis::{OpenAIApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
 use request_sim::{
-    dataset::{parse_dataset_type, Dataset, DatasetType},
-    protocols::{DistserveProtocol, MockProtocol, StProtocol, VllmProtocol},
-    requester::{
-        create_gamma_interval_generator, report_loop, spawn_request_loop,
-        spawn_request_loop_with_timestamp,
-    },
-    scale_event::ScaleEvent,
+    apis::{TGIApi, MODEL_NAME},
+    dataset::{BailianDataset, LLMTrace, MooncakeDataset},
+    requester::{report_loop, spawn_request_loop_debug, spawn_request_loop_with_timestamp},
+    token_sampler::TokenSampler,
 };
 use tokenizers::Tokenizer;
-use tokio::{
-    spawn,
-    sync::{broadcast, oneshot},
-};
+use tokio::spawn;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::fmt::{self, format::FmtSpan};
+use tracing_subscriber::{prelude::*, Layer, Registry};
 
 #[derive(Parser)]
 struct Args {
     /// Path to tokenizer file.
     #[clap(long, required = true)]
     tokenizer: String,
+
+    #[clap(long, required = true)]
+    tokenizer_config: String,
+
+    /// Number of producer threads in TokenSampler.
+    #[clap(long)]
+    num_producer: Option<usize>,
+
+    /// Capacity of the channel between producers and consumers in TokenSampler.
+    #[clap(long)]
+    channel_capacity: Option<usize>,
 
     /// Worker threads to use for tokio runime. Default is set to the number of cores.
     #[clap(long)]
@@ -29,42 +45,21 @@ struct Args {
     #[clap(long, required = true)]
     endpoint: String,
 
-    #[clap(long)]
-    endpoints: Option<Vec<String>>,
+    /// LLM API server type. Either "tgi" (text-generation-inference), or "distserve"
+    #[clap(long, short, required = true)]
+    api: String,
 
-    /// Protocol type. Either "st", "vllm", "distserve" or "mock".
-    #[clap(long, short, required = true, value_parser = parse_protocol)]
-    protocol: Protocol,
-
-    /// Dataset type. Either "mooncake", "burstgpt", "mooncake_sampled", "azure", "uniform($input,$output)" or "mock".
+    /// Dataset type. Either "bailian", "mooncake", "azure", "uniform($input,$output)".
     ///
     /// The uniform dataset requires input and output length arguments and its default request rate is 1.0 rps.
     ///
     /// To adjust the request rate, use the `request_rate` argument for non-replay mode and the `scale_factor` argument for replay mode instead.
-    #[clap(long, short, required = true, value_parser = parse_dataset_type)]
-    dataset_type: DatasetType,
+    #[clap(long, short, required = true)]
+    dataset: String,
 
     /// Path to dataset file. This argument is required only when dataset_type is not "mock" or "uniform".
-    #[clap(long)]
+    #[clap(long, required = true)]
     dataset_path: Option<String>,
-
-    /// Path to second dataset. The second dataset file will be accessed only when dataset_type is "mooncake_sampled".
-    #[clap(long)]
-    second_dataset_path: Option<String>,
-
-    /// If the replay_mode is enabled, the client will send requests following
-    /// the sequence and input/output length of provided dataset above.
-    ///
-    /// Note that if the replay_mode is enabled, the cv will be ignored and the requests will not be shuffled.
-    #[clap(long, default_value_t = false)]
-    replay_mode: bool,
-
-    #[clap(long)]
-    scale_replay_path: Option<String>,
-
-    /// Request rate (request per second). It only takes effect when `replay_mode` is disabled.
-    #[clap(long)]
-    request_rate: Option<f64>,
 
     /// Scale factor for the request rate. It only takes effect when `replay_mode` is enabled.
     ///
@@ -72,65 +67,88 @@ struct Args {
     #[clap(long)]
     scale_factor: Option<f64>,
 
-    /// Coefficient of variation of the request rate. It takes effect only when `replay_mode` is disabled.
-    #[clap(long, default_value_t = 0.5)]
-    cv: f64,
-
     /// Output path.
     #[clap(long, short, default_value = "./log/output.jsonl")]
     output_path: String,
+
+    /// Summary output path (JSON).
+    #[clap(long)]
+    summary_path: Option<String>,
+
+    /// Tracing path. Only used by tracing
+    #[clap(long)]
+    tracing_path: Option<String>,
 
     /// Requester run time.
     #[clap(long, short, default_value_t = 60)]
     time_in_secs: u64,
 
-    /// If prefill_only is enabled, the output length will be set to the 1.
-    #[clap(long, default_value_t = false)]
-    prefill_only: bool,
-
-    /// Truncate the request if the sum of input and output token length is greater than the specified value.
+    /// Used for OpenAI API
     #[clap(long)]
-    truncate: Option<u64>,
-}
+    model_name: Option<String>,
 
-fn parse_protocol(s: &str) -> Result<Protocol, String> {
-    match s.to_lowercase().as_ref() {
-        "st" => Ok(Protocol::St),
-        "vllm" => Ok(Protocol::Vllm),
-        "distserve" => Ok(Protocol::Distserve),
-        "mock" => Ok(Protocol::Mock),
-        _ => Err("Invalid protocol type".to_string()),
-    }
-}
+    /// Used for AIBrix routing strategy
+    #[clap(long)]
+    aibrix_route: Option<String>,
 
-#[derive(Debug, Clone, Copy)]
-enum Protocol {
-    St,
-    Vllm,
-    Distserve,
-    Mock,
+    /// TTFT SLO in seconds
+    #[clap(long, default_value_t = 5.0)]
+    ttft_slo: f32,
+
+    /// TPOT SLO in seconds
+    #[clap(long, default_value_t = 0.06)]
+    tpot_slo: f32,
+
+    /// Enable streaming mode for API requests
+    #[clap(long, default_value_t = false)]
+    stream: bool,
+
+    /// Percentiles (comma-separated) to report for latency metrics, e.g. "90,95,99"
+    #[clap(long, value_delimiter = ',', default_value = "90,95,99")]
+    metric_percentile: Vec<u32>,
+
+    #[clap[long]]
+    early_stop_error_threshold: Option<u32>,
 }
 
 async fn async_main(args: Args) -> Result<(), i32> {
     let Args {
         tokenizer,
+        tokenizer_config,
+        num_producer,
+        channel_capacity,
         threads: _,
         endpoint,
-        endpoints,
-        protocol,
-        dataset_type,
+        api,
+        dataset,
         dataset_path,
-        second_dataset_path,
-        replay_mode,
-        scale_replay_path,
-        request_rate,
         scale_factor,
-        cv,
         output_path,
+        summary_path,
+        tracing_path: _,
         time_in_secs,
-        prefill_only,
-        truncate,
+        model_name,
+        aibrix_route,
+        ttft_slo,
+        tpot_slo,
+        stream,
+        metric_percentile,
+        early_stop_error_threshold,
     } = args;
+
+    let mut metric_percentile = metric_percentile;
+    if metric_percentile.is_empty() {
+        metric_percentile = vec![90, 95, 99];
+    }
+    metric_percentile.sort_unstable();
+    metric_percentile.dedup();
+    for percentile in &metric_percentile {
+        assert!(
+            (1..=100).contains(percentile),
+            "Invalid metric percentile: {percentile}"
+        );
+    }
+    METRIC_PERCENTILES.get_or_init(|| metric_percentile);
 
     let output_file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -139,95 +157,208 @@ async fn async_main(args: Args) -> Result<(), i32> {
         .open(&output_path)
         .await
         .unwrap();
+    let summary_path = summary_path.unwrap_or_else(|| format!("{output_path}.summary.json"));
+    let summary_file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&summary_path)
+        .await
+        .unwrap();
 
-    let (response_tx, response_rx) = flume::unbounded();
-    let dataset = match dataset_type {
-        DatasetType::ProcessedCsv => {
-            Dataset::load_processed_csv(&dataset_path.unwrap(), !replay_mode)
+    let block_size;
+
+    let dataset: Pin<Box<dyn LLMTrace>> = match dataset.to_lowercase().as_str() {
+        "mooncake" => {
+            let mut dataset: Pin<Box<MooncakeDataset>> = Box::pin(MooncakeDataset::new());
+            block_size = 512;
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided in replay mode!")
+                    .as_str(),
+            );
+            dataset
         }
-        DatasetType::Mooncake => Dataset::load_mooncake_jsonl(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::Burstgpt => Dataset::load_burstgpt_csv(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::Azure => Dataset::load_azure_csv(&dataset_path.unwrap(), !replay_mode),
-        DatasetType::MooncakeSampled => Dataset::load_mooncake_ts_burst_data(
-            &dataset_path.unwrap(),
-            &second_dataset_path.unwrap(),
-            !replay_mode,
-        ),
-        DatasetType::Mock => Dataset::load_mock_dataset(),
-        DatasetType::Uniform { input, output } => Dataset::load_uniform_dataset(input, output),
-        DatasetType::CherryPickBurstgpt { start_ts, end_ts } => {
-            Dataset::cherry_pick_burstgpt(&dataset_path.unwrap(), !replay_mode, start_ts, end_ts)
+        "bailian" => {
+            let mut dataset = Box::pin(BailianDataset::new());
+            block_size = 16;
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided in replay mode!")
+                    .as_str(),
+            );
+            dataset
         }
-    };
-    let scale_events = if scale_replay_path.is_some() {
-        assert_eq!(replay_mode, true);
-        let mut scale_event = ScaleEvent::new();
-        scale_event.parse_event_csv(&scale_replay_path.unwrap());
-        Some(scale_event)
-    } else {
-        None
-    };
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let (broad_tx, _rx) = broadcast::channel(1);
-
-    let protocol: Box<dyn request_sim::protocols::Protocol + Send> = match protocol {
-        Protocol::St => Box::new(StProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
-        Protocol::Vllm => Box::new(VllmProtocol::new(Tokenizer::from_file(tokenizer).unwrap())),
-        Protocol::Distserve => Box::new(DistserveProtocol::new(
-            Tokenizer::from_file(tokenizer).unwrap(),
-        )),
-        Protocol::Mock => Box::new(MockProtocol),
+        _ => panic!("Invalid dataset type"),
     };
 
-    tracing::info!("Client start");
-    let requester_handle = if replay_mode {
-        spawn_request_loop_with_timestamp(
-            endpoint,
-            endpoints,
-            dataset,
-            prefill_only,
-            truncate,
-            protocol,
-            scale_factor.unwrap(),
-            response_tx,
-            scale_events,
-            broad_tx.clone(),
-        )
-    } else {
-        spawn_request_loop(
-            endpoint,
-            endpoints,
-            dataset,
-            prefill_only,
-            truncate,
-            protocol,
-            create_gamma_interval_generator(request_rate.unwrap(), cv),
-            response_tx,
-            stop_rx,
-        )
+    let (tx, rx) = flume::unbounded();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+
+    let requester_handle = match api.to_lowercase().as_str() {
+        "tgi" => {
+            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
+            let token_sampler = Arc::new(TokenSampler::new(
+                Tokenizer::from_file(tokenizer).unwrap(),
+                tokenizer_config,
+                num_producer.unwrap_or(1),
+                channel_capacity.unwrap_or(128),
+                block_size,
+            ));
+            tracing::info!("Client start");
+            spawn_request_loop_with_timestamp::<TGIApi>(
+                endpoint,
+                dataset,
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            )
+        }
+        "release-with-debug" => {
+            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
+            let token_sampler = Arc::new(TokenSampler::new(
+                Tokenizer::from_file(tokenizer).unwrap(),
+                tokenizer_config,
+                num_producer.unwrap_or(1),
+                channel_capacity.unwrap_or(128),
+                block_size,
+            ));
+            tracing::info!("Client start");
+            spawn_request_loop_debug::<TGIApi>(
+                endpoint,
+                dataset,
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+            )
+        }
+        "openai" => {
+            MODEL_NAME.get_or_init(|| model_name.unwrap());
+            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
+            let token_sampler = Arc::new(TokenSampler::new(
+                Tokenizer::from_file(tokenizer).unwrap(),
+                tokenizer_config,
+                num_producer.unwrap_or(1),
+                channel_capacity.unwrap_or(128),
+                block_size,
+            ));
+            tracing::info!("Client start");
+            spawn_request_loop_with_timestamp::<OpenAIApi>(
+                endpoint,
+                dataset,
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            )
+        }
+        "aibrix" => {
+            MODEL_NAME.get_or_init(|| model_name.unwrap());
+            AIBRIX_ROUTE_STRATEGY.get_or_init(|| {
+                let valid_route_strategies = ["prefix-cache", "prefix-cache-preble", "throughput"];
+                let route_strategy = aibrix_route.unwrap();
+                assert!(
+                    valid_route_strategies.contains(&route_strategy.as_str()),
+                    "Unsupported AIBrix routing strategy: {}",
+                    route_strategy.as_str()
+                );
+                route_strategy
+            });
+            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
+            let token_sampler = Arc::new(TokenSampler::new(
+                Tokenizer::from_file(tokenizer).unwrap(),
+                tokenizer_config,
+                num_producer.unwrap_or(1),
+                channel_capacity.unwrap_or(128),
+                block_size,
+            ));
+            tracing::info!("Client start");
+            spawn_request_loop_with_timestamp::<OpenAIApi>(
+                endpoint,
+                dataset,
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            )
+        }
+        _ => unimplemented!("Unsupported protocol type"),
     };
+    let reporter_handle = spawn(report_loop(output_file, summary_file, rx));
 
-    let reporter_handle = spawn(report_loop(output_file, response_rx));
+    // start test!
+    tokio::select! {
+        // case 1: time up
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)) => {
+            tracing::info!("Test finished by timeout");
+            interrupt_flag.store(true, Ordering::SeqCst);
+        }
 
-    tokio::time::sleep(tokio::time::Duration::from_secs(time_in_secs)).await;
-    stop_tx.send(()).unwrap();
-    broad_tx.send(()).unwrap();
+        // case 2: interrupt from inner
+        _ = async {
+            // Not the optimal implementation, could be optimized using channel or notify_rx
+            // But for simplicity, we use routinely sleep and wake up
+            while !interrupt_flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        } => {
+            tracing::error!("Test early stop by interrupt_flag");
+        }
+    }
 
-    let returnval = requester_handle.await.unwrap();
+    let ret_val = requester_handle.await.unwrap();
     reporter_handle.await.unwrap();
-    return returnval;
+    return ret_val;
 }
 
 fn main() -> Result<(), i32> {
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     let args = Args::parse();
+    let console_layer = fmt::layer()
+        .compact()
+        .with_target(false)
+        .with_filter(filter_fn(|meta| {
+            // meta.target() 是模块路径
+            // meta.name() 是 span 名称
+            !meta.name().contains("inflate")
+        }))
+        .with_filter(LevelFilter::INFO);
+    if args.tracing_path.is_some() && args.api.to_lowercase().as_str() == "release-with-debug" {
+        let file = std::fs::File::create(args.tracing_path.as_ref().unwrap()).unwrap();
+        let file_layer = fmt::layer()
+            .with_writer(file)
+            .with_ansi(false)
+            .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+            .with_thread_ids(true)
+            .with_filter(filter_fn(|meta| {
+                meta.target().starts_with("inflate") || meta.target().starts_with("spin_rwlck")
+            }))
+            .with_filter(LevelFilter::DEBUG);
+        Registry::default()
+            .with(console_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        Registry::default().with(console_layer).init();
+    }
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     match args.threads {
         Some(threads) => builder.worker_threads(threads),
-        None => &mut builder,
+        None => builder.worker_threads(55),
     }
     .enable_all()
     .build()

@@ -1,49 +1,30 @@
 use std::{
     collections::BTreeMap,
+    pin::Pin,
     sync::{
-        atomic::{AtomicI32, Ordering},
-        OnceLock,
+        atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
+        Arc, OnceLock,
     },
     time::{Duration, Instant},
 };
 
+use futures_util::stream::Count;
 use reqwest::Response;
 use tokio::{
     fs::File,
     io::{AsyncWriteExt, BufWriter},
     spawn,
-    sync::{broadcast, oneshot},
-    task::{yield_now, JoinHandle},
+    task::JoinHandle,
     time::sleep,
 };
-use tracing::instrument;
 
-use crate::{dataset::Dataset, distribution::Distribution, scale_event::ScaleEvent};
-
-pub struct IntervalGenerator {
-    distribution: Box<dyn Distribution>,
-}
-
-impl IntervalGenerator {
-    pub fn new<D: Distribution + 'static>(distribution: D) -> Self {
-        Self {
-            distribution: Box::new(distribution),
-        }
-    }
-
-    pub fn interval_in_millis(&self) -> f64 {
-        self.distribution.generate()
-    }
-}
-
-/// Create a new interval generator with a gamma distribution.
-///
-/// `request_rate`: how many requests per second
-pub fn create_gamma_interval_generator(request_rate: f64, cv: f64) -> IntervalGenerator {
-    let mean = 1000.0 / request_rate;
-    let distribution = crate::distribution::gamma::Gamma::new(mean, cv);
-    IntervalGenerator::new(distribution)
-}
+use crate::apis::METRIC_PERCENTILES;
+use crate::{
+    apis::{LLMApi, RequestError, AIBRIX_ROUTE_STRATEGY},
+    dataset::LLMTrace,
+    timeout_secs_upon_slo,
+    token_sampler::TokenSampler,
+};
 
 #[allow(dead_code)]
 async fn request(endpoint: &str, json_body: String) -> Result<Response, reqwest::Error> {
@@ -57,150 +38,69 @@ async fn request(endpoint: &str, json_body: String) -> Result<Response, reqwest:
         .await?)
 }
 
-#[allow(dead_code)]
-async fn request_with_timeout(
+async fn post_with_timeout<A: 'static + LLMApi + Send>(
+    client: reqwest::Client,
     endpoint: &str,
     json_body: String,
     timeout: Duration,
-) -> Result<Response, reqwest::Error> {
-    Ok(reqwest::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
-        .build()?
+    stream: bool,
+) -> Result<BTreeMap<String, String>, RequestError> {
+    let mut req = client
         .post(endpoint)
         .body(json_body)
-        .header("Content-Type", "application/json")
-        .send()
-        .await?)
+        .header("Content-Type", "application/json");
+
+    if !stream {
+        req = req.timeout(timeout);
+    }
+    if A::AIBRIX_PRIVATE_HEADER {
+        req = req.header(
+            "routing-strategy",
+            AIBRIX_ROUTE_STRATEGY.get().unwrap().as_str(),
+        );
+    }
+
+    let response = req.send().await.map_err(|e| RequestError::Other(e))?;
+
+    A::parse_response(response, stream, timeout).await
 }
 
-async fn wait_all(response_receiver: flume::Receiver<JoinHandle<()>>) {
-    while let Ok(handle) = response_receiver.recv_async().await {
+async fn wait_all(handle_rx: flume::Receiver<JoinHandle<()>>, interrupt_flag: Arc<AtomicBool>) {
+    while let Ok(handle) = handle_rx.recv_async().await {
         handle.await.unwrap();
-    }
-}
-
-/// Send requests in the open loop way.
-///
-/// Note:
-/// - Intervals between requests are randomly generated.
-/// - Use [`spawn_request_loop_with_timestamp`] instead if you want to control the intervals.
-///
-/// Await on the returned handle to wait for the loop to finish.
-pub fn spawn_request_loop(
-    endpoint: String,
-    endpoints: Option<Vec<String>>,
-    dataset: Dataset,
-    prefill_only: bool,
-    truncate: Option<u64>,
-    protocol: Box<dyn crate::protocols::Protocol + Send>,
-    interval_generator: IntervalGenerator,
-    response_sender: flume::Sender<BTreeMap<String, String>>,
-    mut stopped: oneshot::Receiver<()>,
-) -> JoinHandle<Result<(), i32>> {
-    static BASETIME: OnceLock<Instant> = OnceLock::new();
-    BASETIME.get_or_init(|| Instant::now());
-
-    fn get_timestamp() -> u64 {
-        BASETIME.get().unwrap().elapsed().as_millis() as u64
-    }
-
-    let parse_response = protocol.parse_response();
-
-    let (tx, rx) = flume::unbounded();
-    let handle = spawn(async move {
-        wait_all(rx).await;
-        Ok(())
-    });
-
-    spawn(async move {
-        let mut timestamp = get_timestamp();
-        let mut count = 0u64;
-        loop {
-            count += 1;
-            if stopped.try_recv().is_ok() {
-                break;
-            }
-
-            let endpoint = match cfg!(feature = "bypass_router") {
-                false => Some(endpoint.clone()),
-                true => endpoints
-                    .as_ref()
-                    .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
-            }
-            .clone();
-            assert!(endpoint.is_some());
-            let (input_length, output_length) = dataset.next_request(prefill_only, truncate);
-            let json_body = protocol.request_json_body(input_length, output_length);
-            let response_sender = response_sender.clone();
-            let request_handle = spawn(async move {
-                let s_time = get_timestamp();
-                if let Ok(response) = request_with_timeout(
-                    endpoint.unwrap().as_str(),
-                    json_body.to_string(),
-                    Duration::from_secs(180.max((output_length as f64 * 0.4) as u64)),
-                )
-                .await
-                {
-                    let e_time = get_timestamp();
-                    let mut metrics = parse_response(response);
-                    metrics.insert("s_time".to_string(), s_time.to_string());
-                    metrics.insert("e_time".to_string(), e_time.to_string());
-                    metrics.insert("input_length".to_string(), input_length.to_string());
-                    metrics.insert("output_length".to_string(), output_length.to_string());
-                    response_sender.send(metrics).unwrap();
-                } else {
-                    tracing::error!(
-                        "Request {} failed with input {} output {}",
-                        count,
-                        input_length,
-                        output_length
-                    );
-                }
-            });
-
-            tx.send_async(request_handle).await.unwrap();
-            timestamp += interval_generator.interval_in_millis().round() as u64;
-            let current_timestamp = get_timestamp();
-            if timestamp > current_timestamp + 1 {
-                sleep(Duration::from_millis(timestamp - current_timestamp)).await;
-            } else {
-                yield_now().await;
-            }
+        if interrupt_flag.load(Ordering::Relaxed) {
+            tracing::info!("{} requests has not yet finished!", handle_rx.len());
         }
-    });
-    handle
+    }
 }
 
-#[instrument(skip_all)]
-pub fn spawn_request_loop_with_timestamp(
+pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     endpoint: String,
-    endpoints: Option<Vec<String>>,
-    dataset: Dataset,
-    prefill_only: bool,
-    truncate: Option<u64>,
-    protocol: Box<dyn crate::protocols::Protocol + Send>,
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>,
+    token_sampler: Arc<TokenSampler>,
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
-    scale_events: Option<ScaleEvent>,
-    broadcast_tx: broadcast::Sender<()>,
+    interrupt_flag: Arc<AtomicBool>,
+    ttft_slo: f32,
+    tpot_slo: f32,
+    stream: bool,
+    early_stop_error_threshold: Option<u32>,
 ) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     static RETURNCODE: AtomicI32 = AtomicI32::new(0);
     BASETIME.get_or_init(|| Instant::now());
-    fn get_timestamp() -> u64 {
-        BASETIME.get().unwrap().elapsed().as_millis() as u64
+    fn get_timestamp() -> f64 {
+        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
     }
 
-    let parse_response = protocol.parse_response();
-
-    let rr = dataset.request_rate();
+    let rr = dataset.rps();
     println!("Origin request rate: {:.3} req/s", rr);
     println!("Scaled request rate: {:.3} req/s", rr * scale_factor);
 
     let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
     let handle = spawn(async move {
-        wait_all(rx).await;
+        wait_all(rx, flag).await;
         let a = RETURNCODE.load(Ordering::Relaxed);
         if a == 0 {
             Ok(())
@@ -208,117 +108,208 @@ pub fn spawn_request_loop_with_timestamp(
             Err(a)
         }
     });
-    let mut scale_rx = broadcast_tx.subscribe();
-    let mut gen_rx = broadcast_tx.subscribe();
-    let new_endpoint = endpoint.clone();
 
-    if scale_events.is_some() {
-        spawn(async move {
-            loop {
-                if scale_rx.try_recv().is_ok() {
-                    break;
-                }
-                let scale_endpoint = new_endpoint
-                    .clone()
-                    .split('/')
-                    .take(3)
-                    .collect::<Vec<&str>>()
-                    .join("/")
-                    + "/modify_cluster_state";
-                let current_timestamp = get_timestamp();
-                let (ts, src, dst, event_type) =
-                    scale_events.as_ref().unwrap().next_event_with_timestamp();
-                let next_timestamp = (ts as f64 / scale_factor) as u64;
+    let error_count = Arc::new(AtomicU32::new(0));
 
-                if next_timestamp > current_timestamp + 1 {
-                    sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
-                } else {
-                    yield_now().await;
-                }
-                let json_body = scale_events
-                    .as_ref()
-                    .unwrap()
-                    .request_json_body(src, dst, event_type);
-                spawn(async move {
-                    if let Err(_) = request_with_timeout(
-                        scale_endpoint.as_str(),
-                        json_body.to_string(),
-                        Duration::from_secs(10),
-                    )
-                    .await
-                    {
-                        RETURNCODE.store(-1, Ordering::Relaxed);
-                        tracing::error!(
-                            "Scale request failed with src {} dst {} event_type {:?}",
-                            src,
-                            dst,
-                            event_type
-                        );
-                    }
-                });
-            }
-        });
-    }
     spawn(async move {
-        let mut count = 0u64;
-        loop {
-            count += 1;
-            if gen_rx.try_recv().is_ok() {
+        let data_iter = dataset.iter();
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .no_proxy()
+            // .timeout(Duration::from_secs(15)) // default timeout, can be overrided
+            .build()
+            .unwrap();
+        let endpoint = Arc::new(endpoint);
+        for data_index in data_iter {
+            let error_count = Arc::clone(&error_count);
+            if interrupt_flag.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Get next request and its timestamp
-            let endpoint = match cfg!(feature = "bypass_router") {
-                false => Some(endpoint.clone()),
-                true => endpoints
-                    .as_ref()
-                    .and_then(|vec| vec.get(count as usize % vec.len()).cloned()),
-            };
-            assert!(endpoint.is_some());
+            if let Some(threshold) = early_stop_error_threshold {
+                if threshold <= error_count.load(Ordering::Relaxed) {
+                    tracing::error!(
+                        "Request error accumulated more than threshold: {}, exit client",
+                        threshold
+                    );
+                    interrupt_flag.store(true, Ordering::SeqCst); // terminate test
+                    break;
+                }
+            }
+            let client = http_client.clone();
+            let endpoint = endpoint.clone();
+            let response_sender = response_sender.clone();
 
-            let current_timestamp = get_timestamp();
-            let (ts, input_length, output_length) =
-                dataset.next_request_with_timestamp(prefill_only, truncate);
-            let next_timestamp = (ts as f64 / scale_factor) as u64;
+            let curr_timestamp = get_timestamp() as u64;
+            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
 
-            if next_timestamp > current_timestamp + 1 {
-                sleep(Duration::from_millis(next_timestamp - current_timestamp)).await;
-            } else {
-                yield_now().await;
+            if next_timestamp > curr_timestamp + 1 {
+                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
 
-            let json_body = protocol.request_json_body(input_length, output_length);
-            let response_sender = response_sender.clone();
+            // Do not parse in another coroutine to avoid sync/async lock contention
+            let (prompt, input_length, output_length) =
+                dataset.inflate(data_index, token_sampler.as_ref());
+
             let request_handle = spawn(async move {
+                let json_body = A::request_json_body(prompt, output_length, stream);
                 let s_time = get_timestamp();
-                if let Ok(response) = request_with_timeout(
-                    endpoint.unwrap().as_str(),
+                let s_time_drift = s_time - next_timestamp as f64;
+                match post_with_timeout::<A>(
+                    client,
+                    endpoint.as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(15 + output_length),
+                    Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
+                    stream,
                 )
                 .await
                 {
-                    let e_time = get_timestamp();
-                    let mut metrics = parse_response(response);
-                    metrics.insert("s_time".to_string(), s_time.to_string());
-                    metrics.insert("e_time".to_string(), e_time.to_string());
-                    metrics.insert("input_length".to_string(), input_length.to_string());
-                    metrics.insert("output_length".to_string(), output_length.to_string());
-                    response_sender.send(metrics).unwrap();
-                } else {
-                    RETURNCODE.store(-1, Ordering::Relaxed);
-                    tracing::error!(
-                        "Request {} failed with input {} output {}",
-                        count,
-                        input_length,
-                        output_length
-                    );
+                    Ok(mut metrics) => {
+                        let e_time = get_timestamp();
+
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+
+                        let span_time = e_time - s_time;
+                        metrics.insert(
+                            "span_time".to_string(),
+                            format!("{span_time:.3}"),
+                        );
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(RequestError::Timeout) => {
+                        let e_time = get_timestamp();
+
+                        let mut metrics = BTreeMap::<String, String>::from([(
+                            "status".to_owned(),
+                            "timeout".to_owned(),
+                        )]);
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+
+                        let span_time = e_time - s_time;
+                        metrics.insert(
+                            "span_time".to_string(),
+                            format!("{span_time:.3}"),
+                        );
+                        response_sender.send(metrics).unwrap();
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::Other(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::StreamErr(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) stream error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             });
 
             tx.send_async(request_handle).await.unwrap();
         }
+        tracing::debug!("Requester exited.");
     });
+    handle
+}
+
+pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
+    _endpoint: String, // 保留参数，为了接口一致
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>,
+    token_sampler: Arc<TokenSampler>,
+    scale_factor: f64,
+    response_sender: flume::Sender<BTreeMap<String, String>>,
+    interrupt_flag: Arc<AtomicBool>,
+) -> JoinHandle<Result<(), i32>> {
+    use std::time::Instant;
+    static BASETIME: OnceLock<Instant> = OnceLock::new();
+    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
+    BASETIME.get_or_init(|| Instant::now());
+
+    fn get_timestamp() -> f64 {
+        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
+    }
+
+    let rr = dataset.rps();
+    println!("Origin request rate: {:.3} req/s", rr);
+    println!(
+        "Scaled request rate (release-with-debug mode, no HTTP): {:.3} req/s",
+        rr * scale_factor
+    );
+
+    let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
+    let handle = spawn(async move {
+        wait_all(rx, flag).await;
+        let a = RETURNCODE.load(Ordering::Relaxed);
+        if a == 0 {
+            Ok(())
+        } else {
+            Err(a)
+        }
+    });
+
+    let validate_tokenizer = Arc::new(token_sampler.get_tokenizer());
+
+    spawn(async move {
+        let data_iter = dataset.iter();
+        for data_index in data_iter {
+            if interrupt_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let tokenizer = validate_tokenizer.clone();
+            let response_sender = response_sender.clone();
+
+            let curr_timestamp = get_timestamp() as u64;
+            // milisecond
+            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
+
+            if next_timestamp > curr_timestamp + 1 {
+                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
+            }
+
+            let (sample, input_length, output_length) =
+                dataset.inflate(data_index, token_sampler.as_ref());
+
+            let request_handle = spawn(async move {
+                let s_time = get_timestamp();
+                let s_time_drift = s_time - next_timestamp as f64;
+
+                let validate_len = tokenizer
+                    .encode(sample.clone(), false)
+                    .unwrap()
+                    .get_ids()
+                    .len();
+                if validate_len != input_length as usize {
+                    tracing::error!("Validation error: {input_length} :> {validate_len}");
+                }
+
+                let mut metrics = BTreeMap::new();
+                metrics.insert("chat_id".to_string(), data_index.to_string());
+                metrics.insert("input_length".to_string(), input_length.to_string());
+                metrics.insert("output_length".to_string(), output_length.to_string());
+                metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
+
+                response_sender.send(metrics).unwrap();
+            });
+
+            tx.send_async(request_handle).await.unwrap();
+        }
+        tracing::debug!("Requester exited.");
+    });
+
     handle
 }
 
@@ -327,31 +318,252 @@ pub fn spawn_request_loop_with_timestamp(
 /// Report loop exits when the response receiver is closed.
 pub async fn report_loop(
     mut output_jsonl_file: File,
+    mut summary_json_file: File,
     response_receiver: flume::Receiver<BTreeMap<String, String>>,
 ) {
     let mut buf_writer = BufWriter::new(&mut output_jsonl_file);
+    let mut summary = SummaryStats::new();
     while let Ok(metrics) = response_receiver.recv_async().await {
+        summary.record(&metrics);
         let line = serde_json::to_string(&metrics).unwrap();
         buf_writer.write_all(line.as_bytes()).await.unwrap();
         buf_writer.write_all(b"\n").await.unwrap();
         buf_writer.flush().await.unwrap();
     }
+    if let Some(metrics) = summary.finalize() {
+        let line = serde_json::to_string_pretty(&metrics).unwrap();
+        summary_json_file.write_all(line.as_bytes()).await.unwrap();
+        summary_json_file.write_all(b"\n").await.unwrap();
+        summary_json_file.flush().await.unwrap();
+    }
+}
+
+struct SummaryStats {
+    total_requests: u64,
+    success_requests: u64,
+    total_output_tokens: u64,
+    min_s_time: Option<f64>,
+    max_e_time: Option<f64>,
+    ttft_values: Vec<f64>,
+    tpot_values: Vec<f64>,
+    e2e_values: Vec<f64>,
+}
+
+impl SummaryStats {
+    fn new() -> Self {
+        Self {
+            total_requests: 0,
+            success_requests: 0,
+            total_output_tokens: 0,
+            min_s_time: None,
+            max_e_time: None,
+            ttft_values: Vec::new(),
+            tpot_values: Vec::new(),
+            e2e_values: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, metrics: &BTreeMap<String, String>) {
+        self.total_requests += 1;
+
+        if let Some(status) = metrics.get("status") {
+            if status
+                .parse::<u16>()
+                .map(|code| (200..300).contains(&code))
+                .unwrap_or(false)
+            {
+                self.success_requests += 1;
+            }
+        }
+
+        if let Some(output_length) = metrics.get("output_length").and_then(|v| v.parse().ok()) {
+            self.total_output_tokens = self.total_output_tokens.saturating_add(output_length);
+        }
+
+        if let Some(s_time) = metrics.get("s_time").and_then(|v| v.parse().ok()) {
+            self.min_s_time = Some(self.min_s_time.map_or(s_time, |min| min.min(s_time)));
+        }
+        if let Some(e_time) = metrics.get("e_time").and_then(|v| v.parse().ok()) {
+            self.max_e_time = Some(self.max_e_time.map_or(e_time, |max| max.max(e_time)));
+        }
+
+        if let Some(ttft) = metrics.get("first_token_time").and_then(|v| v.parse().ok()) {
+            self.ttft_values.push(ttft);
+        }
+        if let (Some(total_time), Some(output_length)) = (
+            metrics.get("total_time").and_then(|v| v.parse::<f64>().ok()),
+            metrics
+                .get("output_length")
+                .and_then(|v| v.parse::<f64>().ok()),
+        ) {
+            if output_length > 0.0 {
+                self.tpot_values.push(total_time / output_length);
+            }
+        }
+        if let Some(e2e) = metrics.get("span_time").and_then(|v| v.parse().ok()) {
+            self.e2e_values.push(e2e);
+        }
+    }
+
+    fn finalize(&mut self) -> Option<BTreeMap<String, String>> {
+        if self.total_requests == 0 {
+            return None;
+        }
+
+        let percentiles = METRIC_PERCENTILES
+            .get()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[90, 95, 99]);
+
+        let mut summary = BTreeMap::new();
+        summary.insert(
+            "requests_total".to_string(),
+            self.total_requests.to_string(),
+        );
+        summary.insert(
+            "requests_success".to_string(),
+            self.success_requests.to_string(),
+        );
+        summary.insert(
+            "output_tokens_total".to_string(),
+            self.total_output_tokens.to_string(),
+        );
+
+        let duration_ms = match (self.min_s_time, self.max_e_time) {
+            (Some(start), Some(end)) if end >= start => end - start,
+            _ => 0.0,
+        };
+        summary.insert("duration_ms".to_string(), format!("{duration_ms:.3}"));
+        if duration_ms > 0.0 {
+            let duration_secs = duration_ms / 1000.0;
+            summary.insert(
+                "throughput_rps".to_string(),
+                format!("{:.3}", self.total_requests as f64 / duration_secs),
+            );
+            summary.insert(
+                "throughput_tps".to_string(),
+                format!("{:.3}", self.total_output_tokens as f64 / duration_secs),
+            );
+        }
+
+        let ttft = compute_percentiles(&mut self.ttft_values, percentiles);
+        for (percentile, value) in ttft {
+            summary.insert(format!("ttft_p{percentile}_ms"), format_ms(value));
+        }
+        let tpot = compute_percentiles(&mut self.tpot_values, percentiles);
+        for (percentile, value) in tpot {
+            summary.insert(format!("tpot_p{percentile}_ms"), format_ms(value));
+        }
+        let e2e = compute_percentiles(&mut self.e2e_values, percentiles);
+        for (percentile, value) in e2e {
+            summary.insert(format!("e2e_p{percentile}_ms"), format_ms(value));
+        }
+
+        summary.insert(
+            "ttft_mean_ms".to_string(),
+            format_ms(mean(&self.ttft_values)),
+        );
+        summary.insert(
+            "tpot_mean_ms".to_string(),
+            format_ms(mean(&self.tpot_values)),
+        );
+        summary.insert(
+            "e2e_mean_ms".to_string(),
+            format_ms(mean(&self.e2e_values)),
+        );
+
+        Some(summary)
+    }
+}
+
+fn compute_percentiles(values: &mut Vec<f64>, percentiles: &[u32]) -> Vec<(u32, f64)> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let len = values.len();
+    percentiles
+        .iter()
+        .map(|percentile| {
+            let idx = (len as f64 * (*percentile as f64 / 100.0)).ceil() as isize - 1;
+            let idx = idx.max(0) as usize;
+            let idx = idx.min(len - 1);
+            (*percentile, values[idx])
+        })
+        .collect()
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn format_ms(value: f64) -> String {
+    format!("{:.3}", value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        dataset::{BailianDataset, LLMTrace},
+        token_sampler::TokenSampler,
+    };
+    use std::sync::Arc;
+    use tokenizers::Tokenizer;
+    use tokio::fs::File;
 
-    #[test]
-    fn test_serde_json() {
-        let mut map = BTreeMap::new();
-        map.insert("a", "a");
-        map.insert("b", "a");
-        map.insert("c", "a");
-        map.insert("d", "a");
-        map.insert("e", "a");
-        map.insert("f", "a");
-        let line = serde_json::to_string(&map).unwrap();
-        println!("{}", line);
+    #[tokio::test]
+    async fn test_inflate_latency() {
+        // 初始化 tracing 输出
+        let subscriber = tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        // ====== 准备 dataset ======
+        let mut dataset = BailianDataset::new();
+        dataset.load("/Users/zdy/Workspace/Rust/request-sim/data/qwen-bailian-usagetraces-anon-main/qwen_traceA_blksz_16.jsonl"); // 你要准备一个小的测试文件
+
+        let dataset = Arc::new(Box::pin(dataset) as Pin<Box<dyn LLMTrace>>);
+
+        // ====== 准备 TokenSampler ======
+        let token_sampler = Arc::new(TokenSampler::new(
+            Tokenizer::from_file("/Users/zdy/Workspace/Rust/request-sim/data/tokenizer.json")
+                .unwrap(),
+            "/Users/zdy/Workspace/Rust/request-sim/data/tokenizer_config.json".to_string(),
+            4,   // num_producer
+            128, // capacity
+            16,  // block size
+        ));
+
+        // ====== 准备输出通道 ======
+        let (tx, rx) = flume::unbounded();
+        let output_file = File::create("tmp/inflate_latency.jsonl").await.unwrap();
+        let summary_file = File::create("tmp/summary.json").await.unwrap();
+        let reporter = tokio::spawn(report_loop(output_file, summary_file, rx));
+
+        // ====== 测试循环 ======
+        let iter = dataset.iter();
+        for index in iter.take(10) {
+            // 只测前10条
+            let start = std::time::Instant::now();
+            let (_prompt, input_len, output_len) = dataset.inflate(index, &token_sampler);
+            let elapsed_us = start.elapsed().as_micros() as u64;
+
+            let mut metrics = std::collections::BTreeMap::new();
+            metrics.insert("index".to_string(), index.to_string());
+            metrics.insert("input_length".to_string(), input_len.to_string());
+            metrics.insert("output_length".to_string(), output_len.to_string());
+            metrics.insert("inflate_time_us".to_string(), elapsed_us.to_string());
+            tx.send_async(metrics).await.unwrap();
+        }
+
+        drop(tx);
+        reporter.await.unwrap();
+
+        tracing::info!("Inflate latency test completed");
     }
 }
