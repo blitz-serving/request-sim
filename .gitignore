@@ -1,6 +1,7 @@
 /target
 /data
 /tmp
+/log
 Cargo.lock
 *.csv
 *.jsonl
