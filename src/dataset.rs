@@ -77,6 +77,7 @@ unsafe impl Sync for DataIter {}
 
 pub trait LLMTrace: Send + Sync {
     fn load(&mut self, path: &str);
+    fn len(&self) -> usize;
     fn timestamp(&self, index: usize) -> u64;
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64);
     fn iter(&self) -> DataIter;
@@ -113,6 +114,10 @@ impl LLMTrace for BailianDataset {
             let item: BailianDataItem = serde_json::from_str(line.unwrap().as_str()).unwrap();
             self.items.push(item);
         }
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
     }
 
     fn iter(&self) -> DataIter {
@@ -204,6 +209,10 @@ impl LLMTrace for MooncakeDataset {
             let item: MooncakeDataItem = serde_json::from_str(line.unwrap().as_str()).unwrap();
             self.items.push(item);
         }
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
     }
 
     fn iter(&self) -> DataIter {

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -6,6 +7,7 @@ use std::sync::{
 
 use clap::Parser;
 use request_sim::apis::{OpenAIApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
+use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TGIApi, MODEL_NAME},
     dataset::{BailianDataset, LLMTrace, MooncakeDataset},
@@ -109,6 +111,19 @@ struct Args {
 
     #[clap[long]]
     early_stop_error_threshold: Option<u32>,
+
+    /// Cache mode for pre-generated prompts.
+    ///   none  — no pre-generation, inflate inline via TokenSampler channels (default)
+    ///   tmpfs — pre-generate all prompts to tmpfs (default: /dev/shm/request-sim-cache.bin)
+    ///   file  — pre-generate all prompts to disk (default: ./request-sim-cache.bin)
+    #[clap(long, default_value = "none")]
+    cache: String,
+
+    /// Path to the cache file. Defaults depend on --cache mode:
+    ///   tmpfs → /dev/shm/request-sim-cache.bin
+    ///   file  → ./request-sim-cache.bin
+    #[clap(long)]
+    cache_path: Option<String>,
 }
 
 async fn async_main(args: Args) -> Result<(), i32> {
@@ -134,6 +149,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
         stream,
         metric_percentile,
         early_stop_error_threshold,
+        cache,
+        cache_path,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -195,60 +212,72 @@ async fn async_main(args: Args) -> Result<(), i32> {
     let (tx, rx) = flume::unbounded();
     let interrupt_flag = Arc::new(AtomicBool::new(false));
 
+    // Create token sampler once (shared across all API types)
+    let token_sampler = Arc::new(TokenSampler::new(
+        Tokenizer::from_file(tokenizer).unwrap(),
+        tokenizer_config,
+        num_producer.unwrap_or(1),
+        channel_capacity.unwrap_or(128),
+        block_size,
+    ));
+
+    // Resolve cache mode and path
+    let cache_mode = cache.to_lowercase();
+    let prompt_cache: Option<Arc<PromptCache>> = match cache_mode.as_str() {
+        "none" => None,
+        "tmpfs" => {
+            let path = cache_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/dev/shm/request-sim-cache.bin"));
+            let cache = PromptCache::load_or_generate(
+                dataset.as_ref().get_ref(),
+                token_sampler.as_ref(),
+                &path,
+            );
+            Some(Arc::new(cache))
+        }
+        "file" => {
+            let path = cache_path
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("./request-sim-cache.bin"));
+            let cache = PromptCache::load_or_generate(
+                dataset.as_ref().get_ref(),
+                token_sampler.as_ref(),
+                &path,
+            );
+            Some(Arc::new(cache))
+        }
+        _ => panic!("Invalid cache mode: {cache_mode}. Use 'none', 'tmpfs', or 'file'."),
+    };
+
+    let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
+
+    tracing::info!("Client start");
     let requester_handle = match api.to_lowercase().as_str() {
-        "tgi" => {
-            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
-            let token_sampler = Arc::new(TokenSampler::new(
-                Tokenizer::from_file(tokenizer).unwrap(),
-                tokenizer_config,
-                num_producer.unwrap_or(1),
-                channel_capacity.unwrap_or(128),
-                block_size,
-            ));
-            tracing::info!("Client start");
-            spawn_request_loop_with_timestamp::<TGIApi>(
-                endpoint,
-                dataset,
-                token_sampler,
-                scale_factor.unwrap(),
-                tx,
-                interrupt_flag.clone(),
-                ttft_slo,
-                tpot_slo,
-                stream,
-                early_stop_error_threshold,
-            )
-        }
-        "release-with-debug" => {
-            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
-            let token_sampler = Arc::new(TokenSampler::new(
-                Tokenizer::from_file(tokenizer).unwrap(),
-                tokenizer_config,
-                num_producer.unwrap_or(1),
-                channel_capacity.unwrap_or(128),
-                block_size,
-            ));
-            tracing::info!("Client start");
-            spawn_request_loop_debug::<TGIApi>(
-                endpoint,
-                dataset,
-                token_sampler,
-                scale_factor.unwrap(),
-                tx,
-                interrupt_flag.clone(),
-            )
-        }
+        "tgi" => spawn_request_loop_with_timestamp::<TGIApi>(
+            endpoint,
+            dataset,
+            token_sampler,
+            scale_factor.unwrap(),
+            tx,
+            interrupt_flag.clone(),
+            ttft_slo,
+            tpot_slo,
+            stream,
+            early_stop_error_threshold,
+            prompt_cache,
+        ),
+        "release-with-debug" => spawn_request_loop_debug::<TGIApi>(
+            endpoint,
+            dataset,
+            token_sampler,
+            scale_factor.unwrap(),
+            tx,
+            interrupt_flag.clone(),
+            prompt_cache,
+        ),
         "openai" => {
             MODEL_NAME.get_or_init(|| model_name.unwrap());
-            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
-            let token_sampler = Arc::new(TokenSampler::new(
-                Tokenizer::from_file(tokenizer).unwrap(),
-                tokenizer_config,
-                num_producer.unwrap_or(1),
-                channel_capacity.unwrap_or(128),
-                block_size,
-            ));
-            tracing::info!("Client start");
             spawn_request_loop_with_timestamp::<OpenAIApi>(
                 endpoint,
                 dataset,
@@ -260,6 +289,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 tpot_slo,
                 stream,
                 early_stop_error_threshold,
+                prompt_cache,
             )
         }
         "aibrix" => {
@@ -274,15 +304,6 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 );
                 route_strategy
             });
-            let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
-            let token_sampler = Arc::new(TokenSampler::new(
-                Tokenizer::from_file(tokenizer).unwrap(),
-                tokenizer_config,
-                num_producer.unwrap_or(1),
-                channel_capacity.unwrap_or(128),
-                block_size,
-            ));
-            tracing::info!("Client start");
             spawn_request_loop_with_timestamp::<OpenAIApi>(
                 endpoint,
                 dataset,
@@ -294,6 +315,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 tpot_slo,
                 stream,
                 early_stop_error_threshold,
+                prompt_cache,
             )
         }
         _ => unimplemented!("Unsupported protocol type"),

@@ -19,6 +19,7 @@ use tokio::{
 };
 
 use crate::apis::METRIC_PERCENTILES;
+use crate::cache::PromptCache;
 use crate::{
     apis::{LLMApi, RequestError, AIBRIX_ROUTE_STRATEGY},
     dataset::LLMTrace,
@@ -85,6 +86,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     tpot_slo: f32,
     stream: bool,
     early_stop_error_threshold: Option<u32>,
+    prompt_cache: Option<Arc<PromptCache>>,
 ) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     static RETURNCODE: AtomicI32 = AtomicI32::new(0);
@@ -148,9 +150,14 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
 
-            // Do not parse in another coroutine to avoid sync/async lock contention
+            // Use pre-generated cache when available, otherwise inflate inline
             let (prompt, input_length, output_length) =
-                dataset.inflate(data_index, token_sampler.as_ref());
+                if let Some(ref cache) = prompt_cache {
+                    let entry = cache.get(data_index);
+                    (entry.prompt.clone(), entry.input_length, entry.output_length)
+                } else {
+                    dataset.inflate(data_index, token_sampler.as_ref())
+                };
 
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, output_length, stream);
@@ -179,6 +186,19 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             "span_time".to_string(),
                             format!("{span_time:.3}"),
                         );
+
+                        // Compute TPOT from E2E span_time for non-streaming successful requests.
+                        // In non-streaming mode, total_time is unavailable so this is the only way.
+                        if output_length > 0
+                            && metrics
+                                .get("status")
+                                .map(|s| s.starts_with('2'))
+                                .unwrap_or(false)
+                        {
+                            let tpot = span_time / output_length as f64;
+                            metrics.insert("tpot".to_string(), format!("{tpot:.3}"));
+                        }
+
                         response_sender.send(metrics).unwrap();
                     }
                     Err(RequestError::Timeout) => {
@@ -231,6 +251,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     scale_factor: f64,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     interrupt_flag: Arc<AtomicBool>,
+    prompt_cache: Option<Arc<PromptCache>>,
 ) -> JoinHandle<Result<(), i32>> {
     use std::time::Instant;
     static BASETIME: OnceLock<Instant> = OnceLock::new();
@@ -280,7 +301,12 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
             }
 
             let (sample, input_length, output_length) =
-                dataset.inflate(data_index, token_sampler.as_ref());
+                if let Some(ref cache) = prompt_cache {
+                    let entry = cache.get(data_index);
+                    (entry.prompt.clone(), entry.input_length, entry.output_length)
+                } else {
+                    dataset.inflate(data_index, token_sampler.as_ref())
+                };
 
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();
@@ -390,12 +416,16 @@ impl SummaryStats {
         if let Some(ttft) = metrics.get("first_token_time").and_then(|v| v.parse().ok()) {
             self.ttft_values.push(ttft);
         }
-        if let (Some(total_time), Some(output_length)) = (
+        if let Some(tpot) = metrics.get("tpot").and_then(|v| v.parse::<f64>().ok()) {
+            // Non-streaming: TPOT pre-computed from span_time / output_length
+            self.tpot_values.push(tpot);
+        } else if let (Some(total_time), Some(output_length)) = (
             metrics.get("total_time").and_then(|v| v.parse::<f64>().ok()),
             metrics
                 .get("output_length")
                 .and_then(|v| v.parse::<f64>().ok()),
         ) {
+            // Streaming: TPOT from total_time / output_length
             if output_length > 0.0 {
                 self.tpot_values.push(total_time / output_length);
             }
