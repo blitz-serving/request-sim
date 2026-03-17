@@ -201,16 +201,16 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             format!("{span_time:.3}"),
                         );
 
-                        // Compute TPOT from E2E span_time for non-streaming successful requests.
-                        // In non-streaming mode, total_time is unavailable so this is the only way.
+                        // Non-streaming: compute normalized E2E (span_time / output_length).
+                        // This includes TTFT and is NOT the same as streaming TPOT.
                         if output_length > 0
                             && metrics
                                 .get("status")
                                 .map(|s| s.starts_with('2'))
                                 .unwrap_or(false)
                         {
-                            let tpot = span_time / output_length as f64;
-                            metrics.insert("tpot".to_string(), format!("{tpot:.3}"));
+                            let normalized_e2e = span_time / output_length as f64;
+                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
                         }
 
                         response_sender.send(metrics).unwrap();
@@ -444,18 +444,19 @@ impl SummaryStats {
         if let Some(ttft) = metrics.get("first_token_time").and_then(|v| v.parse().ok()) {
             self.ttft_values.push(ttft);
         }
-        if let Some(tpot) = metrics.get("tpot").and_then(|v| v.parse::<f64>().ok()) {
-            // Non-streaming: TPOT pre-computed from span_time / output_length
-            self.tpot_values.push(tpot);
-        } else if let (Some(total_time), Some(output_length)) = (
+        if let Some(normalized_e2e) = metrics.get("normalized_e2e").and_then(|v| v.parse::<f64>().ok()) {
+            // Non-streaming: E2E span_time / output_length (includes TTFT, not true TPOT)
+            self.tpot_values.push(normalized_e2e);
+        } else if let (Some(total_time), Some(token_count)) = (
             metrics.get("total_time").and_then(|v| v.parse::<f64>().ok()),
             metrics
-                .get("output_length")
+                .get("token_count")
                 .and_then(|v| v.parse::<f64>().ok()),
         ) {
-            // Streaming: TPOT from total_time / output_length
-            if output_length > 0.0 {
-                self.tpot_values.push(total_time / output_length);
+            // Streaming: TPOT = decode_time / (actual_token_count - 1)
+            // total_time = last_token - first_token spans (N-1) inter-token gaps
+            if token_count > 1.0 {
+                self.tpot_values.push(total_time / (token_count - 1.0));
             }
         }
         if let Some(e2e) = metrics.get("span_time").and_then(|v| v.parse().ok()) {

@@ -124,6 +124,7 @@ impl LLMApi for OpenAIApi {
                 result.insert("total_time".to_string(), format!("{total_time:.3}"));
             }
         }
+        result.insert("token_count".to_string(), token_count.to_string());
 
         if !tbt_except_first.is_empty() {
             let max_tbt_except_first = tbt_except_first
