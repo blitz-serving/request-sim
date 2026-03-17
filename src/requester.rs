@@ -87,6 +87,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     stream: bool,
     early_stop_error_threshold: Option<u32>,
     prompt_cache: Option<Arc<PromptCache>>,
+    time_range: (Option<u64>, Option<u64>),
 ) -> JoinHandle<Result<(), i32>> {
     static BASETIME: OnceLock<Instant> = OnceLock::new();
     static RETURNCODE: AtomicI32 = AtomicI32::new(0);
@@ -123,7 +124,20 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             .build()
             .unwrap();
         let endpoint = Arc::new(endpoint);
+        let (begin_time, end_time) = time_range;
         for data_index in data_iter {
+            let trace_ts = dataset.timestamp(data_index);
+            if let Some(begin) = begin_time {
+                if trace_ts < begin {
+                    continue;
+                }
+            }
+            if let Some(end) = end_time {
+                if trace_ts > end {
+                    continue;
+                }
+            }
+
             let error_count = Arc::clone(&error_count);
             if interrupt_flag.load(Ordering::Relaxed) {
                 break;
@@ -252,6 +266,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     response_sender: flume::Sender<BTreeMap<String, String>>,
     interrupt_flag: Arc<AtomicBool>,
     prompt_cache: Option<Arc<PromptCache>>,
+    time_range: (Option<u64>, Option<u64>),
 ) -> JoinHandle<Result<(), i32>> {
     use std::time::Instant;
     static BASETIME: OnceLock<Instant> = OnceLock::new();
@@ -285,7 +300,20 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
 
     spawn(async move {
         let data_iter = dataset.iter();
+        let (begin_time, end_time) = time_range;
         for data_index in data_iter {
+            let trace_ts = dataset.timestamp(data_index);
+            if let Some(begin) = begin_time {
+                if trace_ts < begin {
+                    continue;
+                }
+            }
+            if let Some(end) = end_time {
+                if trace_ts > end {
+                    continue;
+                }
+            }
+
             if interrupt_flag.load(Ordering::Relaxed) {
                 break;
             }

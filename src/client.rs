@@ -22,6 +22,7 @@ use tracing_subscriber::fmt::{self, format::FmtSpan};
 use tracing_subscriber::{prelude::*, Layer, Registry};
 
 #[derive(Parser)]
+#[command(rename_all = "kebab-case")]
 struct Args {
     /// Path to tokenizer file.
     #[clap(long, required = true)]
@@ -109,7 +110,7 @@ struct Args {
     #[clap(long, value_delimiter = ',', default_value = "90,95,99")]
     metric_percentile: Vec<u32>,
 
-    #[clap[long]]
+    #[clap(long)]
     early_stop_error_threshold: Option<u32>,
 
     /// Cache mode for pre-generated prompts.
@@ -124,6 +125,16 @@ struct Args {
     ///   file  → ./request-sim-cache.bin
     #[clap(long)]
     cache_path: Option<String>,
+
+    /// Begin timestamp (ms) of the trace time range to replay.
+    /// Only requests with trace timestamp >= this value will be replayed.
+    #[clap(long)]
+    begin_time: Option<u64>,
+
+    /// End timestamp (ms) of the trace time range to replay.
+    /// Only requests with trace timestamp <= this value will be replayed.
+    #[clap(long)]
+    end_time: Option<u64>,
 }
 
 async fn async_main(args: Args) -> Result<(), i32> {
@@ -151,6 +162,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
         early_stop_error_threshold,
         cache,
         cache_path,
+        begin_time,
+        end_time,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -253,6 +266,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
     let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
 
     tracing::info!("Client start");
+    let time_range = (begin_time, end_time);
     let requester_handle = match api.to_lowercase().as_str() {
         "tgi" => spawn_request_loop_with_timestamp::<TGIApi>(
             endpoint,
@@ -266,6 +280,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             stream,
             early_stop_error_threshold,
             prompt_cache,
+            time_range,
         ),
         "release-with-debug" => spawn_request_loop_debug::<TGIApi>(
             endpoint,
@@ -275,6 +290,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             tx,
             interrupt_flag.clone(),
             prompt_cache,
+            time_range,
         ),
         "openai" => {
             MODEL_NAME.get_or_init(|| model_name.unwrap());
@@ -290,6 +306,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 stream,
                 early_stop_error_threshold,
                 prompt_cache,
+                time_range,
             )
         }
         "aibrix" => {
@@ -316,6 +333,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 stream,
                 early_stop_error_threshold,
                 prompt_cache,
+                time_range,
             )
         }
         _ => unimplemented!("Unsupported protocol type"),
