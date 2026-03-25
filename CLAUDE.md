@@ -47,14 +47,15 @@ Three modes controlled by `--mode`:
 src/
   client.rs          CLI args + validate_config() + mode dispatch (entry point)
   lib.rs             SpinLock, SpinRwLock, timeout_secs_upon_slo()
-  dataset.rs         LLMTrace trait + BailianDataset (block=16) + MooncakeDataset (block=512)
+  dataset.rs         LLMTrace trait + BailianDataset (block=16) + MooncakeDataset (block=512) + MiniMaxDataset + PlainTextDataset
   token_sampler.rs   TokenSampler: N producer threads → crossbeam channels → gen_string()
   requester.rs       RequestContext, ArrivalProcess, spawn_request_loop_*, report_loop(), SummaryStats
   mock_server.rs     Hyper echo server (100-300ms random latency)
   apis/
-    mod.rs           LLMApi trait, RequestError, global statics (MODEL_NAME, METRIC_PERCENTILES)
+    mod.rs           LLMApi trait, RequestError, global statics (MODEL_NAME, METRIC_PERCENTILES, MAX_TOKENS_CAP)
     tgi_api.rs       TGI: extracts metrics from response headers
     openai_api.rs    OpenAI: SSE streaming, per-token latency tracking
+    sgl_api.rs       SGLang: OpenAI-compatible SSE + usage/cached_tokens extraction
     aibrix_api.rs    AIBrix: adds routing-strategy header
 ```
 
@@ -76,3 +77,31 @@ Pipeline: **Load → Warm → Dispatch → Report**
 - **Cache has two modes**: cold path uses `SpinRwLock` for concurrent lazy population; warm path is lock-free (safe because no writers exist after `warm_cache()`)
 - **`SpinRwLock`** is writer-prioritized (waiter bit blocks new readers) — see `lib.rs` for bit layout
 - **One request = one tokio task** — dispatched sequentially by timestamp, executed concurrently
+
+## Prompt Text Modes
+
+Two compile-time feature flags control how prompts are constructed:
+
+| Feature | Prompt content | Datasets | `inflate()` signature | `output_length` |
+|---------|---------------|----------|----------------------|-----------------|
+| *(default)* hashed | Synthetic noise (from block hashes via `TokenSampler`) | `bailian`, `mooncake` | `inflate(index, &TokenSampler)` | Always > 0 (from trace) |
+| `prompt-text-plain` | Meaningful real text | `minimax`, `plaintext` | `inflate(index)` | >= 0 (0 = let model EOS) |
+
+Build with plain mode: `cargo build --release --features prompt-text-plain`
+
+### Semantic invariants
+
+- **hashed**: content is noise, so `output_length` must always be set from the trace — the model cannot produce a meaningful EOS on synthetic tokens. `min_tokens = max_tokens = output_length`.
+- **plain**: content is meaningful, so `output_length = 0` is valid (model decides when to stop via EOS). When `output_length > 0` (e.g. MiniMaxDataset), it is used as exact constraint.
+
+### `--max-tokens` safety cap
+
+`--max-tokens` provides a ceiling on generated tokens when the dataset does not specify `output_length`:
+
+| `output_length` | `--max-tokens` | `min_tokens` | `max_tokens` |
+|---|---|---|---|
+| > 0 (from trace) | any | `output_length` | `output_length` |
+| 0 (e.g. plaintext) | set | omit | `--max-tokens` |
+| 0 (e.g. plaintext) | unset | omit | omit (EOS only) |
+
+Stored as `MAX_TOKENS_CAP: OnceLock<Option<u64>>` in `apis/mod.rs`, read by all API backends in `request_json_body()`.

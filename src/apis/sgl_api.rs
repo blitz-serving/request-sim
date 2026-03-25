@@ -1,4 +1,4 @@
-use super::{LLMApi, RequestError, METRIC_PERCENTILES, MODEL_NAME};
+use super::{LLMApi, RequestError, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME};
 use futures_util::TryStreamExt;
 use reqwest::Response;
 use serde_json::json;
@@ -20,7 +20,7 @@ impl LLMApi for SglApi {
     const AIBRIX_PRIVATE_HEADER: bool = false;
 
     fn request_json_body(prompt: String, output_length: u64, stream: bool) -> String {
-        let json_body = json!({
+        let mut body = json!({
             "model": MODEL_NAME.get().unwrap().as_str(),
             "messages": [
                 {
@@ -29,11 +29,15 @@ impl LLMApi for SglApi {
                 }
             ],
             "stream": stream,
-            "min_tokens": output_length,
-            "max_tokens": output_length,
         });
+        if output_length > 0 {
+            body["min_tokens"] = json!(output_length);
+            body["max_tokens"] = json!(output_length);
+        } else if let Some(Some(cap)) = MAX_TOKENS_CAP.get() {
+            body["max_tokens"] = json!(cap);
+        }
 
-        json_body.to_string()
+        body.to_string()
     }
 
     async fn parse_response(

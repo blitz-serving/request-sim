@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use reqwest::Response;
 
-use super::{LLMApi, RequestError, METRIC_PERCENTILES};
+use super::{LLMApi, MAX_TOKENS_CAP, METRIC_PERCENTILES, RequestError};
 use std::time::Duration;
 pub struct TgiApi;
 
@@ -28,9 +28,13 @@ impl LLMApi for TgiApi {
     const AIBRIX_PRIVATE_HEADER: bool = false;
 
     fn request_json_body(prompt: String, output_length: u64, _stream: bool) -> String {
-        let json_body =
-            serde_json::json!({"inputs":prompt,"parameters":{"max_new_tokens":output_length}});
-        json_body.to_string()
+        let mut body = serde_json::json!({"inputs": prompt, "parameters": {}});
+        if output_length > 0 {
+            body["parameters"]["max_new_tokens"] = serde_json::json!(output_length);
+        } else if let Some(Some(cap)) = MAX_TOKENS_CAP.get() {
+            body["parameters"]["max_new_tokens"] = serde_json::json!(cap);
+        }
+        body.to_string()
     }
 
     async fn parse_response(

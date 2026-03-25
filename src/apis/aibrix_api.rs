@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use super::{LLMApi, RequestError, MODEL_NAME};
+use super::{LLMApi, RequestError, MAX_TOKENS_CAP, MODEL_NAME};
 
 #[derive(Copy, Clone)]
 pub struct AbxApi;
@@ -16,8 +16,8 @@ impl LLMApi for AbxApi {
     const AIBRIX_PRIVATE_HEADER: bool = true;
 
     fn request_json_body(prompt: String, output_length: u64, stream: bool) -> String {
-        let json_body = json!({
-            "model": MODEL_NAME.get().unwrap().as_str(), // 可按需修改
+        let mut body = json!({
+            "model": MODEL_NAME.get().unwrap().as_str(),
             "messages": [
                 {
                     "role": "user",
@@ -25,11 +25,15 @@ impl LLMApi for AbxApi {
                 }
             ],
             "stream": stream,
-            "min_tokens": output_length,
-            "max_tokens": output_length,
         });
+        if output_length > 0 {
+            body["min_tokens"] = json!(output_length);
+            body["max_tokens"] = json!(output_length);
+        } else if let Some(Some(cap)) = MAX_TOKENS_CAP.get() {
+            body["max_tokens"] = json!(cap);
+        }
 
-        json_body.to_string()
+        body.to_string()
     }
 
     async fn parse_response(

@@ -31,7 +31,8 @@ while using only **~30 CPU threads**, which is sufficient for stress testing a
   - **Random process**: stochastic arrival times (Poisson or uniform distribution)
   - **Feedback**: control-theory closed-loop with configurable batch size
 - Construct prompts based on block hashes (preserving KVCache hit patterns)
-- End-to-end request replay using OpenAI and TGI compatible APIs
+- Plain text dataset support for meaningful prompts (`--dataset plaintext`)
+- End-to-end request replay using OpenAI, TGI, SGLang, and AIBrix compatible APIs
 - Exports results in **JSONL** format for post-processing
 - High throughput with low resource usage:
   - ~30 CPU threads can saturate a 16-instance model cluster
@@ -42,10 +43,11 @@ while using only **~30 CPU threads**, which is sufficient for stress testing a
 
 ## Supported backend APIs
 
-As long as the backend supports these APIs, we can use the trace replayer to replay the traces. The current supported APIs are: 
+As long as the backend supports these APIs, we can use the trace replayer to replay the traces. The current supported APIs are:
 
-- **OpenAI API**: `http://endpoint:port/v1/chat/completion` (non-streaming)
-- **TGI (Text Generation Inference)**: `http://endpoint:port/generate` (non-streaming)
+- **OpenAI API**: `http://endpoint:port/v1/chat/completions`
+- **TGI (Text Generation Inference)**: `http://endpoint:port/generate`
+- **SGLang**: `http://endpoint:port/v1/chat/completions` (OpenAI-compatible, extracts usage/cached_tokens)
 - **AIBrix**
 
 
@@ -108,6 +110,54 @@ request-sim --mode feedback \
 ```
 
 **Optional**: `--target-bs` (default 1). BS=1 is the queueing-theory closed-loop special case. Terminates when all dataset entries are consumed.
+
+
+## Prompt Text Modes
+
+Two compile-time modes control how prompts are constructed:
+
+### Hashed mode (default)
+
+Prompts are **synthetic noise** reconstructed from block hashes in the trace via `TokenSampler`. Content is semantically meaningless — suitable only for performance testing. `output_length` is always specified by the trace data (`min_tokens = max_tokens = output_length`).
+
+```bash
+cargo build --release          # hashed mode (default)
+```
+
+Datasets: `bailian`, `mooncake`
+
+### Plain text mode (`prompt-text-plain`)
+
+Prompts are **meaningful real text**. The model generates until EOS naturally, unless capped by `--max-tokens`.
+
+```bash
+cargo build --release --features prompt-text-plain
+```
+
+Datasets: `minimax`, `plaintext`
+
+The `plaintext` dataset reads a raw text file (one prompt per line):
+
+```bash
+request-sim --mode feedback \
+  --target-bs 4 \
+  --dataset plaintext --dataset-path prompts.txt \
+  --api sgl --endpoint http://localhost:8080/v1/chat/completions \
+  --model-name Qwen2.5-7B-Instruct \
+  --max-tokens 4096 \
+  --stream \
+  --time-in-secs 300
+```
+
+### `--max-tokens` safety cap
+
+When the dataset does not provide `output_length` (e.g. `plaintext`), `--max-tokens` sets a ceiling on generated tokens. It is ignored when the trace provides an explicit `output_length`.
+
+| `output_length` | `--max-tokens` | Request body |
+|---|---|---|
+| > 0 (from trace) | any | `min_tokens = max_tokens = output_length` |
+| 0 (plaintext) | set | `max_tokens = --max-tokens` (no `min_tokens`) |
+| 0 (plaintext) | unset | no token limit (model EOS only) |
 
 
 ## Getting Started

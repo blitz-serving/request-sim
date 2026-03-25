@@ -305,7 +305,7 @@ impl LLMTrace for MooncakeDataset {
 struct MiniMaxRawItem {
     server_timestamp: u64,
     dialogue_input: String,
-    dialogue_outputs: String,
+    dialogue_outputs: Option<String>,
 }
 
 /// A single message entry inside `dialogue_input.data[]`.
@@ -379,9 +379,14 @@ impl LLMTrace for MiniMaxDataset {
         let base_ts = raw_items.first().map(|i| i.server_timestamp).unwrap_or(0);
 
         for raw in &raw_items {
+            // Skip entries with null dialogue_outputs
+            let dialogue_outputs = match &raw.dialogue_outputs {
+                Some(s) => s,
+                None => continue,
+            };
             // Parse dialogue_outputs: JSON array of output entries
             let outputs: Vec<MiniMaxOutputEntry> =
-                serde_json::from_str(&raw.dialogue_outputs)
+                serde_json::from_str(dialogue_outputs)
                     .unwrap_or_else(|e| panic!("Failed to parse dialogue_outputs: {e}"));
             let first_output = outputs.first().expect("dialogue_outputs array is empty");
             let input_length = first_output.model_input_tokens_count;
@@ -452,5 +457,70 @@ impl LLMTrace for MiniMaxDataset {
     fn inflate(&self, index: usize) -> (String, u64, u64) {
         let item = &self.items[index];
         (item.input_text.clone(), item.input_length, item.output_length)
+    }
+}
+
+//
+// ============== PlainTextDataset ==============
+//
+
+#[prompt_text(plain)]
+pub struct PlainTextDataset {
+    items: Vec<String>,
+}
+
+#[cfg(feature = "prompt-text-plain")]
+impl PlainTextDataset {
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+        }
+    }
+}
+
+#[cfg(feature = "prompt-text-plain")]
+unsafe impl Send for PlainTextDataset {}
+#[cfg(feature = "prompt-text-plain")]
+unsafe impl Sync for PlainTextDataset {}
+
+#[prompt_text(plain)]
+impl LLMTrace for PlainTextDataset {
+    fn load(&mut self, path: &str) {
+        let file = File::open(path).unwrap();
+        for line in BufReader::new(file).lines() {
+            let line = line.unwrap();
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            self.items.push(trimmed.to_string());
+        }
+        tracing::info!(
+            "Loaded PlainTextDataset: {} items",
+            self.items.len(),
+        );
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn iter(&self) -> DataIter {
+        DataIter {
+            size: self.items.len(),
+            index: AtomicUsize::new(0),
+        }
+    }
+
+    fn rps(&self) -> f64 {
+        1.0
+    }
+
+    fn timestamp(&self, index: usize) -> u64 {
+        index as u64
+    }
+
+    fn inflate(&self, index: usize) -> (String, u64, u64) {
+        (self.items[index].clone(), 0, 0)
     }
 }

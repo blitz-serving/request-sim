@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use clap::Parser;
-use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
+use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, MAX_TOKENS_CAP, METRIC_PERCENTILES};
 use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TgiApi, MODEL_NAME},
@@ -23,7 +23,7 @@ use request_sim::{
     token_sampler::TokenSampler,
 };
 #[cfg(feature = "prompt-text-plain")]
-use request_sim::dataset::MiniMaxDataset;
+use request_sim::dataset::{MiniMaxDataset, PlainTextDataset};
 #[cfg(not(feature = "prompt-text-plain"))]
 use tokenizers::Tokenizer;
 use tokio::spawn;
@@ -167,6 +167,12 @@ struct Args {
     /// BS=1 is queueing-theory closed-loop (send one, await, send next).
     #[clap(long, default_value_t = 1)]
     target_bs: usize,
+
+    /// Safety cap on output tokens. Applied as max_tokens when the dataset does
+    /// not specify an output length (e.g. plaintext dataset). Ignored when the
+    /// trace provides an explicit output_length.
+    #[clap(long)]
+    max_tokens: Option<u64>,
 }
 
 fn validate_config(args: &Args) {
@@ -248,6 +254,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         arrival,
         rate,
         target_bs,
+        max_tokens,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -263,6 +270,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         );
     }
     METRIC_PERCENTILES.get_or_init(|| metric_percentile);
+    MAX_TOKENS_CAP.get_or_init(|| max_tokens);
 
     let output_file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -313,6 +321,16 @@ async fn async_main(args: Args) -> Result<(), i32> {
             dataset.load(
                 dataset_path
                     .expect("A dataset path must be provided for minimax dataset!")
+                    .as_str(),
+            );
+            dataset
+        }
+        #[cfg(feature = "prompt-text-plain")]
+        "plaintext" => {
+            let mut dataset = Box::pin(PlainTextDataset::new());
+            dataset.load(
+                dataset_path
+                    .expect("--dataset-path is required for plaintext dataset")
                     .as_str(),
             );
             dataset
