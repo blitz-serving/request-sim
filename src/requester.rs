@@ -28,6 +28,69 @@ use crate::{
 #[cfg(not(feature = "prompt-text-plain"))]
 use crate::token_sampler::TokenSampler;
 
+// ── Module-level timing infrastructure ──────────────────────────────────────
+
+static BASETIME: OnceLock<Instant> = OnceLock::new();
+static RETURNCODE: AtomicI32 = AtomicI32::new(0);
+
+fn init_basetime() {
+    BASETIME.get_or_init(|| Instant::now());
+}
+
+fn get_timestamp() -> f64 {
+    BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
+}
+
+// ── Request context (unifies feature-gated inflate) ─────────────────────────
+
+#[derive(Clone)]
+pub struct RequestContext {
+    pub dataset: Arc<Pin<Box<dyn LLMTrace>>>,
+    #[cfg(not(feature = "prompt-text-plain"))]
+    pub token_sampler: Arc<TokenSampler>,
+    pub prompt_cache: Option<Arc<PromptCache>>,
+}
+
+impl RequestContext {
+    /// Inflate prompt for a dataset entry, using the cache if available,
+    /// otherwise delegating to the dataset's inflate method.
+    pub fn inflate(&self, index: usize) -> (String, u64, u64) {
+        if let Some(ref cache) = self.prompt_cache {
+            let entry = cache.get(index);
+            (entry.prompt.clone(), entry.input_length, entry.output_length)
+        } else {
+            #[cfg(not(feature = "prompt-text-plain"))]
+            {
+                self.dataset.inflate(index, self.token_sampler.as_ref())
+            }
+            #[cfg(feature = "prompt-text-plain")]
+            {
+                self.dataset.inflate(index)
+            }
+        }
+    }
+}
+
+// ── Arrival process for random-process mode ─────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub enum ArrivalProcess {
+    Poisson,
+    Uniform,
+}
+
+fn next_interarrival(arrival: &ArrivalProcess, rate: f64) -> Duration {
+    use rand::Rng;
+    match arrival {
+        ArrivalProcess::Poisson => {
+            let mut rng = rand::thread_rng();
+            let exp = rand_distr::Exp::new(rate).unwrap();
+            Duration::from_secs_f64(rng.sample(exp))
+        }
+        ArrivalProcess::Uniform => Duration::from_secs_f64(1.0 / rate),
+    }
+}
+
 #[allow(dead_code)]
 async fn request(endpoint: &str, json_body: String) -> Result<Response, reqwest::Error> {
     Ok(reqwest::Client::builder()
@@ -91,12 +154,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     prompt_cache: Option<Arc<PromptCache>>,
     time_range: (Option<u64>, Option<u64>),
 ) -> JoinHandle<Result<(), i32>> {
-    static BASETIME: OnceLock<Instant> = OnceLock::new();
-    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
-    BASETIME.get_or_init(|| Instant::now());
-    fn get_timestamp() -> f64 {
-        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
-    }
+    init_basetime();
 
     let rr = dataset.rps();
     println!("Origin request rate: {:.3} req/s", rr);
@@ -271,12 +329,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     prompt_cache: Option<Arc<PromptCache>>,
     time_range: (Option<u64>, Option<u64>),
 ) -> JoinHandle<Result<(), i32>> {
-    static BASETIME: OnceLock<Instant> = OnceLock::new();
-    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
-    BASETIME.get_or_init(|| Instant::now());
-    fn get_timestamp() -> f64 {
-        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
-    }
+    init_basetime();
 
     let rr = dataset.rps();
     println!("Origin request rate: {:.3} req/s", rr);
@@ -447,14 +500,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     prompt_cache: Option<Arc<PromptCache>>,
     time_range: (Option<u64>, Option<u64>),
 ) -> JoinHandle<Result<(), i32>> {
-    use std::time::Instant;
-    static BASETIME: OnceLock<Instant> = OnceLock::new();
-    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
-    BASETIME.get_or_init(|| Instant::now());
-
-    fn get_timestamp() -> f64 {
-        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
-    }
+    init_basetime();
 
     let rr = dataset.rps();
     println!("Origin request rate: {:.3} req/s", rr);
@@ -555,14 +601,7 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     prompt_cache: Option<Arc<PromptCache>>,
     time_range: (Option<u64>, Option<u64>),
 ) -> JoinHandle<Result<(), i32>> {
-    use std::time::Instant;
-    static BASETIME: OnceLock<Instant> = OnceLock::new();
-    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
-    BASETIME.get_or_init(|| Instant::now());
-
-    fn get_timestamp() -> f64 {
-        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
-    }
+    init_basetime();
 
     let rr = dataset.rps();
     println!("Origin request rate: {:.3} req/s", rr);
@@ -640,6 +679,277 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
         tracing::debug!("Requester exited.");
     });
 
+    handle
+}
+
+// ── Random-process mode ─────────────────────────────────────────────────────
+
+pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
+    endpoint: String,
+    ctx: RequestContext,
+    arrival: ArrivalProcess,
+    rate: f64,
+    response_sender: flume::Sender<BTreeMap<String, String>>,
+    interrupt_flag: Arc<AtomicBool>,
+    ttft_slo: f32,
+    tpot_slo: f32,
+    stream: bool,
+    early_stop_error_threshold: Option<u32>,
+) -> JoinHandle<Result<(), i32>> {
+    init_basetime();
+
+    println!("Random-process mode: arrival={:?}, rate={:.3} req/s", arrival, rate);
+
+    let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
+    let handle = spawn(async move {
+        wait_all(rx, flag).await;
+        let a = RETURNCODE.load(Ordering::Relaxed);
+        if a == 0 { Ok(()) } else { Err(a) }
+    });
+
+    let error_count = Arc::new(AtomicU32::new(0));
+
+    spawn(async move {
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let endpoint = Arc::new(endpoint);
+        let dataset_len = ctx.dataset.len();
+        let mut index: usize = 0;
+
+        while !interrupt_flag.load(Ordering::Relaxed) {
+            let data_index = index % dataset_len;
+            index += 1;
+
+            let error_count = Arc::clone(&error_count);
+            if let Some(threshold) = early_stop_error_threshold {
+                if threshold <= error_count.load(Ordering::Relaxed) {
+                    tracing::error!(
+                        "Request error accumulated more than threshold: {}, exit client",
+                        threshold
+                    );
+                    interrupt_flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+
+            // Inter-arrival delay
+            sleep(next_interarrival(&arrival, rate)).await;
+
+            let client = http_client.clone();
+            let endpoint = endpoint.clone();
+            let response_sender = response_sender.clone();
+
+            let (prompt, input_length, output_length) = ctx.inflate(data_index);
+
+            let request_handle = spawn(async move {
+                let json_body = A::request_json_body(prompt, output_length, stream);
+                let s_time = get_timestamp();
+                match post_with_timeout::<A>(
+                    client,
+                    endpoint.as_str(),
+                    json_body.to_string(),
+                    Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
+                    stream,
+                )
+                .await
+                {
+                    Ok(mut metrics) => {
+                        let e_time = get_timestamp();
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), "0.000".to_string());
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+                        let span_time = e_time - s_time;
+                        metrics.insert("span_time".to_string(), format!("{span_time:.3}"));
+                        if output_length > 0
+                            && metrics.get("status").map(|s| s.starts_with('2')).unwrap_or(false)
+                        {
+                            let normalized_e2e = span_time / output_length as f64;
+                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
+                        }
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(RequestError::Timeout) => {
+                        let e_time = get_timestamp();
+                        let mut metrics = BTreeMap::<String, String>::from([(
+                            "status".to_owned(), "timeout".to_owned(),
+                        )]);
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), "0.000".to_string());
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+                        let span_time = e_time - s_time;
+                        metrics.insert("span_time".to_string(), format!("{span_time:.3}"));
+                        response_sender.send(metrics).unwrap();
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::Other(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::StreamErr(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) stream error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+
+            tx.send_async(request_handle).await.unwrap();
+        }
+        tracing::debug!("Random-process requester exited.");
+    });
+    handle
+}
+
+// ── Feedback mode (control-theory closed-loop) ──────────────────────────────
+
+pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
+    endpoint: String,
+    ctx: RequestContext,
+    target_bs: usize,
+    response_sender: flume::Sender<BTreeMap<String, String>>,
+    interrupt_flag: Arc<AtomicBool>,
+    ttft_slo: f32,
+    tpot_slo: f32,
+    stream: bool,
+    early_stop_error_threshold: Option<u32>,
+) -> JoinHandle<Result<(), i32>> {
+    init_basetime();
+
+    println!(
+        "Feedback mode: target_bs={}, dataset_size={}",
+        target_bs,
+        ctx.dataset.len()
+    );
+
+    let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
+    let handle = spawn(async move {
+        wait_all(rx, flag).await;
+        let a = RETURNCODE.load(Ordering::Relaxed);
+        if a == 0 { Ok(()) } else { Err(a) }
+    });
+
+    let error_count = Arc::new(AtomicU32::new(0));
+
+    spawn(async move {
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let endpoint = Arc::new(endpoint);
+
+        // Semaphore-based batch size control (junction function for BS metric)
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(target_bs));
+        let data_iter = ctx.dataset.iter();
+
+        for data_index in data_iter {
+            if interrupt_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let error_count = Arc::clone(&error_count);
+            if let Some(threshold) = early_stop_error_threshold {
+                if threshold <= error_count.load(Ordering::Relaxed) {
+                    tracing::error!(
+                        "Request error accumulated more than threshold: {}, exit client",
+                        threshold
+                    );
+                    interrupt_flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+
+            // Junction: block until in_flight < target_bs
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
+            let client = http_client.clone();
+            let endpoint = endpoint.clone();
+            let response_sender = response_sender.clone();
+
+            let (prompt, input_length, output_length) = ctx.inflate(data_index);
+
+            let request_handle = spawn(async move {
+                let _permit = permit; // held for task lifetime, released on drop
+                let json_body = A::request_json_body(prompt, output_length, stream);
+                let s_time = get_timestamp();
+                match post_with_timeout::<A>(
+                    client,
+                    endpoint.as_str(),
+                    json_body.to_string(),
+                    Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
+                    stream,
+                )
+                .await
+                {
+                    Ok(mut metrics) => {
+                        let e_time = get_timestamp();
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), "0.000".to_string());
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+                        let span_time = e_time - s_time;
+                        metrics.insert("span_time".to_string(), format!("{span_time:.3}"));
+                        if output_length > 0
+                            && metrics.get("status").map(|s| s.starts_with('2')).unwrap_or(false)
+                        {
+                            let normalized_e2e = span_time / output_length as f64;
+                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
+                        }
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(RequestError::Timeout) => {
+                        let e_time = get_timestamp();
+                        let mut metrics = BTreeMap::<String, String>::from([(
+                            "status".to_owned(), "timeout".to_owned(),
+                        )]);
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), "0.000".to_string());
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+                        let span_time = e_time - s_time;
+                        metrics.insert("span_time".to_string(), format!("{span_time:.3}"));
+                        response_sender.send(metrics).unwrap();
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::Other(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::StreamErr(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) stream error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+
+            tx.send_async(request_handle).await.unwrap();
+        }
+
+        // Wait for all in-flight requests to drain
+        let _ = semaphore.acquire_many(target_bs as u32).await;
+        interrupt_flag.store(true, Ordering::SeqCst);
+        tracing::info!("Feedback requester: all {} entries consumed.", ctx.dataset.len());
+    });
     handle
 }
 

@@ -11,7 +11,11 @@ use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TGIApi, MODEL_NAME},
     dataset::LLMTrace,
-    requester::{report_loop, spawn_request_loop_debug, spawn_request_loop_with_timestamp},
+    requester::{
+        report_loop, spawn_request_loop_debug, spawn_request_loop_feedback,
+        spawn_request_loop_random_process, spawn_request_loop_with_timestamp, ArrivalProcess,
+        RequestContext,
+    },
 };
 #[cfg(not(feature = "prompt-text-plain"))]
 use request_sim::{
@@ -146,9 +150,70 @@ struct Args {
     /// Only requests with trace timestamp <= this value will be replayed.
     #[clap(long)]
     end_time: Option<u64>,
+
+    /// Request dispatch mode: trace-replay, random-process, or feedback.
+    #[clap(long, default_value = "trace-replay")]
+    mode: String,
+
+    /// Arrival process for random-process mode: poisson or uniform.
+    #[clap(long)]
+    arrival: Option<String>,
+
+    /// Request rate (requests/second) for random-process mode.
+    #[clap(long)]
+    rate: Option<f64>,
+
+    /// Target batch size (concurrent in-flight requests) for feedback mode.
+    /// BS=1 is queueing-theory closed-loop (send one, await, send next).
+    #[clap(long, default_value_t = 1)]
+    target_bs: usize,
+}
+
+fn validate_config(args: &Args) {
+    match args.mode.as_str() {
+        "trace-replay" => {
+            assert!(
+                args.scale_factor.is_some(),
+                "--scale-factor is required for trace-replay mode"
+            );
+        }
+        "random-process" => {
+            assert!(
+                args.arrival.is_some(),
+                "--arrival (poisson|uniform) is required for random-process mode"
+            );
+            assert!(
+                args.rate.is_some(),
+                "--rate is required for random-process mode"
+            );
+            let arrival = args.arrival.as_ref().unwrap();
+            assert!(
+                arrival == "poisson" || arrival == "uniform",
+                "--arrival must be 'poisson' or 'uniform', got '{arrival}'"
+            );
+            let rate = args.rate.unwrap();
+            assert!(rate > 0.0, "--rate must be positive, got {rate}");
+        }
+        "feedback" => {
+            assert!(
+                args.target_bs >= 1,
+                "--target-bs must be >= 1, got {}",
+                args.target_bs
+            );
+        }
+        other => panic!(
+            "Invalid --mode: '{other}'. Must be trace-replay, random-process, or feedback"
+        ),
+    }
+    // release-with-debug always uses trace-replay
+    if args.api.to_lowercase() == "release-with-debug" && args.mode != "trace-replay" {
+        panic!("--api release-with-debug only supports --mode trace-replay");
+    }
 }
 
 async fn async_main(args: Args) -> Result<(), i32> {
+    validate_config(&args);
+
     let Args {
         #[cfg(not(feature = "prompt-text-plain"))]
         tokenizer,
@@ -179,6 +244,10 @@ async fn async_main(args: Args) -> Result<(), i32> {
         cache_path,
         begin_time,
         end_time,
+        mode,
+        arrival,
+        rate,
+        target_bs,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -307,24 +376,64 @@ async fn async_main(args: Args) -> Result<(), i32> {
 
     let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
 
+    // Build RequestContext for new mode functions
+    let ctx = RequestContext {
+        dataset: dataset.clone(),
+        #[cfg(not(feature = "prompt-text-plain"))]
+        token_sampler: token_sampler.clone(),
+        prompt_cache: prompt_cache.clone(),
+    };
+
+    // Parse arrival process (for random-process mode)
+    let arrival_process = arrival.as_deref().map(|a| match a {
+        "poisson" => ArrivalProcess::Poisson,
+        "uniform" => ArrivalProcess::Uniform,
+        _ => unreachable!(), // validated in validate_config
+    });
+
+    // Set up API globals
+    let api_lower = api.to_lowercase();
+    if api_lower == "openai" || api_lower == "aibrix" {
+        MODEL_NAME.get_or_init(|| model_name.unwrap());
+    }
+    if api_lower == "aibrix" {
+        AIBRIX_ROUTE_STRATEGY.get_or_init(|| {
+            let valid_route_strategies = ["prefix-cache", "prefix-cache-preble", "throughput"];
+            let route_strategy = aibrix_route.unwrap();
+            assert!(
+                valid_route_strategies.contains(&route_strategy.as_str()),
+                "Unsupported AIBrix routing strategy: {}",
+                route_strategy.as_str()
+            );
+            route_strategy
+        });
+    }
+
     tracing::info!("Client start");
+
+    // Termination logging
+    match mode.as_str() {
+        "random-process" => {
+            tracing::info!(
+                "random-process mode: cyclic dispatch, will terminate after {}s timeout",
+                time_in_secs
+            );
+        }
+        "feedback" => {
+            tracing::info!(
+                "feedback mode: target_bs={}, will terminate when dataset ({} entries) exhausted or {}s timeout",
+                target_bs,
+                dataset.len(),
+                time_in_secs
+            );
+        }
+        _ => {} // trace-replay: existing logging in spawn function is sufficient
+    }
+
     let time_range = (begin_time, end_time);
-    let requester_handle = match api.to_lowercase().as_str() {
-        "tgi" => spawn_request_loop_with_timestamp::<TGIApi>(
-            endpoint,
-            dataset,
-            #[cfg(not(feature = "prompt-text-plain"))]
-            token_sampler,
-            scale_factor.unwrap(),
-            tx,
-            interrupt_flag.clone(),
-            ttft_slo,
-            tpot_slo,
-            stream,
-            early_stop_error_threshold,
-            prompt_cache,
-            time_range,
-        ),
+
+    // Dispatch: first resolve API type parameter, then match mode
+    let requester_handle = match api_lower.as_str() {
         "release-with-debug" => spawn_request_loop_debug::<TGIApi>(
             endpoint,
             dataset,
@@ -336,9 +445,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
             prompt_cache,
             time_range,
         ),
-        "openai" => {
-            MODEL_NAME.get_or_init(|| model_name.unwrap());
-            spawn_request_loop_with_timestamp::<OpenAIApi>(
+        "tgi" => match mode.as_str() {
+            "trace-replay" => spawn_request_loop_with_timestamp::<TGIApi>(
                 endpoint,
                 dataset,
                 #[cfg(not(feature = "prompt-text-plain"))]
@@ -352,21 +460,34 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
                 prompt_cache,
                 time_range,
-            )
-        }
-        "aibrix" => {
-            MODEL_NAME.get_or_init(|| model_name.unwrap());
-            AIBRIX_ROUTE_STRATEGY.get_or_init(|| {
-                let valid_route_strategies = ["prefix-cache", "prefix-cache-preble", "throughput"];
-                let route_strategy = aibrix_route.unwrap();
-                assert!(
-                    valid_route_strategies.contains(&route_strategy.as_str()),
-                    "Unsupported AIBrix routing strategy: {}",
-                    route_strategy.as_str()
-                );
-                route_strategy
-            });
-            spawn_request_loop_with_timestamp::<OpenAIApi>(
+            ),
+            "random-process" => spawn_request_loop_random_process::<TGIApi>(
+                endpoint,
+                ctx,
+                arrival_process.unwrap(),
+                rate.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            "feedback" => spawn_request_loop_feedback::<TGIApi>(
+                endpoint,
+                ctx,
+                target_bs,
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            _ => unreachable!(),
+        },
+        "openai" => match mode.as_str() {
+            "trace-replay" => spawn_request_loop_with_timestamp::<OpenAIApi>(
                 endpoint,
                 dataset,
                 #[cfg(not(feature = "prompt-text-plain"))]
@@ -380,8 +501,73 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
                 prompt_cache,
                 time_range,
-            )
-        }
+            ),
+            "random-process" => spawn_request_loop_random_process::<OpenAIApi>(
+                endpoint,
+                ctx,
+                arrival_process.unwrap(),
+                rate.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            "feedback" => spawn_request_loop_feedback::<OpenAIApi>(
+                endpoint,
+                ctx,
+                target_bs,
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            _ => unreachable!(),
+        },
+        "aibrix" => match mode.as_str() {
+            "trace-replay" => spawn_request_loop_with_timestamp::<OpenAIApi>(
+                endpoint,
+                dataset,
+                #[cfg(not(feature = "prompt-text-plain"))]
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+                prompt_cache,
+                time_range,
+            ),
+            "random-process" => spawn_request_loop_random_process::<OpenAIApi>(
+                endpoint,
+                ctx,
+                arrival_process.unwrap(),
+                rate.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            "feedback" => spawn_request_loop_feedback::<OpenAIApi>(
+                endpoint,
+                ctx,
+                target_bs,
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            _ => unreachable!(),
+        },
         _ => unimplemented!("Unsupported protocol type"),
     };
     let reporter_handle = spawn(report_loop(output_file, summary_file, rx));
