@@ -6,10 +6,10 @@ use std::sync::{
 };
 
 use clap::Parser;
-use request_sim::apis::{OpenAIApi, SglApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
+use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
 use request_sim::cache::PromptCache;
 use request_sim::{
-    apis::{TGIApi, MODEL_NAME},
+    apis::{TgiApi, MODEL_NAME},
     dataset::LLMTrace,
     requester::{
         report_loop, spawn_request_loop_debug, spawn_request_loop_feedback,
@@ -434,7 +434,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
 
     // Dispatch: first resolve API type parameter, then match mode
     let requester_handle = match api_lower.as_str() {
-        "release-with-debug" => spawn_request_loop_debug::<TGIApi>(
+        "release-with-debug" => spawn_request_loop_debug::<TgiApi>(
             endpoint,
             dataset,
             #[cfg(not(feature = "prompt-text-plain"))]
@@ -446,7 +446,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             time_range,
         ),
         "tgi" => match mode.as_str() {
-            "trace-replay" => spawn_request_loop_with_timestamp::<TGIApi>(
+            "trace-replay" => spawn_request_loop_with_timestamp::<TgiApi>(
                 endpoint,
                 dataset,
                 #[cfg(not(feature = "prompt-text-plain"))]
@@ -461,7 +461,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 prompt_cache,
                 time_range,
             ),
-            "random-process" => spawn_request_loop_random_process::<TGIApi>(
+            "random-process" => spawn_request_loop_random_process::<TgiApi>(
                 endpoint,
                 ctx,
                 arrival_process.unwrap(),
@@ -473,7 +473,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 stream,
                 early_stop_error_threshold,
             ),
-            "feedback" => spawn_request_loop_feedback::<TGIApi>(
+            "feedback" => spawn_request_loop_feedback::<TgiApi>(
                 endpoint,
                 ctx,
                 target_bs,
@@ -487,7 +487,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             _ => unreachable!(),
         },
         "openai" => match mode.as_str() {
-            "trace-replay" => spawn_request_loop_with_timestamp::<OpenAIApi>(
+            "trace-replay" => spawn_request_loop_with_timestamp::<OaiApi>(
                 endpoint,
                 dataset,
                 #[cfg(not(feature = "prompt-text-plain"))]
@@ -502,7 +502,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 prompt_cache,
                 time_range,
             ),
-            "random-process" => spawn_request_loop_random_process::<OpenAIApi>(
+            "random-process" => spawn_request_loop_random_process::<OaiApi>(
                 endpoint,
                 ctx,
                 arrival_process.unwrap(),
@@ -514,7 +514,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 stream,
                 early_stop_error_threshold,
             ),
-            "feedback" => spawn_request_loop_feedback::<OpenAIApi>(
+            "feedback" => spawn_request_loop_feedback::<OaiApi>(
                 endpoint,
                 ctx,
                 target_bs,
@@ -528,7 +528,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             _ => unreachable!(),
         },
         "aibrix" => match mode.as_str() {
-            "trace-replay" => spawn_request_loop_with_timestamp::<OpenAIApi>(
+            "trace-replay" => spawn_request_loop_with_timestamp::<OaiApi>(
                 endpoint,
                 dataset,
                 #[cfg(not(feature = "prompt-text-plain"))]
@@ -543,7 +543,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 prompt_cache,
                 time_range,
             ),
-            "random-process" => spawn_request_loop_random_process::<OpenAIApi>(
+            "random-process" => spawn_request_loop_random_process::<OaiApi>(
                 endpoint,
                 ctx,
                 arrival_process.unwrap(),
@@ -555,7 +555,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 stream,
                 early_stop_error_threshold,
             ),
-            "feedback" => spawn_request_loop_feedback::<OpenAIApi>(
+            "feedback" => spawn_request_loop_feedback::<OaiApi>(
                 endpoint,
                 ctx,
                 target_bs,

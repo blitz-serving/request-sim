@@ -4,13 +4,13 @@ use reqwest::Response;
 
 use super::{LLMApi, RequestError, METRIC_PERCENTILES};
 use std::time::Duration;
-pub struct TGIApi;
+pub struct TgiApi;
 
 const DEFAULT_PERCENTILES: [u32; 3] = [90, 95, 99];
 
-impl Copy for TGIApi {}
+impl Copy for TgiApi {}
 
-impl Clone for TGIApi {
+impl Clone for TgiApi {
     fn clone(&self) -> Self {
         *self
     }
@@ -24,7 +24,7 @@ fn normalize_ms(value: &str) -> String {
 }
 
 #[async_trait::async_trait]
-impl LLMApi for TGIApi {
+impl LLMApi for TgiApi {
     const AIBRIX_PRIVATE_HEADER: bool = false;
 
     fn request_json_body(prompt: String, output_length: u64, _stream: bool) -> String {

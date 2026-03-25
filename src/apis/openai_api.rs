@@ -11,17 +11,17 @@ use tokio::{
 use tokio_util::io::StreamReader;
 
 #[derive(Copy, Clone)]
-pub struct OpenAIApi;
+pub struct OaiApi;
 
 const DEFAULT_PERCENTILES: [u32; 3] = [90, 95, 99];
 
 #[async_trait::async_trait]
-impl LLMApi for OpenAIApi {
+impl LLMApi for OaiApi {
     const AIBRIX_PRIVATE_HEADER: bool = false;
 
     fn request_json_body(prompt: String, output_length: u64, stream: bool) -> String {
         let json_body = json!({
-            "model": MODEL_NAME.get().unwrap().as_str(), // 可按需修改
+            "model": MODEL_NAME.get().unwrap().as_str(),
             "messages": [
                 {
                     "role": "user",
@@ -29,7 +29,7 @@ impl LLMApi for OpenAIApi {
                 }
             ],
             "stream": stream,
-            "min_tokens": output_length, // 标准的 openAI API 不支持，需测试引擎（如 vLLM）支持
+            "min_tokens": output_length,
             "max_tokens": output_length,
         });
 

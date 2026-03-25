@@ -7,12 +7,12 @@ use std::time::Duration;
 use super::{LLMApi, RequestError, MODEL_NAME};
 
 #[derive(Copy, Clone)]
-pub struct AIBrixApi;
+pub struct AbxApi;
 
 pub static AIBRIX_ROUTE_STRATEGY: OnceLock<String> = OnceLock::new();
 
 #[async_trait::async_trait]
-impl LLMApi for AIBrixApi {
+impl LLMApi for AbxApi {
     const AIBRIX_PRIVATE_HEADER: bool = true;
 
     fn request_json_body(prompt: String, output_length: u64, stream: bool) -> String {

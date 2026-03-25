@@ -10,10 +10,10 @@ pub mod openai_api;
 pub mod sgl_api;
 pub mod tgi_api;
 
-pub use aibrix_api::{AIBrixApi, AIBRIX_ROUTE_STRATEGY};
-pub use openai_api::OpenAIApi;
+pub use aibrix_api::{AbxApi, AIBRIX_ROUTE_STRATEGY};
+pub use openai_api::OaiApi;
 pub use sgl_api::SglApi;
-pub use tgi_api::TGIApi;
+pub use tgi_api::TgiApi;
 
 use std::time::Duration;
 
