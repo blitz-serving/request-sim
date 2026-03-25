@@ -5,13 +5,13 @@ Rust benchmark client for LLM inference endpoints. Supports three request dispat
 ## Build & Test
 
 ```bash
-cargo build --release -j64          # binary: target/release/client
+cargo build --release -j64          # binary: target/release/request-sim
 cargo build --release --bin mock_server  # test echo server
 ```
 
 **Validate without HTTP** (debug mode checks inflate() token counts):
 ```bash
-./client --mode trace-replay --api release-with-debug --dataset bailian --dataset-path trace.jsonl \
+./request-sim --mode trace-replay --api release-with-debug --dataset bailian --dataset-path trace.jsonl \
   --tokenizer tokenizer.json --tokenizer-config tokenizer_config.json \
   --scale-factor 1.0 --endpoint unused --time-in-secs 30
 ```

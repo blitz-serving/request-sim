@@ -10,7 +10,7 @@ edition = "2021"
 # path = "src/trace_generator.rs"
 
 [[bin]]
-name = "client"
+name = "request-sim"
 path = "src/client.rs"
 
 [[bin]]

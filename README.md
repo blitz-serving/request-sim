@@ -58,7 +58,7 @@ Controlled by `--mode` (default: `trace-replay`).
 Replays requests at the original trace timestamps, scaled by `--scale-factor`.
 
 ```bash
-client --mode trace-replay \
+request-sim --mode trace-replay \
   --scale-factor 1.5 \
   --dataset bailian --dataset-path trace.jsonl \
   --api openai --endpoint http://localhost:8080/v1/chat/completions \
@@ -74,7 +74,7 @@ Arrival times drawn from a stochastic process. Cycles through dataset entries in
 
 ```bash
 # Poisson arrivals at 10 req/s
-client --mode random-process \
+request-sim --mode random-process \
   --arrival poisson --rate 10.0 \
   --dataset bailian --dataset-path trace.jsonl \
   --api openai --endpoint http://localhost:8080/v1/chat/completions \
@@ -82,7 +82,7 @@ client --mode random-process \
   --time-in-secs 120
 
 # Fixed-interval (uniform) arrivals at 5 req/s
-client --mode random-process \
+request-sim --mode random-process \
   --arrival uniform --rate 5.0 \
   ...
 ```
@@ -95,14 +95,14 @@ Control-theory closed-loop. Maintains `--target-bs` concurrent in-flight request
 
 ```bash
 # Closed-loop, one-at-a-time (BS=1)
-client --mode feedback \
+request-sim --mode feedback \
   --target-bs 1 \
   --dataset bailian --dataset-path trace.jsonl \
   --api tgi --endpoint http://localhost:8080/generate \
   --time-in-secs 600
 
 # Maintain 4 concurrent in-flight requests
-client --mode feedback \
+request-sim --mode feedback \
   --target-bs 4 \
   ...
 ```
@@ -135,7 +135,7 @@ Build in release mode from the repository root:
 ```bash
 cargo build \
   -p request-sim \
-  --bin client \
+  --bin request-sim \
   --release \
   -j64
 ```
@@ -143,7 +143,7 @@ cargo build \
 The executable will be generated at:
 
 ```
-path/to/your/repo/target/release/client
+path/to/your/repo/target/release/request-sim
 ```
 
 
@@ -155,7 +155,7 @@ path/to/your/repo/target/release/client
 vllm serve /path/to/Qwen2.5-7B-Instruct --port 8080
 
 # Now init trace-replayer
-path/to/your/repo/target/release/client \
+path/to/your/repo/target/release/request-sim \
   --mode trace-replay \
   --tokenizer /path/to/Qwen2.5-7B-Instruct/tokenizer.json \
   --tokenizer-config /path/to/Qwen2.5-7B-Instruct/tokenizer_config.json \
@@ -167,7 +167,7 @@ path/to/your/repo/target/release/client \
   --time-in-secs 1200 \
   --num-producer 32 \
   --channel-capacity 40960 \
-  --output-path /path/to/client.jsonl \
+  --output-path /path/to/output.jsonl \
   --model-name <MODEL_NAME IN VLLM>
 ```
 
