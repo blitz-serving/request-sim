@@ -1,4 +1,5 @@
 use super::{LLMApi, RequestError, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME};
+use crate::dataset::PromptPayload;
 use futures_util::TryStreamExt;
 use reqwest::Response;
 use serde_json::json;
@@ -19,15 +20,14 @@ const DEFAULT_PERCENTILES: [u32; 3] = [90, 95, 99];
 impl LLMApi for SglApi {
     const AIBRIX_PRIVATE_HEADER: bool = false;
 
-    fn request_json_body(prompt: String, output_length: u64, stream: bool) -> String {
+    fn request_json_body(prompt: PromptPayload, output_length: u64, stream: bool) -> String {
+        let messages = match prompt {
+            PromptPayload::Content(text) => json!([{"role": "user", "content": text}]),
+            PromptPayload::Messages(val) => val,
+        };
         let mut body = json!({
             "model": MODEL_NAME.get().unwrap().as_str(),
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "stream": stream,
         });
         if output_length > 0 {

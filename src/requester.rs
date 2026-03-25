@@ -20,6 +20,7 @@ use tokio::{
 
 use crate::apis::METRIC_PERCENTILES;
 use crate::cache::PromptCache;
+use crate::dataset::PromptPayload;
 use crate::{
     apis::{LLMApi, RequestError, AIBRIX_ROUTE_STRATEGY},
     dataset::LLMTrace,
@@ -54,7 +55,7 @@ pub struct RequestContext {
 impl RequestContext {
     /// Inflate prompt for a dataset entry, using the cache if available,
     /// otherwise delegating to the dataset's inflate method.
-    pub fn inflate(&self, index: usize) -> (String, u64, u64) {
+    pub fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
         if let Some(ref cache) = self.prompt_cache {
             let entry = cache.get(index);
             (entry.prompt.clone(), entry.input_length, entry.output_length)
@@ -552,13 +553,17 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
 
-            let (sample, input_length, output_length) =
+            let (payload, input_length, output_length) =
                 if let Some(ref cache) = prompt_cache {
                     let entry = cache.get(data_index);
                     (entry.prompt.clone(), entry.input_length, entry.output_length)
                 } else {
                     dataset.inflate(data_index, token_sampler.as_ref())
                 };
+            let sample = match payload {
+                PromptPayload::Content(s) => s,
+                _ => panic!("debug mode requires Content prompt (hashed dataset)"),
+            };
 
             let request_handle = spawn(async move {
                 let s_time = get_timestamp();

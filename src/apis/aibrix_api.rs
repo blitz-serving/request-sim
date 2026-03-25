@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::{LLMApi, RequestError, MAX_TOKENS_CAP, MODEL_NAME};
+use crate::dataset::PromptPayload;
 
 #[derive(Copy, Clone)]
 pub struct AbxApi;
@@ -15,15 +16,14 @@ pub static AIBRIX_ROUTE_STRATEGY: OnceLock<String> = OnceLock::new();
 impl LLMApi for AbxApi {
     const AIBRIX_PRIVATE_HEADER: bool = true;
 
-    fn request_json_body(prompt: String, output_length: u64, stream: bool) -> String {
+    fn request_json_body(prompt: PromptPayload, output_length: u64, stream: bool) -> String {
+        let messages = match prompt {
+            PromptPayload::Content(text) => json!([{"role": "user", "content": text}]),
+            PromptPayload::Messages(val) => val,
+        };
         let mut body = json!({
             "model": MODEL_NAME.get().unwrap().as_str(),
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
+            "messages": messages,
             "stream": stream,
         });
         if output_length > 0 {

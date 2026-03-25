@@ -2,13 +2,13 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::dataset::LLMTrace;
+use crate::dataset::{LLMTrace, PromptPayload};
 #[cfg(not(feature = "prompt-text-plain"))]
 use crate::token_sampler::TokenSampler;
 
 /// A single pre-generated prompt with its metadata.
 pub struct CachedPrompt {
-    pub prompt: String,
+    pub prompt: PromptPayload,
     pub input_length: u64,
     pub output_length: u64,
 }
@@ -199,15 +199,33 @@ impl PromptCache {
             reader.read_exact(&mut buf8)?;
             let output_length = u64::from_le_bytes(buf8);
 
+            let mut tag = [0u8; 1];
+            reader.read_exact(&mut tag)?;
+
             reader.read_exact(&mut buf8)?;
             let prompt_len = u64::from_le_bytes(buf8) as usize;
 
             let mut prompt_bytes = vec![0u8; prompt_len];
             reader.read_exact(&mut prompt_bytes)?;
 
-            let prompt = String::from_utf8(prompt_bytes).map_err(|e| {
+            let payload_str = String::from_utf8(prompt_bytes).map_err(|e| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
             })?;
+
+            let prompt = match tag[0] {
+                0 => PromptPayload::Content(payload_str),
+                1 => {
+                    let val: serde_json::Value = serde_json::from_str(&payload_str)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    PromptPayload::Messages(val)
+                }
+                t => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown PromptPayload tag: {t}"),
+                    ));
+                }
+            };
 
             entries.push(CachedPrompt {
                 prompt,
@@ -232,9 +250,14 @@ impl PromptCache {
         for entry in &self.entries {
             writer.write_all(&entry.input_length.to_le_bytes())?;
             writer.write_all(&entry.output_length.to_le_bytes())?;
-            let bytes = entry.prompt.as_bytes();
+
+            let (tag, bytes): (u8, Vec<u8>) = match &entry.prompt {
+                PromptPayload::Content(s) => (0, s.as_bytes().to_vec()),
+                PromptPayload::Messages(v) => (1, serde_json::to_vec(v).unwrap()),
+            };
+            writer.write_all(&[tag])?;
             writer.write_all(&(bytes.len() as u64).to_le_bytes())?;
-            writer.write_all(bytes)?;
+            writer.write_all(&bytes)?;
         }
         writer.flush()?;
 

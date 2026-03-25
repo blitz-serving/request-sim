@@ -2,6 +2,8 @@ use reqwest::Response;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use crate::dataset::PromptPayload;
+
 pub static MODEL_NAME: OnceLock<String> = OnceLock::new();
 pub static METRIC_PERCENTILES: OnceLock<Vec<u32>> = OnceLock::new();
 pub static MAX_TOKENS_CAP: OnceLock<Option<u64>> = OnceLock::new();
@@ -27,7 +29,7 @@ pub enum RequestError {
 #[async_trait::async_trait]
 pub trait LLMApi: Copy + Clone + Send + Sync {
     const AIBRIX_PRIVATE_HEADER: bool;
-    fn request_json_body(prompt: String, output_length: u64, stream: bool) -> String;
+    fn request_json_body(prompt: PromptPayload, output_length: u64, stream: bool) -> String;
     async fn parse_response(
         response: Response,
         stream: bool,

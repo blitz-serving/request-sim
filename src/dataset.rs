@@ -12,7 +12,18 @@ use crate::SpinRwLock;
 use chrono::NaiveDateTime;
 use request_sim_macros::prompt_text;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::{instrument, Level};
+
+/// Describes the format of the prompt returned by `inflate()`.
+///
+/// - `Content`: raw text to be wrapped in `[{"role":"user","content":...}]` by the API layer.
+/// - `Messages`: pre-structured messages array, used directly as the `"messages"` value.
+#[derive(Clone, Debug)]
+pub enum PromptPayload {
+    Content(String),
+    Messages(serde_json::Value),
+}
 
 /// jsonl of Bailian
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,10 +95,10 @@ pub trait LLMTrace: Send + Sync {
     fn timestamp(&self, index: usize) -> u64;
 
     #[cfg(not(feature = "prompt-text-plain"))]
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64);
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (PromptPayload, u64, u64);
 
     #[cfg(feature = "prompt-text-plain")]
-    fn inflate(&self, index: usize) -> (String, u64, u64);
+    fn inflate(&self, index: usize) -> (PromptPayload, u64, u64);
 
     fn iter(&self) -> DataIter;
     fn rps(&self) -> f64;
@@ -148,7 +159,7 @@ impl LLMTrace for BailianDataset {
     }
 
     #[instrument(skip_all, target = "inflate", fields(chat_id = index), level = Level::INFO)]
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (PromptPayload, u64, u64) {
         // NOTE: the last block hash may be hashed onto a partially filled block
         const BLOCK_SIZE: usize = 16;
         unsafe {
@@ -189,7 +200,7 @@ impl LLMTrace for BailianDataset {
                 self.rwlock.write_unlock();
             }
 
-            (prompt, (*data_item).input_length, (*data_item).output_length)
+            (PromptPayload::Content(prompt), (*data_item).input_length, (*data_item).output_length)
         }
     }
 }
@@ -248,7 +259,7 @@ impl LLMTrace for MooncakeDataset {
         (self.items[index].timestamp * 1000.) as u64
     }
 
-    fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64) {
+    fn inflate(&self, index: usize, ts: &TokenSampler) -> (PromptPayload, u64, u64) {
         // NOTE: the last block hash may be hashed onto a partially filled block
         const BLOCK_SIZE: usize = 512;
         unsafe {
@@ -290,7 +301,7 @@ impl LLMTrace for MooncakeDataset {
                 self.rwlock.write_unlock();
             }
 
-            (prompt, (*data_item).input_length, (*data_item).output_length)
+            (PromptPayload::Content(prompt), (*data_item).input_length, (*data_item).output_length)
         }
     }
 }
@@ -312,6 +323,8 @@ struct MiniMaxRawItem {
 #[cfg(feature = "prompt-text-plain")]
 #[derive(Debug, Deserialize)]
 struct MiniMaxDialogueMessage {
+    #[serde(default)]
+    role: String,
     #[serde(default)]
     text: String,
 }
@@ -335,7 +348,7 @@ struct MiniMaxOutputEntry {
 #[cfg(feature = "prompt-text-plain")]
 struct MiniMaxParsedItem {
     timestamp_ms: u64,
-    input_text: String,
+    prompt: PromptPayload,
     input_length: u64,
     output_length: u64,
 }
@@ -400,20 +413,22 @@ impl LLMTrace for MiniMaxDataset {
                 serde_json::from_str(&raw.dialogue_input)
                     .unwrap_or_else(|e| panic!("Failed to parse dialogue_input: {e}"));
 
-            // Concatenate all message texts
-            let input_text: String = dialogue
+            // Build structured messages array, preserving roles
+            let messages: Vec<serde_json::Value> = dialogue
                 .data
                 .iter()
-                .map(|msg| msg.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
+                .map(|msg| {
+                    let role = if msg.role.is_empty() { "user" } else { &msg.role };
+                    json!({"role": role, "content": msg.text})
+                })
+                .collect();
 
             // Convert nanoseconds to relative milliseconds
             let timestamp_ms = (raw.server_timestamp - base_ts) / 1_000_000;
 
             self.items.push(MiniMaxParsedItem {
                 timestamp_ms,
-                input_text,
+                prompt: PromptPayload::Messages(json!(messages)),
                 input_length,
                 output_length,
             });
@@ -454,9 +469,9 @@ impl LLMTrace for MiniMaxDataset {
         self.items[index].timestamp_ms
     }
 
-    fn inflate(&self, index: usize) -> (String, u64, u64) {
+    fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
         let item = &self.items[index];
-        (item.input_text.clone(), item.input_length, item.output_length)
+        (item.prompt.clone(), item.input_length, item.output_length)
     }
 }
 
@@ -520,7 +535,7 @@ impl LLMTrace for PlainTextDataset {
         index as u64
     }
 
-    fn inflate(&self, index: usize) -> (String, u64, u64) {
-        (self.items[index].clone(), 0, 0)
+    fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
+        (PromptPayload::Content(self.items[index].clone()), 0, 0)
     }
 }
