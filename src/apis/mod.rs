@@ -7,10 +7,12 @@ pub static METRIC_PERCENTILES: OnceLock<Vec<u32>> = OnceLock::new();
 
 pub mod aibrix_api;
 pub mod openai_api;
+pub mod sgl_api;
 pub mod tgi_api;
 
 pub use aibrix_api::{AIBrixApi, AIBRIX_ROUTE_STRATEGY};
 pub use openai_api::OpenAIApi;
+pub use sgl_api::SglApi;
 pub use tgi_api::TGIApi;
 
 use std::time::Duration;

@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use clap::Parser;
-use request_sim::apis::{OpenAIApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
+use request_sim::apis::{OpenAIApi, SglApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
 use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TGIApi, MODEL_NAME},
@@ -393,7 +393,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
 
     // Set up API globals
     let api_lower = api.to_lowercase();
-    if api_lower == "openai" || api_lower == "aibrix" {
+    if api_lower == "openai" || api_lower == "aibrix" || api_lower == "sgl" {
         MODEL_NAME.get_or_init(|| model_name.unwrap());
     }
     if api_lower == "aibrix" {
@@ -556,6 +556,47 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
             ),
             "feedback" => spawn_request_loop_feedback::<OpenAIApi>(
+                endpoint,
+                ctx,
+                target_bs,
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            _ => unreachable!(),
+        },
+        "sgl" => match mode.as_str() {
+            "trace-replay" => spawn_request_loop_with_timestamp::<SglApi>(
+                endpoint,
+                dataset,
+                #[cfg(not(feature = "prompt-text-plain"))]
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+                prompt_cache,
+                time_range,
+            ),
+            "random-process" => spawn_request_loop_random_process::<SglApi>(
+                endpoint,
+                ctx,
+                arrival_process.unwrap(),
+                rate.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            "feedback" => spawn_request_loop_feedback::<SglApi>(
                 endpoint,
                 ctx,
                 target_bs,
