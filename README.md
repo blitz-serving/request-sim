@@ -26,7 +26,11 @@ while using only **~30 CPU threads**, which is sufficient for stress testing a
 
 ## Features
 
-- Replay anonymous traces and construct prompts based on block hashes
+- **Three request dispatch modes**:
+  - **Trace replay**: replay anonymous production traces at recorded timestamps
+  - **Random process**: stochastic arrival times (Poisson or uniform distribution)
+  - **Feedback**: control-theory closed-loop with configurable batch size
+- Construct prompts based on block hashes (preserving KVCache hit patterns)
 - End-to-end request replay using OpenAI and TGI compatible APIs
 - Exports results in **JSONL** format for post-processing
 - High throughput with low resource usage:
@@ -43,6 +47,67 @@ As long as the backend supports these APIs, we can use the trace replayer to rep
 - **OpenAI API**: `http://endpoint:port/v1/chat/completion` (non-streaming)
 - **TGI (Text Generation Inference)**: `http://endpoint:port/generate` (non-streaming)
 - **AIBrix**
+
+
+## Request Modes
+
+Controlled by `--mode` (default: `trace-replay`).
+
+### trace-replay (default)
+
+Replays requests at the original trace timestamps, scaled by `--scale-factor`.
+
+```bash
+client --mode trace-replay \
+  --scale-factor 1.5 \
+  --dataset bailian --dataset-path trace.jsonl \
+  --api openai --endpoint http://localhost:8080/v1/chat/completions \
+  --model-name Qwen2.5-7B-Instruct \
+  --time-in-secs 600
+```
+
+**Required**: `--scale-factor`. **Optional**: `--begin-time`, `--end-time` (filter trace window).
+
+### random-process
+
+Arrival times drawn from a stochastic process. Cycles through dataset entries indefinitely until `--time-in-secs` elapses.
+
+```bash
+# Poisson arrivals at 10 req/s
+client --mode random-process \
+  --arrival poisson --rate 10.0 \
+  --dataset bailian --dataset-path trace.jsonl \
+  --api openai --endpoint http://localhost:8080/v1/chat/completions \
+  --model-name Qwen2.5-7B-Instruct \
+  --time-in-secs 120
+
+# Fixed-interval (uniform) arrivals at 5 req/s
+client --mode random-process \
+  --arrival uniform --rate 5.0 \
+  ...
+```
+
+**Required**: `--arrival` (poisson | uniform), `--rate` (req/s, must be > 0).
+
+### feedback
+
+Control-theory closed-loop. Maintains `--target-bs` concurrent in-flight requests using a semaphore. When a request completes, the next one is sent immediately (if dataset entries remain).
+
+```bash
+# Closed-loop, one-at-a-time (BS=1)
+client --mode feedback \
+  --target-bs 1 \
+  --dataset bailian --dataset-path trace.jsonl \
+  --api tgi --endpoint http://localhost:8080/generate \
+  --time-in-secs 600
+
+# Maintain 4 concurrent in-flight requests
+client --mode feedback \
+  --target-bs 4 \
+  ...
+```
+
+**Optional**: `--target-bs` (default 1). BS=1 is the queueing-theory closed-loop special case. Terminates when all dataset entries are consumed.
 
 
 ## Getting Started
@@ -91,6 +156,7 @@ vllm serve /path/to/Qwen2.5-7B-Instruct --port 8080
 
 # Now init trace-replayer
 path/to/your/repo/target/release/client \
+  --mode trace-replay \
   --tokenizer /path/to/Qwen2.5-7B-Instruct/tokenizer.json \
   --tokenizer-config /path/to/Qwen2.5-7B-Instruct/tokenizer_config.json \
   --endpoint http://localhost:8080/v1/chat/completions \

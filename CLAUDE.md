@@ -1,6 +1,6 @@
 # request-sim
 
-Rust trace-replay benchmark client for LLM inference endpoints. Replays timestamped production traces against TGI / OpenAI / AIBrix APIs, measuring TTFT, TPOT, and throughput.
+Rust benchmark client for LLM inference endpoints. Supports three request dispatch modes: trace replay, stochastic arrival processes, and control-theory feedback loops. Measures TTFT, TPOT, and throughput against TGI / OpenAI / AIBrix APIs.
 
 ## Build & Test
 
@@ -11,10 +11,27 @@ cargo build --release --bin mock_server  # test echo server
 
 **Validate without HTTP** (debug mode checks inflate() token counts):
 ```bash
-./client --api release-with-debug --dataset bailian --dataset-path trace.jsonl \
+./client --mode trace-replay --api release-with-debug --dataset bailian --dataset-path trace.jsonl \
   --tokenizer tokenizer.json --tokenizer-config tokenizer_config.json \
   --scale-factor 1.0 --endpoint unused --time-in-secs 30
 ```
+
+## Request Modes
+
+Three modes controlled by `--mode`:
+
+| Mode | Arrival timing | Concurrency | Dataset cycling | Terminates on |
+|------|---------------|-------------|-----------------|---------------|
+| `trace-replay` (default) | Replays original trace timestamps, scaled by `--scale-factor` | Unbounded concurrent | No | Dataset exhausted OR `--time-in-secs` |
+| `random-process` | Stochastic: `--arrival poisson\|uniform`, rate from `--rate` | Unbounded concurrent | Yes (modular indexing) | `--time-in-secs` ONLY |
+| `feedback` | Closed-loop: next request sent when a slot frees | `--target-bs` concurrent (semaphore) | No | Dataset exhausted OR `--time-in-secs` |
+
+### Config constraints per mode
+
+- **trace-replay**: `--scale-factor` required. `--begin-time`/`--end-time` apply.
+- **random-process**: `--arrival` and `--rate` required. `--scale-factor`/`--begin-time`/`--end-time` ignored. Cyclic — always needs `--time-in-secs` to terminate.
+- **feedback**: `--target-bs` (default 1). BS=1 degenerates to queueing-theory closed-loop. `--scale-factor`/`--begin-time`/`--end-time` ignored.
+- **release-with-debug**: forces trace-replay mode only.
 
 ## Conventions
 
@@ -28,11 +45,11 @@ cargo build --release --bin mock_server  # test echo server
 
 ```
 src/
-  client.rs          CLI args + main orchestration (entry point)
+  client.rs          CLI args + validate_config() + mode dispatch (entry point)
   lib.rs             SpinLock, SpinRwLock, timeout_secs_upon_slo()
   dataset.rs         LLMTrace trait + BailianDataset (block=16) + MooncakeDataset (block=512)
   token_sampler.rs   TokenSampler: N producer threads → crossbeam channels → gen_string()
-  requester.rs       spawn_request_loop_with_timestamp(), report_loop(), SummaryStats
+  requester.rs       RequestContext, ArrivalProcess, spawn_request_loop_*, report_loop(), SummaryStats
   mock_server.rs     Hyper echo server (100-300ms random latency)
   apis/
     mod.rs           LLMApi trait, RequestError, global statics (MODEL_NAME, METRIC_PERCENTILES)
@@ -43,11 +60,14 @@ src/
 
 ## Architecture
 
-Pipeline: **Load → Warm → Replay → Report**
+Pipeline: **Load → Warm → Dispatch → Report**
 
-1. `client.rs` parses CLI args, loads dataset JSONL, creates `TokenSampler`
-2. `warm_cache()` pre-generates all unique token blocks into a HashMap (sets `is_warm=true`)
-3. `spawn_request_loop_*()` replays requests at trace timestamps (scaled by `--scale-factor`), calling `inflate()` (lock-free in warm mode) and spawning async HTTP tasks
+1. `client.rs` parses CLI args, validates config, loads dataset JSONL, creates `TokenSampler`
+2. Optionally pre-generates all prompts into a `PromptCache` (--cache tmpfs|file)
+3. Dispatch function selected by `--mode`:
+   - `trace-replay`: `spawn_request_loop_with_timestamp()` — replays at trace timestamps (scaled by `--scale-factor`), unbounded concurrent tasks
+   - `random-process`: `spawn_request_loop_random_process()` — stochastic inter-arrival sleep (Poisson/uniform), cycles dataset, concurrent tasks
+   - `feedback`: `spawn_request_loop_feedback()` — semaphore-gated batch size control (`--target-bs`), iterates dataset once
 4. `report_loop()` collects results via flume channel → writes per-request JSONL + percentile summary JSON
 
 ### Key design decisions
