@@ -2,7 +2,14 @@ pub mod apis;
 pub mod cache;
 pub mod dataset;
 pub mod requester;
+
+#[cfg(not(feature = "prompt-text-plain"))]
 pub mod token_sampler;
+
+#[cfg(all(feature = "prompt-text-plain", feature = "prompt-text-hashed"))]
+compile_error!(
+    "Features `prompt-text-plain` and `prompt-text-hashed` are mutually exclusive. Choose one."
+);
 
 use core::hint::spin_loop;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

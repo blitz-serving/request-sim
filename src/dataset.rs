@@ -6,8 +6,11 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{token_sampler::TokenSampler, SpinRwLock};
+#[cfg(not(feature = "prompt-text-plain"))]
+use crate::token_sampler::TokenSampler;
+use crate::SpinRwLock;
 use chrono::NaiveDateTime;
+use request_sim_macros::prompt_text;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, Level};
 
@@ -79,7 +82,13 @@ pub trait LLMTrace: Send + Sync {
     fn load(&mut self, path: &str);
     fn len(&self) -> usize;
     fn timestamp(&self, index: usize) -> u64;
+
+    #[cfg(not(feature = "prompt-text-plain"))]
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (String, u64, u64);
+
+    #[cfg(feature = "prompt-text-plain")]
+    fn inflate(&self, index: usize) -> (String, u64, u64);
+
     fn iter(&self) -> DataIter;
     fn rps(&self) -> f64;
 }
@@ -87,12 +96,14 @@ pub trait LLMTrace: Send + Sync {
 //
 // ============== BailianDataset ==============
 //
+#[prompt_text(hashed)]
 pub struct BailianDataset {
     items: Vec<BailianDataItem>,
     user_prompts: UnsafeCell<HashMap<u64, String>>,
     rwlock: SpinRwLock,
 }
 
+#[cfg(not(feature = "prompt-text-plain"))]
 impl BailianDataset {
     pub fn new() -> Self {
         Self {
@@ -103,9 +114,12 @@ impl BailianDataset {
     }
 }
 
+#[cfg(not(feature = "prompt-text-plain"))]
 unsafe impl Send for BailianDataset {}
+#[cfg(not(feature = "prompt-text-plain"))]
 unsafe impl Sync for BailianDataset {}
 
+#[prompt_text(hashed)]
 impl LLMTrace for BailianDataset {
     fn load(&mut self, path: &str) {
         let file = File::open(path).unwrap();
@@ -183,12 +197,14 @@ impl LLMTrace for BailianDataset {
 //
 // ============== MooncakeDataset ==============
 //
+#[prompt_text(hashed)]
 pub struct MooncakeDataset {
     items: Vec<MooncakeDataItem>,
     user_prompts: UnsafeCell<HashMap<u64, String>>,
     rwlock: SpinRwLock,
 }
 
+#[cfg(not(feature = "prompt-text-plain"))]
 impl MooncakeDataset {
     pub fn new() -> Self {
         Self {
@@ -199,9 +215,12 @@ impl MooncakeDataset {
     }
 }
 
+#[cfg(not(feature = "prompt-text-plain"))]
 unsafe impl Send for MooncakeDataset {}
+#[cfg(not(feature = "prompt-text-plain"))]
 unsafe impl Sync for MooncakeDataset {}
 
+#[prompt_text(hashed)]
 impl LLMTrace for MooncakeDataset {
     fn load(&mut self, path: &str) {
         let file = File::open(path).unwrap();
@@ -273,5 +292,165 @@ impl LLMTrace for MooncakeDataset {
 
             (prompt, (*data_item).input_length, (*data_item).output_length)
         }
+    }
+}
+
+//
+// ============== MiniMaxDataset ==============
+//
+
+/// Raw JSONL line from MiniMax traces.
+#[cfg(feature = "prompt-text-plain")]
+#[derive(Debug, Deserialize)]
+struct MiniMaxRawItem {
+    server_timestamp: u64,
+    dialogue_input: String,
+    dialogue_outputs: String,
+}
+
+/// A single message entry inside `dialogue_input.data[]`.
+#[cfg(feature = "prompt-text-plain")]
+#[derive(Debug, Deserialize)]
+struct MiniMaxDialogueMessage {
+    #[serde(default)]
+    text: String,
+}
+
+/// Wrapper for `dialogue_input` JSON (we only need the `data` array).
+#[cfg(feature = "prompt-text-plain")]
+#[derive(Debug, Deserialize)]
+struct MiniMaxDialogueInput {
+    data: Vec<MiniMaxDialogueMessage>,
+}
+
+/// A single output entry inside the `dialogue_outputs` JSON array.
+#[cfg(feature = "prompt-text-plain")]
+#[derive(Debug, Deserialize)]
+struct MiniMaxOutputEntry {
+    model_input_tokens_count: u64,
+    output_tokens_count: Vec<u64>,
+}
+
+/// Processed item ready for replay.
+#[cfg(feature = "prompt-text-plain")]
+struct MiniMaxParsedItem {
+    timestamp_ms: u64,
+    input_text: String,
+    input_length: u64,
+    output_length: u64,
+}
+
+#[prompt_text(plain)]
+pub struct MiniMaxDataset {
+    items: Vec<MiniMaxParsedItem>,
+}
+
+#[cfg(feature = "prompt-text-plain")]
+impl MiniMaxDataset {
+    pub fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+}
+
+#[cfg(feature = "prompt-text-plain")]
+unsafe impl Send for MiniMaxDataset {}
+#[cfg(feature = "prompt-text-plain")]
+unsafe impl Sync for MiniMaxDataset {}
+
+#[prompt_text(plain)]
+impl LLMTrace for MiniMaxDataset {
+    fn load(&mut self, path: &str) {
+        let file = File::open(path).unwrap();
+        let mut raw_items: Vec<MiniMaxRawItem> = Vec::new();
+
+        for line in BufReader::new(file).lines() {
+            let line = line.unwrap();
+            if line.trim().is_empty() {
+                continue;
+            }
+            let item: MiniMaxRawItem = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("Failed to parse MiniMax JSONL line: {e}"));
+            raw_items.push(item);
+        }
+
+        // Sort by timestamp
+        raw_items.sort_by_key(|item| item.server_timestamp);
+
+        let base_ts = raw_items.first().map(|i| i.server_timestamp).unwrap_or(0);
+
+        for raw in &raw_items {
+            // Parse dialogue_outputs: JSON array of output entries
+            let outputs: Vec<MiniMaxOutputEntry> =
+                serde_json::from_str(&raw.dialogue_outputs)
+                    .unwrap_or_else(|e| panic!("Failed to parse dialogue_outputs: {e}"));
+            let first_output = outputs.first().expect("dialogue_outputs array is empty");
+            let input_length = first_output.model_input_tokens_count;
+            let output_length = *first_output
+                .output_tokens_count
+                .first()
+                .expect("output_tokens_count array is empty");
+
+            // Parse dialogue_input: JSON object with `data` array of messages
+            let dialogue: MiniMaxDialogueInput =
+                serde_json::from_str(&raw.dialogue_input)
+                    .unwrap_or_else(|e| panic!("Failed to parse dialogue_input: {e}"));
+
+            // Concatenate all message texts
+            let input_text: String = dialogue
+                .data
+                .iter()
+                .map(|msg| msg.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // Convert nanoseconds to relative milliseconds
+            let timestamp_ms = (raw.server_timestamp - base_ts) / 1_000_000;
+
+            self.items.push(MiniMaxParsedItem {
+                timestamp_ms,
+                input_text,
+                input_length,
+                output_length,
+            });
+        }
+
+        tracing::info!(
+            "Loaded MiniMax dataset: {} items, time span {:.1}s",
+            self.items.len(),
+            self.items.last().map(|i| i.timestamp_ms as f64 / 1000.0).unwrap_or(0.0),
+        );
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn iter(&self) -> DataIter {
+        DataIter {
+            size: self.items.len(),
+            index: AtomicUsize::new(0),
+        }
+    }
+
+    fn rps(&self) -> f64 {
+        if self.items.len() < 2 {
+            return 1.0;
+        }
+        let duration_s = (self.items.last().unwrap().timestamp_ms
+            - self.items.first().unwrap().timestamp_ms) as f64
+            / 1000.0;
+        if duration_s <= 0.0 {
+            return 1.0;
+        }
+        self.items.len() as f64 / duration_s
+    }
+
+    fn timestamp(&self, index: usize) -> u64 {
+        self.items[index].timestamp_ms
+    }
+
+    fn inflate(&self, index: usize) -> (String, u64, u64) {
+        let item = &self.items[index];
+        (item.input_text.clone(), item.input_length, item.output_length)
     }
 }

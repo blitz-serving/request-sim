@@ -10,10 +10,17 @@ use request_sim::apis::{OpenAIApi, AIBRIX_ROUTE_STRATEGY, METRIC_PERCENTILES};
 use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TGIApi, MODEL_NAME},
-    dataset::{BailianDataset, LLMTrace, MooncakeDataset},
+    dataset::LLMTrace,
     requester::{report_loop, spawn_request_loop_debug, spawn_request_loop_with_timestamp},
+};
+#[cfg(not(feature = "prompt-text-plain"))]
+use request_sim::{
+    dataset::{BailianDataset, MooncakeDataset},
     token_sampler::TokenSampler,
 };
+#[cfg(feature = "prompt-text-plain")]
+use request_sim::dataset::MiniMaxDataset;
+#[cfg(not(feature = "prompt-text-plain"))]
 use tokenizers::Tokenizer;
 use tokio::spawn;
 use tracing::level_filters::LevelFilter;
@@ -25,17 +32,21 @@ use tracing_subscriber::{prelude::*, Layer, Registry};
 #[command(rename_all = "kebab-case")]
 struct Args {
     /// Path to tokenizer file.
+    #[cfg(not(feature = "prompt-text-plain"))]
     #[clap(long, required = true)]
     tokenizer: String,
 
+    #[cfg(not(feature = "prompt-text-plain"))]
     #[clap(long, required = true)]
     tokenizer_config: String,
 
     /// Number of producer threads in TokenSampler.
+    #[cfg(not(feature = "prompt-text-plain"))]
     #[clap(long)]
     num_producer: Option<usize>,
 
     /// Capacity of the channel between producers and consumers in TokenSampler.
+    #[cfg(not(feature = "prompt-text-plain"))]
     #[clap(long)]
     channel_capacity: Option<usize>,
 
@@ -139,9 +150,13 @@ struct Args {
 
 async fn async_main(args: Args) -> Result<(), i32> {
     let Args {
+        #[cfg(not(feature = "prompt-text-plain"))]
         tokenizer,
+        #[cfg(not(feature = "prompt-text-plain"))]
         tokenizer_config,
+        #[cfg(not(feature = "prompt-text-plain"))]
         num_producer,
+        #[cfg(not(feature = "prompt-text-plain"))]
         channel_capacity,
         threads: _,
         endpoint,
@@ -196,9 +211,12 @@ async fn async_main(args: Args) -> Result<(), i32> {
         .await
         .unwrap();
 
+    // --- Dataset dispatch ---
+    #[cfg(not(feature = "prompt-text-plain"))]
     let block_size;
 
     let dataset: Pin<Box<dyn LLMTrace>> = match dataset.to_lowercase().as_str() {
+        #[cfg(not(feature = "prompt-text-plain"))]
         "mooncake" => {
             let mut dataset: Pin<Box<MooncakeDataset>> = Box::pin(MooncakeDataset::new());
             block_size = 512;
@@ -209,6 +227,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             );
             dataset
         }
+        #[cfg(not(feature = "prompt-text-plain"))]
         "bailian" => {
             let mut dataset = Box::pin(BailianDataset::new());
             block_size = 16;
@@ -219,13 +238,24 @@ async fn async_main(args: Args) -> Result<(), i32> {
             );
             dataset
         }
+        #[cfg(feature = "prompt-text-plain")]
+        "minimax" => {
+            let mut dataset = Box::pin(MiniMaxDataset::new());
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided for minimax dataset!")
+                    .as_str(),
+            );
+            dataset
+        }
         _ => panic!("Invalid dataset type"),
     };
 
     let (tx, rx) = flume::unbounded();
     let interrupt_flag = Arc::new(AtomicBool::new(false));
 
-    // Create token sampler once (shared across all API types)
+    // Create token sampler (hashed mode only)
+    #[cfg(not(feature = "prompt-text-plain"))]
     let token_sampler = Arc::new(TokenSampler::new(
         Tokenizer::from_file(tokenizer).unwrap(),
         tokenizer_config,
@@ -242,9 +272,15 @@ async fn async_main(args: Args) -> Result<(), i32> {
             let path = cache_path
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/dev/shm/request-sim-cache.bin"));
+            #[cfg(not(feature = "prompt-text-plain"))]
             let cache = PromptCache::load_or_generate(
                 dataset.as_ref().get_ref(),
                 token_sampler.as_ref(),
+                &path,
+            );
+            #[cfg(feature = "prompt-text-plain")]
+            let cache = PromptCache::load_or_generate(
+                dataset.as_ref().get_ref(),
                 &path,
             );
             Some(Arc::new(cache))
@@ -253,9 +289,15 @@ async fn async_main(args: Args) -> Result<(), i32> {
             let path = cache_path
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./request-sim-cache.bin"));
+            #[cfg(not(feature = "prompt-text-plain"))]
             let cache = PromptCache::load_or_generate(
                 dataset.as_ref().get_ref(),
                 token_sampler.as_ref(),
+                &path,
+            );
+            #[cfg(feature = "prompt-text-plain")]
+            let cache = PromptCache::load_or_generate(
+                dataset.as_ref().get_ref(),
                 &path,
             );
             Some(Arc::new(cache))
@@ -271,6 +313,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         "tgi" => spawn_request_loop_with_timestamp::<TGIApi>(
             endpoint,
             dataset,
+            #[cfg(not(feature = "prompt-text-plain"))]
             token_sampler,
             scale_factor.unwrap(),
             tx,
@@ -285,6 +328,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         "release-with-debug" => spawn_request_loop_debug::<TGIApi>(
             endpoint,
             dataset,
+            #[cfg(not(feature = "prompt-text-plain"))]
             token_sampler,
             scale_factor.unwrap(),
             tx,
@@ -297,6 +341,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             spawn_request_loop_with_timestamp::<OpenAIApi>(
                 endpoint,
                 dataset,
+                #[cfg(not(feature = "prompt-text-plain"))]
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,
@@ -324,6 +369,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             spawn_request_loop_with_timestamp::<OpenAIApi>(
                 endpoint,
                 dataset,
+                #[cfg(not(feature = "prompt-text-plain"))]
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,
@@ -350,8 +396,6 @@ async fn async_main(args: Args) -> Result<(), i32> {
 
         // case 2: interrupt from inner
         _ = async {
-            // Not the optimal implementation, could be optimized using channel or notify_rx
-            // But for simplicity, we use routinely sleep and wake up
             while !interrupt_flag.load(Ordering::Relaxed) {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
@@ -371,8 +415,6 @@ fn main() -> Result<(), i32> {
         .compact()
         .with_target(false)
         .with_filter(filter_fn(|meta| {
-            // meta.target() 是模块路径
-            // meta.name() 是 span 名称
             !meta.name().contains("inflate")
         }))
         .with_filter(LevelFilter::INFO);

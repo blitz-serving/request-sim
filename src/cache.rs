@@ -3,6 +3,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::dataset::LLMTrace;
+#[cfg(not(feature = "prompt-text-plain"))]
 use crate::token_sampler::TokenSampler;
 
 /// A single pre-generated prompt with its metadata.
@@ -38,6 +39,7 @@ impl PromptCache {
 
     /// Load cache from file if it exists and has the expected count,
     /// otherwise generate from dataset and write to file.
+    #[cfg(not(feature = "prompt-text-plain"))]
     pub fn load_or_generate(
         dataset: &dyn LLMTrace,
         token_sampler: &TokenSampler,
@@ -81,7 +83,53 @@ impl PromptCache {
         cache
     }
 
+    /// Load cache from file if it exists and has the expected count,
+    /// otherwise generate from dataset and write to file.
+    #[cfg(feature = "prompt-text-plain")]
+    pub fn load_or_generate(
+        dataset: &dyn LLMTrace,
+        cache_path: &Path,
+    ) -> Self {
+        let expected = dataset.len();
+
+        if cache_path.exists() {
+            match Self::load(cache_path) {
+                Ok(cache) if cache.len() == expected => {
+                    tracing::info!(
+                        "Loaded prompt cache from {} ({} entries)",
+                        cache_path.display(),
+                        cache.len()
+                    );
+                    return cache;
+                }
+                Ok(cache) => {
+                    tracing::warn!(
+                        "Cache count mismatch (file={}, dataset={}), regenerating",
+                        cache.len(),
+                        expected
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load cache: {e}, regenerating");
+                }
+            }
+        }
+
+        let cache = Self::generate(dataset);
+        if let Err(e) = cache.write(cache_path) {
+            tracing::error!("Failed to write cache to {}: {e}", cache_path.display());
+        } else {
+            tracing::info!(
+                "Wrote prompt cache to {} ({} entries)",
+                cache_path.display(),
+                cache.len()
+            );
+        }
+        cache
+    }
+
     /// Generate all prompts by iterating the dataset.
+    #[cfg(not(feature = "prompt-text-plain"))]
     fn generate(dataset: &dyn LLMTrace, token_sampler: &TokenSampler) -> Self {
         let n = dataset.len();
         tracing::info!("Pre-generating {n} prompts...");
@@ -90,6 +138,33 @@ impl PromptCache {
         let mut entries = Vec::with_capacity(n);
         for i in 0..n {
             let (prompt, input_length, output_length) = dataset.inflate(i, token_sampler);
+            entries.push(CachedPrompt {
+                prompt,
+                input_length,
+                output_length,
+            });
+            if (i + 1) % 10000 == 0 {
+                tracing::info!("  pre-gen progress: {}/{n}", i + 1);
+            }
+        }
+
+        tracing::info!(
+            "Pre-generated {n} prompts in {:.2}s",
+            start.elapsed().as_secs_f64()
+        );
+        Self { entries }
+    }
+
+    /// Generate all prompts by iterating the dataset (plain-text mode).
+    #[cfg(feature = "prompt-text-plain")]
+    fn generate(dataset: &dyn LLMTrace) -> Self {
+        let n = dataset.len();
+        tracing::info!("Pre-generating {n} prompts...");
+        let start = std::time::Instant::now();
+
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let (prompt, input_length, output_length) = dataset.inflate(i);
             entries.push(CachedPrompt {
                 prompt,
                 input_length,

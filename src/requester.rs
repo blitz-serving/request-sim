@@ -24,8 +24,9 @@ use crate::{
     apis::{LLMApi, RequestError, AIBRIX_ROUTE_STRATEGY},
     dataset::LLMTrace,
     timeout_secs_upon_slo,
-    token_sampler::TokenSampler,
 };
+#[cfg(not(feature = "prompt-text-plain"))]
+use crate::token_sampler::TokenSampler;
 
 #[allow(dead_code)]
 async fn request(endpoint: &str, json_body: String) -> Result<Response, reqwest::Error> {
@@ -75,6 +76,7 @@ async fn wait_all(handle_rx: flume::Receiver<JoinHandle<()>>, interrupt_flag: Ar
     }
 }
 
+#[cfg(not(feature = "prompt-text-plain"))]
 pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     endpoint: String,
     dataset: Arc<Pin<Box<dyn LLMTrace>>>,
@@ -120,7 +122,6 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(30))
             .no_proxy()
-            // .timeout(Duration::from_secs(15)) // default timeout, can be overrided
             .build()
             .unwrap();
         let endpoint = Arc::new(endpoint);
@@ -149,7 +150,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                         "Request error accumulated more than threshold: {}, exit client",
                         threshold
                     );
-                    interrupt_flag.store(true, Ordering::SeqCst); // terminate test
+                    interrupt_flag.store(true, Ordering::SeqCst);
                     break;
                 }
             }
@@ -201,8 +202,6 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             format!("{span_time:.3}"),
                         );
 
-                        // Non-streaming: compute normalized E2E (span_time / output_length).
-                        // This includes TTFT and is NOT the same as streaming TPOT.
                         if output_length > 0
                             && metrics
                                 .get("status")
@@ -258,8 +257,188 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     handle
 }
 
+#[cfg(feature = "prompt-text-plain")]
+pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
+    endpoint: String,
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>,
+    scale_factor: f64,
+    response_sender: flume::Sender<BTreeMap<String, String>>,
+    interrupt_flag: Arc<AtomicBool>,
+    ttft_slo: f32,
+    tpot_slo: f32,
+    stream: bool,
+    early_stop_error_threshold: Option<u32>,
+    prompt_cache: Option<Arc<PromptCache>>,
+    time_range: (Option<u64>, Option<u64>),
+) -> JoinHandle<Result<(), i32>> {
+    static BASETIME: OnceLock<Instant> = OnceLock::new();
+    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
+    BASETIME.get_or_init(|| Instant::now());
+    fn get_timestamp() -> f64 {
+        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
+    }
+
+    let rr = dataset.rps();
+    println!("Origin request rate: {:.3} req/s", rr);
+    println!("Scaled request rate: {:.3} req/s", rr * scale_factor);
+
+    let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
+    let handle = spawn(async move {
+        wait_all(rx, flag).await;
+        let a = RETURNCODE.load(Ordering::Relaxed);
+        if a == 0 {
+            Ok(())
+        } else {
+            Err(a)
+        }
+    });
+
+    let error_count = Arc::new(AtomicU32::new(0));
+
+    spawn(async move {
+        let data_iter = dataset.iter();
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let endpoint = Arc::new(endpoint);
+        let (begin_time, end_time) = time_range;
+        for data_index in data_iter {
+            let trace_ts = dataset.timestamp(data_index);
+            if let Some(begin) = begin_time {
+                if trace_ts < begin {
+                    continue;
+                }
+            }
+            if let Some(end) = end_time {
+                if trace_ts > end {
+                    continue;
+                }
+            }
+
+            let error_count = Arc::clone(&error_count);
+            if interrupt_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if let Some(threshold) = early_stop_error_threshold {
+                if threshold <= error_count.load(Ordering::Relaxed) {
+                    tracing::error!(
+                        "Request error accumulated more than threshold: {}, exit client",
+                        threshold
+                    );
+                    interrupt_flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            let client = http_client.clone();
+            let endpoint = endpoint.clone();
+            let response_sender = response_sender.clone();
+
+            let curr_timestamp = get_timestamp() as u64;
+            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
+
+            if next_timestamp > curr_timestamp + 1 {
+                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
+            }
+
+            let (prompt, input_length, output_length) =
+                if let Some(ref cache) = prompt_cache {
+                    let entry = cache.get(data_index);
+                    (entry.prompt.clone(), entry.input_length, entry.output_length)
+                } else {
+                    dataset.inflate(data_index)
+                };
+
+            let request_handle = spawn(async move {
+                let json_body = A::request_json_body(prompt, output_length, stream);
+                let s_time = get_timestamp();
+                let s_time_drift = s_time - next_timestamp as f64;
+                match post_with_timeout::<A>(
+                    client,
+                    endpoint.as_str(),
+                    json_body.to_string(),
+                    Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
+                    stream,
+                )
+                .await
+                {
+                    Ok(mut metrics) => {
+                        let e_time = get_timestamp();
+
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+
+                        let span_time = e_time - s_time;
+                        metrics.insert(
+                            "span_time".to_string(),
+                            format!("{span_time:.3}"),
+                        );
+
+                        if output_length > 0
+                            && metrics
+                                .get("status")
+                                .map(|s| s.starts_with('2'))
+                                .unwrap_or(false)
+                        {
+                            let normalized_e2e = span_time / output_length as f64;
+                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
+                        }
+
+                        response_sender.send(metrics).unwrap();
+                    }
+                    Err(RequestError::Timeout) => {
+                        let e_time = get_timestamp();
+
+                        let mut metrics = BTreeMap::<String, String>::from([(
+                            "status".to_owned(),
+                            "timeout".to_owned(),
+                        )]);
+                        metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                        metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
+                        metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
+                        metrics.insert("input_length".to_string(), input_length.to_string());
+                        metrics.insert("output_length".to_string(), output_length.to_string());
+
+                        let span_time = e_time - s_time;
+                        metrics.insert(
+                            "span_time".to_string(),
+                            format!("{span_time:.3}"),
+                        );
+                        response_sender.send(metrics).unwrap();
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::Other(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(RequestError::StreamErr(error)) => {
+                        tracing::error!(
+                            "Request#{data_index}::({input_length}|{output_length}) stream error: {error}",
+                        );
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+
+            tx.send_async(request_handle).await.unwrap();
+        }
+        tracing::debug!("Requester exited.");
+    });
+    handle
+}
+
+#[cfg(not(feature = "prompt-text-plain"))]
 pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
-    _endpoint: String, // 保留参数，为了接口一致
+    _endpoint: String,
     dataset: Arc<Pin<Box<dyn LLMTrace>>>,
     token_sampler: Arc<TokenSampler>,
     scale_factor: f64,
@@ -321,7 +500,6 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
             let response_sender = response_sender.clone();
 
             let curr_timestamp = get_timestamp() as u64;
-            // milisecond
             let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
 
             if next_timestamp > curr_timestamp + 1 {
@@ -348,6 +526,104 @@ pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
                 if validate_len != input_length as usize {
                     tracing::error!("Validation error: {input_length} :> {validate_len}");
                 }
+
+                let mut metrics = BTreeMap::new();
+                metrics.insert("chat_id".to_string(), data_index.to_string());
+                metrics.insert("input_length".to_string(), input_length.to_string());
+                metrics.insert("output_length".to_string(), output_length.to_string());
+                metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
+                metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
+
+                response_sender.send(metrics).unwrap();
+            });
+
+            tx.send_async(request_handle).await.unwrap();
+        }
+        tracing::debug!("Requester exited.");
+    });
+
+    handle
+}
+
+#[cfg(feature = "prompt-text-plain")]
+pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
+    _endpoint: String,
+    dataset: Arc<Pin<Box<dyn LLMTrace>>>,
+    scale_factor: f64,
+    response_sender: flume::Sender<BTreeMap<String, String>>,
+    interrupt_flag: Arc<AtomicBool>,
+    prompt_cache: Option<Arc<PromptCache>>,
+    time_range: (Option<u64>, Option<u64>),
+) -> JoinHandle<Result<(), i32>> {
+    use std::time::Instant;
+    static BASETIME: OnceLock<Instant> = OnceLock::new();
+    static RETURNCODE: AtomicI32 = AtomicI32::new(0);
+    BASETIME.get_or_init(|| Instant::now());
+
+    fn get_timestamp() -> f64 {
+        BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
+    }
+
+    let rr = dataset.rps();
+    println!("Origin request rate: {:.3} req/s", rr);
+    println!(
+        "Scaled request rate (release-with-debug mode, no HTTP): {:.3} req/s",
+        rr * scale_factor
+    );
+
+    let (tx, rx) = flume::unbounded();
+    let flag = Arc::clone(&interrupt_flag);
+    let handle = spawn(async move {
+        wait_all(rx, flag).await;
+        let a = RETURNCODE.load(Ordering::Relaxed);
+        if a == 0 {
+            Ok(())
+        } else {
+            Err(a)
+        }
+    });
+
+    spawn(async move {
+        let data_iter = dataset.iter();
+        let (begin_time, end_time) = time_range;
+        for data_index in data_iter {
+            let trace_ts = dataset.timestamp(data_index);
+            if let Some(begin) = begin_time {
+                if trace_ts < begin {
+                    continue;
+                }
+            }
+            if let Some(end) = end_time {
+                if trace_ts > end {
+                    continue;
+                }
+            }
+
+            if interrupt_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            let response_sender = response_sender.clone();
+
+            let curr_timestamp = get_timestamp() as u64;
+            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
+
+            if next_timestamp > curr_timestamp + 1 {
+                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
+            }
+
+            let (sample, input_length, output_length) =
+                if let Some(ref cache) = prompt_cache {
+                    let entry = cache.get(data_index);
+                    (entry.prompt.clone(), entry.input_length, entry.output_length)
+                } else {
+                    dataset.inflate(data_index)
+                };
+
+            let request_handle = spawn(async move {
+                let s_time = get_timestamp();
+                let s_time_drift = s_time - next_timestamp as f64;
+
+                let _ = &sample; // used for potential future validation
 
                 let mut metrics = BTreeMap::new();
                 metrics.insert("chat_id".to_string(), data_index.to_string());
@@ -564,6 +840,7 @@ fn format_ms(value: f64) -> String {
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "prompt-text-plain"))]
 mod tests {
     use super::*;
     use crate::{
