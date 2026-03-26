@@ -29,7 +29,7 @@ fn normalize_ms(value: &str) -> String {
 impl LLMApi for TgiApi {
     const AIBRIX_PRIVATE_HEADER: bool = false;
 
-    fn request_json_body(prompt: PromptPayload, output_length: u64, _stream: bool) -> String {
+    fn request_json_body(prompt: PromptPayload, _input_length: u64, output_length: u64, _stream: bool) -> String {
         let inputs = match prompt {
             PromptPayload::Content(text) => serde_json::Value::String(text),
             PromptPayload::Messages(val) => val,

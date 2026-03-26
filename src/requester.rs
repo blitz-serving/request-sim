@@ -225,7 +225,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                 };
 
             let request_handle = spawn(async move {
-                let json_body = A::request_json_body(prompt, output_length, stream);
+                let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
                 let s_time_drift = s_time - next_timestamp as f64;
                 match post_with_timeout::<A>(
@@ -400,7 +400,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                 };
 
             let request_handle = spawn(async move {
-                let json_body = A::request_json_body(prompt, output_length, stream);
+                let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
                 let s_time_drift = s_time - next_timestamp as f64;
                 match post_with_timeout::<A>(
@@ -745,7 +745,7 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
             let (prompt, input_length, output_length) = ctx.inflate(data_index);
 
             let request_handle = spawn(async move {
-                let json_body = A::request_json_body(prompt, output_length, stream);
+                let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
                 match post_with_timeout::<A>(
                     client,
@@ -1072,7 +1072,7 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
 
             let task_state = Arc::clone(&state);
             let request_handle = spawn(async move {
-                let json_body = A::request_json_body(prompt, output_length, stream);
+                let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
                 let result = post_with_timeout::<A>(
                     client,

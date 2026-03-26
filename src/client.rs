@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use clap::Parser;
-use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, MAX_TOKENS_CAP, METRIC_PERCENTILES, RID_SOURCE, RidSource};
+use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, CONTEXT_LENGTH, MAX_TOKENS_CAP, METRIC_PERCENTILES, RID_SOURCE, RidSource};
 use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TgiApi, MODEL_NAME},
@@ -195,6 +195,13 @@ struct Args {
     #[clap(long)]
     max_tokens: Option<u64>,
 
+    /// Model context window size (in tokens). When set and a request's
+    /// input_length + output_length exceeds this limit, min_tokens is omitted
+    /// from the request body to avoid server-side errors. max_tokens is kept
+    /// so the server can cap or reject as appropriate.
+    #[clap(long)]
+    context_length: Option<u64>,
+
     /// Source for request rid (content identity).
     ///   none         — no rid in request body (default)
     ///   content-hash — SHA256 of serialized messages, truncated to 16 hex chars
@@ -297,6 +304,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         tps_limit,
         all_tokens_limit,
         max_tokens,
+        context_length,
         rid_source,
     } = args;
 
@@ -314,6 +322,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
     }
     METRIC_PERCENTILES.get_or_init(|| metric_percentile);
     MAX_TOKENS_CAP.get_or_init(|| max_tokens);
+    CONTEXT_LENGTH.get_or_init(|| context_length);
     RID_SOURCE.get_or_init(|| match rid_source.as_str() {
         "none" => RidSource::None,
         "content-hash" => RidSource::ContentHash,

@@ -1,4 +1,4 @@
-use super::{InFlightState, LLMApi, RequestError, MAX_TOKENS_CAP, MODEL_NAME};
+use super::{InFlightState, LLMApi, RequestError, CONTEXT_LENGTH, MAX_TOKENS_CAP, MODEL_NAME};
 use crate::dataset::PromptPayload;
 use reqwest::Response;
 use serde_json::json;
@@ -15,7 +15,7 @@ pub static AIBRIX_ROUTE_STRATEGY: OnceLock<String> = OnceLock::new();
 impl LLMApi for AbxApi {
     const AIBRIX_PRIVATE_HEADER: bool = true;
 
-    fn request_json_body(prompt: PromptPayload, output_length: u64, stream: bool) -> String {
+    fn request_json_body(prompt: PromptPayload, input_length: u64, output_length: u64, stream: bool) -> String {
         let messages = match prompt {
             PromptPayload::Content(text) => json!([{"role": "user", "content": text}]),
             PromptPayload::Messages(val) => val,
@@ -26,7 +26,12 @@ impl LLMApi for AbxApi {
             "stream": stream,
         });
         if output_length > 0 {
-            body["min_tokens"] = json!(output_length);
+            let exceeds_ctx = CONTEXT_LENGTH.get()
+                .and_then(|opt| opt.as_ref())
+                .is_some_and(|ctx| input_length + output_length > *ctx);
+            if !exceeds_ctx {
+                body["min_tokens"] = json!(output_length);
+            }
             body["max_tokens"] = json!(output_length);
         } else if let Some(Some(cap)) = MAX_TOKENS_CAP.get() {
             body["max_tokens"] = json!(cap);
