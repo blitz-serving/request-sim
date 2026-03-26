@@ -24,13 +24,13 @@ Three modes controlled by `--mode`:
 |------|---------------|-------------|-----------------|---------------|
 | `trace-replay` (default) | Replays original trace timestamps, scaled by `--scale-factor` | Unbounded concurrent | No | Dataset exhausted OR `--time-in-secs` |
 | `random-process` | Stochastic: `--arrival poisson\|uniform`, rate from `--rate` | Unbounded concurrent | Yes (modular indexing) | `--time-in-secs` ONLY |
-| `feedback` | Closed-loop: next request sent when a slot frees | `--target-bs` concurrent (semaphore) | No | Dataset exhausted OR `--time-in-secs` |
+| `feedback` | Closed-loop: AIMD controller probes concurrency | `--bs-limit` ceiling, controller adjusts `bs_allowed` | No | Dataset exhausted OR `--time-in-secs` |
 
 ### Config constraints per mode
 
 - **trace-replay**: `--scale-factor` required. `--begin-time`/`--end-time` apply.
 - **random-process**: `--arrival` and `--rate` required. `--scale-factor`/`--begin-time`/`--end-time` ignored. Cyclic — always needs `--time-in-secs` to terminate.
-- **feedback**: `--target-bs` (default 1). BS=1 degenerates to queueing-theory closed-loop. `--scale-factor`/`--begin-time`/`--end-time` ignored.
+- **feedback**: `--bs-limit` (default 1) sets the concurrency ceiling. An AIMD controller ramps `bs_allowed` from 1 toward `bs-limit`, retreating when constraints (`--tpot-limit`, `--tps-limit`, `--all-tokens-limit`) are violated. `--tpot-limit`/`--tps-limit` require `--stream`. `--scale-factor`/`--begin-time`/`--end-time` ignored.
 - **release-with-debug**: forces trace-replay mode only.
 
 ## Conventions
@@ -46,13 +46,13 @@ Three modes controlled by `--mode`:
 ```
 src/
   client.rs          CLI args + validate_config() + mode dispatch (entry point)
-  lib.rs             SpinLock, SpinRwLock, timeout_secs_upon_slo()
+  lib.rs             SpinLock, SpinRwLock, timeout_secs_upon_slo(), init_basetime(), get_timestamp()
   dataset.rs         LLMTrace trait + BailianDataset (block=16) + MooncakeDataset (block=512) + MiniMaxDataset + PlainTextDataset
   token_sampler.rs   TokenSampler: N producer threads → crossbeam channels → gen_string()
-  requester.rs       RequestContext, ArrivalProcess, spawn_request_loop_*, report_loop(), SummaryStats
+  requester.rs       RequestContext, ArrivalProcess, ControllerConfig, FeedbackState, spawn_request_loop_*, report_loop(), SummaryStats
   mock_server.rs     Hyper echo server (100-300ms random latency)
   apis/
-    mod.rs           LLMApi trait, RequestError, global statics (MODEL_NAME, METRIC_PERCENTILES, MAX_TOKENS_CAP)
+    mod.rs           LLMApi trait, RequestError, InFlightState, global statics (MODEL_NAME, METRIC_PERCENTILES, MAX_TOKENS_CAP)
     tgi_api.rs       TGI: extracts metrics from response headers
     openai_api.rs    OpenAI: SSE streaming, per-token latency tracking
     sgl_api.rs       SGLang: OpenAI-compatible SSE + usage/cached_tokens extraction
@@ -68,7 +68,7 @@ Pipeline: **Load → Warm → Dispatch → Report**
 3. Dispatch function selected by `--mode`:
    - `trace-replay`: `spawn_request_loop_with_timestamp()` — replays at trace timestamps (scaled by `--scale-factor`), unbounded concurrent tasks
    - `random-process`: `spawn_request_loop_random_process()` — stochastic inter-arrival sleep (Poisson/uniform), cycles dataset, concurrent tasks
-   - `feedback`: `spawn_request_loop_feedback()` — semaphore-gated batch size control (`--target-bs`), iterates dataset once
+   - `feedback`: `spawn_request_loop_feedback()` — AIMD controller dynamically adjusts concurrency (`bs_allowed`) toward `--bs-limit`, respecting `--tpot-limit`, `--tps-limit`, `--all-tokens-limit` constraints
 4. `report_loop()` collects results via flume channel → writes per-request JSONL + percentile summary JSON
 
 ### Key design decisions

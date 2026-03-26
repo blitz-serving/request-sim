@@ -1,14 +1,13 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
-        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use futures_util::stream::Count;
 use reqwest::Response;
 use tokio::{
     fs::File,
@@ -22,25 +21,16 @@ use crate::apis::METRIC_PERCENTILES;
 use crate::cache::PromptCache;
 use crate::dataset::PromptPayload;
 use crate::{
-    apis::{LLMApi, RequestError, AIBRIX_ROUTE_STRATEGY},
+    apis::{InFlightState, LLMApi, RequestError, AIBRIX_ROUTE_STRATEGY},
     dataset::LLMTrace,
-    timeout_secs_upon_slo,
+    get_timestamp, init_basetime, timeout_secs_upon_slo,
 };
 #[cfg(not(feature = "prompt-text-plain"))]
 use crate::token_sampler::TokenSampler;
 
-// ── Module-level timing infrastructure ──────────────────────────────────────
+// ── Module-level statics ─────────────────────────────────────────────────────
 
-static BASETIME: OnceLock<Instant> = OnceLock::new();
 static RETURNCODE: AtomicI32 = AtomicI32::new(0);
-
-fn init_basetime() {
-    BASETIME.get_or_init(|| Instant::now());
-}
-
-fn get_timestamp() -> f64 {
-    BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
-}
 
 // ── Request context (unifies feature-gated inflate) ─────────────────────────
 
@@ -110,6 +100,7 @@ async fn post_with_timeout<A: 'static + LLMApi + Send>(
     json_body: String,
     timeout: Duration,
     stream: bool,
+    in_flight: Option<Arc<InFlightState>>,
 ) -> Result<BTreeMap<String, String>, RequestError> {
     let mut req = client
         .post(endpoint)
@@ -128,7 +119,7 @@ async fn post_with_timeout<A: 'static + LLMApi + Send>(
 
     let response = req.send().await.map_err(|e| RequestError::Other(e))?;
 
-    A::parse_response(response, stream, timeout).await
+    A::parse_response(response, stream, timeout, in_flight).await
 }
 
 async fn wait_all(handle_rx: flume::Receiver<JoinHandle<()>>, interrupt_flag: Arc<AtomicBool>) {
@@ -243,6 +234,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                     json_body.to_string(),
                     Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
                     stream,
+                    None,
                 )
                 .await
                 {
@@ -417,6 +409,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                     json_body.to_string(),
                     Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
                     stream,
+                    None,
                 )
                 .await
                 {
@@ -760,6 +753,7 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
                     json_body.to_string(),
                     Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
                     stream,
+                    None,
                 )
                 .await
                 {
@@ -819,10 +813,170 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
 
 // ── Feedback mode (control-theory closed-loop) ──────────────────────────────
 
+// ── AIMD Feedback Controller ─────────────────────────────────────────────────
+
+/// Configuration for the AIMD feedback controller.
+/// When all constraint fields are None, feedback mode uses the static semaphore (backward compat).
+pub struct ControllerConfig {
+    pub bs_limit: usize,
+    pub interval_secs: f64,
+    pub cooldown_ticks: u32,
+    pub tpot_limit_ms: Option<f64>,
+    pub tps_limit: Option<f64>,
+    pub all_tokens_limit: Option<u64>,
+}
+
+/// Shared mutable state between the dispatch loop, per-request tasks, and the controller.
+struct FeedbackState {
+    /// Currently in-flight requests, keyed by request ID.
+    in_flight: Mutex<HashMap<u64, Arc<InFlightState>>>,
+    /// Monotonically increasing total output tokens received across all requests.
+    global_token_counter: AtomicU64,
+    /// Current allowed concurrency (controller writes, dispatch reads).
+    bs_allowed: AtomicUsize,
+    /// Actual number of active (in-flight) requests right now.
+    bs_active: AtomicUsize,
+    /// Wakes the dispatch loop when a request completes or bs_allowed increases.
+    notify: tokio::sync::Notify,
+    /// Monotonic request ID generator.
+    next_request_id: AtomicU64,
+}
+
+impl FeedbackState {
+    fn new(initial_bs: usize) -> Self {
+        Self {
+            in_flight: Mutex::new(HashMap::new()),
+            global_token_counter: AtomicU64::new(0),
+            bs_allowed: AtomicUsize::new(initial_bs),
+            bs_active: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+            next_request_id: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Spawn the AIMD controller loop as a background tokio task.
+///
+/// Each tick (every `interval_secs`):
+/// 1. Observe: bs_active, tps, avg_tpot, all_tokens
+/// 2. Evaluate constraints (tpot_limit, tps_limit, all_tokens_limit)
+/// 3. AIMD on control input (step_size): AI grows step on success, hard-reset on violation
+/// 4. Actuate: adjust bs_allowed toward bs_limit
+fn spawn_controller_loop(
+    config: &ControllerConfig,
+    state: Arc<FeedbackState>,
+    interrupt_flag: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    let bs_limit = config.bs_limit;
+    let interval_secs = config.interval_secs;
+    let cooldown_ticks = config.cooldown_ticks;
+    let tpot_limit_ms = config.tpot_limit_ms;
+    let tps_limit = config.tps_limit;
+    let all_tokens_limit = config.all_tokens_limit;
+
+    spawn(async move {
+        let interval = Duration::from_secs_f64(interval_secs);
+        let mut step_size: usize = 1;
+        let mut prev_token_count: u64 = 0;
+        let mut cooldown_remaining: u32 = 0;
+
+        loop {
+            sleep(interval).await;
+
+            if interrupt_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // ── 1. Observe ──────────────────────────────────────────────
+            let bs_active = state.bs_active.load(Ordering::Relaxed);
+            let cur_token_count = state.global_token_counter.load(Ordering::Relaxed);
+            let delta_tokens = cur_token_count.saturating_sub(prev_token_count);
+            prev_token_count = cur_token_count;
+            let tps = delta_tokens as f64 / interval_secs;
+
+            // Compute avg TPOT and all_tokens from in-flight snapshot
+            let (avg_tpot, all_tokens) = {
+                let map = state.in_flight.lock().unwrap();
+                let now_ms = get_timestamp();
+                let mut tpot_sum = 0.0;
+                let mut tpot_count = 0u64;
+                let mut total_tokens: u64 = 0;
+
+                for (_id, ifl) in map.iter() {
+                    let out = ifl.output_tokens_so_far.load(Ordering::Relaxed);
+                    total_tokens += ifl.input_length + out;
+
+                    let ftt = ifl.first_token_time_ms.load(Ordering::Acquire);
+                    if ftt > 0 && out > 1 {
+                        let decode_elapsed = now_ms - ftt as f64;
+                        if decode_elapsed > 0.0 {
+                            let tpot_i = decode_elapsed / (out - 1) as f64;
+                            tpot_sum += tpot_i;
+                            tpot_count += 1;
+                        }
+                    }
+                }
+                let avg = if tpot_count > 0 {
+                    tpot_sum / tpot_count as f64
+                } else {
+                    0.0
+                };
+                (avg, total_tokens)
+            };
+
+            // ── 2. Evaluate constraints ─────────────────────────────────
+            let tpot_violated = tpot_limit_ms
+                .map(|limit| avg_tpot > limit && avg_tpot > 0.0)
+                .unwrap_or(false);
+            let tps_violated = tps_limit
+                .map(|limit| tps < limit && bs_active > 0 && cur_token_count > 0)
+                .unwrap_or(false);
+            let all_tokens_violated = all_tokens_limit
+                .map(|limit| all_tokens > limit)
+                .unwrap_or(false);
+            let any_violated = tpot_violated || tps_violated || all_tokens_violated;
+
+            // ── 3. AIMD on control input ────────────────────────────────
+            let bs_current = state.bs_allowed.load(Ordering::Relaxed);
+
+            let (new_bs, action) = if cooldown_remaining > 0 {
+                cooldown_remaining -= 1;
+                (bs_current, "cooldown")
+            } else if any_violated {
+                // Retreat: undo last advance, hard-reset step to 1
+                let retreat = std::cmp::max(1, step_size - 1);
+                let retreated = std::cmp::max(1, bs_current.saturating_sub(retreat));
+                step_size = 1;
+                cooldown_remaining = cooldown_ticks;
+                (retreated, "retreat")
+            } else if bs_current < bs_limit {
+                // Advance: increase bs_allowed, grow step for next tick
+                let new = std::cmp::min(bs_current + step_size, bs_limit);
+                step_size += 1;
+                cooldown_remaining = cooldown_ticks;
+                (new, "advance")
+            } else {
+                (bs_current, "steady")
+            };
+
+            // ── 4. Actuate ──────────────────────────────────────────────
+            let prev_bs = state.bs_allowed.swap(new_bs, Ordering::Release);
+            if new_bs > prev_bs {
+                state.notify.notify_one();
+            }
+
+            tracing::info!(
+                "controller: bs_allowed={new_bs} bs_active={bs_active} tps={tps:.1} \
+                 tpot={avg_tpot:.1}ms all_tokens={all_tokens} step={step_size} action={action}"
+            );
+        }
+    })
+}
+
 pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
     endpoint: String,
     ctx: RequestContext,
-    target_bs: usize,
+    config: ControllerConfig,
     response_sender: flume::Sender<BTreeMap<String, String>>,
     interrupt_flag: Arc<AtomicBool>,
     ttft_slo: f32,
@@ -832,9 +986,11 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
 ) -> JoinHandle<Result<(), i32>> {
     init_basetime();
 
+    let bs_limit = config.bs_limit;
     println!(
-        "Feedback mode: target_bs={}, dataset_size={}",
-        target_bs,
+        "Feedback mode: bs_limit={}, interval={}ms, dataset_size={}",
+        bs_limit,
+        (config.interval_secs * 1000.0) as u64,
         ctx.dataset.len()
     );
 
@@ -847,6 +1003,7 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
     });
 
     let error_count = Arc::new(AtomicU32::new(0));
+    let ctrl_interrupt = Arc::clone(&interrupt_flag);
 
     spawn(async move {
         let http_client = reqwest::Client::builder()
@@ -857,8 +1014,10 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
             .unwrap();
         let endpoint = Arc::new(endpoint);
 
-        // Semaphore-based batch size control (junction function for BS metric)
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(target_bs));
+        let state = Arc::new(FeedbackState::new(1));
+        let _controller_handle =
+            spawn_controller_loop(&config, Arc::clone(&state), ctrl_interrupt);
+
         let data_iter = ctx.dataset.iter();
 
         for data_index in data_iter {
@@ -878,57 +1037,114 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
                 }
             }
 
-            // Junction: block until in_flight < target_bs
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            // Concurrency gate: wait until bs_active < bs_allowed
+            loop {
+                let notified = state.notify.notified();
+                if state.bs_active.load(Ordering::Relaxed)
+                    < state.bs_allowed.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                notified.await;
+            }
 
+            let request_id = state.next_request_id.fetch_add(1, Ordering::Relaxed);
             let client = http_client.clone();
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
 
             let (prompt, input_length, output_length) = ctx.inflate(data_index);
 
+            let in_flight_state = Arc::new(InFlightState {
+                input_length,
+                output_tokens_so_far: AtomicU64::new(0),
+                first_token_time_ms: AtomicU64::new(0),
+            });
+            state
+                .in_flight
+                .lock()
+                .unwrap()
+                .insert(request_id, Arc::clone(&in_flight_state));
+            state.bs_active.fetch_add(1, Ordering::Relaxed);
+
+            let task_state = Arc::clone(&state);
             let request_handle = spawn(async move {
-                let _permit = permit; // held for task lifetime, released on drop
                 let json_body = A::request_json_body(prompt, output_length, stream);
                 let s_time = get_timestamp();
-                match post_with_timeout::<A>(
+                let result = post_with_timeout::<A>(
                     client,
                     endpoint.as_str(),
                     json_body.to_string(),
-                    Duration::from_secs(timeout_secs_upon_slo(output_length, ttft_slo, tpot_slo)),
+                    Duration::from_secs(timeout_secs_upon_slo(
+                        output_length, ttft_slo, tpot_slo,
+                    )),
                     stream,
+                    Some(in_flight_state),
                 )
-                .await
-                {
+                .await;
+
+                // Accumulate output tokens into global counter
+                let out_tokens = task_state
+                    .in_flight
+                    .lock()
+                    .unwrap()
+                    .get(&request_id)
+                    .map(|s| s.output_tokens_so_far.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                task_state
+                    .global_token_counter
+                    .fetch_add(out_tokens, Ordering::Relaxed);
+
+                // Remove from in-flight set, decrement counter, notify dispatch
+                task_state.in_flight.lock().unwrap().remove(&request_id);
+                task_state.bs_active.fetch_sub(1, Ordering::Relaxed);
+                task_state.notify.notify_one();
+
+                match result {
                     Ok(mut metrics) => {
                         let e_time = get_timestamp();
                         metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
                         metrics.insert("s_time_drift".to_string(), "0.000".to_string());
                         metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
                         metrics.insert("input_length".to_string(), input_length.to_string());
-                        metrics.insert("output_length".to_string(), output_length.to_string());
+                        metrics.insert(
+                            "output_length".to_string(),
+                            output_length.to_string(),
+                        );
                         let span_time = e_time - s_time;
-                        metrics.insert("span_time".to_string(), format!("{span_time:.3}"));
+                        metrics
+                            .insert("span_time".to_string(), format!("{span_time:.3}"));
                         if output_length > 0
-                            && metrics.get("status").map(|s| s.starts_with('2')).unwrap_or(false)
+                            && metrics
+                                .get("status")
+                                .map(|s| s.starts_with('2'))
+                                .unwrap_or(false)
                         {
                             let normalized_e2e = span_time / output_length as f64;
-                            metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
+                            metrics.insert(
+                                "normalized_e2e".to_string(),
+                                format!("{normalized_e2e:.3}"),
+                            );
                         }
                         response_sender.send(metrics).unwrap();
                     }
                     Err(RequestError::Timeout) => {
                         let e_time = get_timestamp();
                         let mut metrics = BTreeMap::<String, String>::from([(
-                            "status".to_owned(), "timeout".to_owned(),
+                            "status".to_owned(),
+                            "timeout".to_owned(),
                         )]);
                         metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
                         metrics.insert("s_time_drift".to_string(), "0.000".to_string());
                         metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
                         metrics.insert("input_length".to_string(), input_length.to_string());
-                        metrics.insert("output_length".to_string(), output_length.to_string());
+                        metrics.insert(
+                            "output_length".to_string(),
+                            output_length.to_string(),
+                        );
                         let span_time = e_time - s_time;
-                        metrics.insert("span_time".to_string(), format!("{span_time:.3}"));
+                        metrics
+                            .insert("span_time".to_string(), format!("{span_time:.3}"));
                         response_sender.send(metrics).unwrap();
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -950,11 +1166,20 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
             tx.send_async(request_handle).await.unwrap();
         }
 
-        // Wait for all in-flight requests to drain
-        let _ = semaphore.acquire_many(target_bs as u32).await;
+        // Drain: wait for all in-flight to complete
+        loop {
+            if state.bs_active.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            state.notify.notified().await;
+        }
         interrupt_flag.store(true, Ordering::SeqCst);
-        tracing::info!("Feedback requester: all {} entries consumed.", ctx.dataset.len());
+        tracing::info!(
+            "Feedback requester: all {} entries consumed.",
+            ctx.dataset.len()
+        );
     });
+
     handle
 }
 

@@ -13,9 +13,23 @@ compile_error!(
 
 use core::hint::spin_loop;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::thread::yield_now;
+use std::time::Instant;
 
 use tracing::{instrument, Level};
+
+// ── Global timing infrastructure ─────────────────────────────────────────────
+
+static BASETIME: OnceLock<Instant> = OnceLock::new();
+
+pub fn init_basetime() {
+    BASETIME.get_or_init(|| Instant::now());
+}
+
+pub fn get_timestamp() -> f64 {
+    BASETIME.get().unwrap().elapsed().as_secs_f64() * 1000.0
+}
 
 pub fn timeout_secs_upon_slo(output_length: u64, ttft_slo: f32, tpot_slo: f32) -> u64 {
     15.max((ttft_slo + tpot_slo * output_length as f32) as u64)

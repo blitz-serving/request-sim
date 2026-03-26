@@ -1,18 +1,21 @@
 use std::{
-    cell::UnsafeCell,
-    collections::HashMap,
     fs::File,
     io::{BufRead, BufReader},
     sync::atomic::{AtomicUsize, Ordering},
 };
+#[cfg(not(feature = "prompt-text-plain"))]
+use std::{cell::UnsafeCell, collections::HashMap};
 
 #[cfg(not(feature = "prompt-text-plain"))]
 use crate::token_sampler::TokenSampler;
+#[cfg(not(feature = "prompt-text-plain"))]
 use crate::SpinRwLock;
 use chrono::NaiveDateTime;
 use request_sim_macros::prompt_text;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "prompt-text-plain")]
 use serde_json::json;
+#[cfg(not(feature = "prompt-text-plain"))]
 use tracing::{instrument, Level};
 
 /// Describes the format of the prompt returned by `inflate()`.
@@ -26,6 +29,7 @@ pub enum PromptPayload {
 }
 
 /// jsonl of Bailian
+#[cfg(not(feature = "prompt-text-plain"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BailianDataItem {
     pub chat_id: i64,
@@ -39,6 +43,7 @@ pub(crate) struct BailianDataItem {
 }
 
 /// jsonl of Mooncake
+#[cfg(not(feature = "prompt-text-plain"))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MooncakeDataItem {
     pub timestamp: f32,
@@ -47,6 +52,7 @@ pub(crate) struct MooncakeDataItem {
     pub hash_ids: Vec<u64>,
 }
 
+#[allow(dead_code)]
 fn from_timestamp<'de, D>(deserializer: D) -> Result<NaiveDateTime, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -56,6 +62,7 @@ where
     NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").map_err(serde::de::Error::custom)
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AzureDataItem {
     #[serde(rename = "TIMESTAMP", deserialize_with = "from_timestamp")]

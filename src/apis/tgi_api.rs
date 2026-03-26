@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use reqwest::Response;
 
-use super::{LLMApi, MAX_TOKENS_CAP, METRIC_PERCENTILES, RequestError};
+use super::{InFlightState, LLMApi, MAX_TOKENS_CAP, METRIC_PERCENTILES, RequestError};
 use crate::dataset::PromptPayload;
+use std::sync::Arc;
 use std::time::Duration;
 pub struct TgiApi;
 
@@ -46,6 +47,7 @@ impl LLMApi for TgiApi {
         response: Response,
         _stream: bool,
         _timeout_duration: Duration,
+        _in_flight: Option<Arc<InFlightState>>,
     ) -> Result<BTreeMap<String, String>, RequestError> {
         let mut map = BTreeMap::new();
         map.insert("status".to_string(), response.status().as_str().to_string());

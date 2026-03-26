@@ -1,6 +1,7 @@
 use reqwest::Response;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, OnceLock};
 
 use crate::dataset::PromptPayload;
 
@@ -13,6 +14,15 @@ pub static RID_SOURCE: OnceLock<RidSource> = OnceLock::new();
 pub enum RidSource {
     None,
     ContentHash,
+}
+
+/// Per-request live state for real-time controller observation.
+/// Created at dispatch, updated by streaming parser, read by controller.
+pub struct InFlightState {
+    pub input_length: u64,
+    pub output_tokens_so_far: AtomicU64,
+    /// ms from BASETIME when first output token arrived. 0 = not yet received.
+    pub first_token_time_ms: AtomicU64,
 }
 
 /// Compute a deterministic rid from the serialized messages JSON.
@@ -50,5 +60,6 @@ pub trait LLMApi: Copy + Clone + Send + Sync {
         response: Response,
         stream: bool,
         timeout_duration: Duration,
+        in_flight: Option<Arc<InFlightState>>,
     ) -> Result<BTreeMap<String, String>, RequestError>;
 }

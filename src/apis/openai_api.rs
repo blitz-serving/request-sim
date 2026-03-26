@@ -1,9 +1,11 @@
-use super::{LLMApi, RequestError, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME, RID_SOURCE, RidSource, compute_content_hash_rid};
+use super::{InFlightState, LLMApi, RequestError, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME, RID_SOURCE, RidSource, compute_content_hash_rid};
 use crate::dataset::PromptPayload;
 use futures_util::TryStreamExt;
 use reqwest::Response;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -48,6 +50,7 @@ impl LLMApi for OaiApi {
         response: Response,
         stream: bool,
         timeout_duration: Duration,
+        in_flight: Option<Arc<InFlightState>>,
     ) -> Result<BTreeMap<String, String>, RequestError> {
         let mut result = BTreeMap::new();
         result.insert("status".to_string(), response.status().as_str().to_string());
@@ -99,6 +102,17 @@ impl LLMApi for OaiApi {
                         if data_str.contains(r#""delta""#) {
                             let now = TokioInstant::now();
                             token_count += 1;
+
+                            // Update in-flight state for controller observation
+                            if let Some(ref state) = in_flight {
+                                state.output_tokens_so_far.fetch_add(1, Ordering::Relaxed);
+                                if token_count == 1 {
+                                    let ts = crate::get_timestamp() as u64;
+                                    let _ = state.first_token_time_ms.compare_exchange(
+                                        0, ts, Ordering::Release, Ordering::Relaxed,
+                                    );
+                                }
+                            }
 
                             if first_token_time.is_none() {
                                 first_token_time = Some(now);

@@ -1,11 +1,10 @@
+use super::{InFlightState, LLMApi, RequestError, MAX_TOKENS_CAP, MODEL_NAME};
+use crate::dataset::PromptPayload;
 use reqwest::Response;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-
-use super::{LLMApi, RequestError, MAX_TOKENS_CAP, MODEL_NAME};
-use crate::dataset::PromptPayload;
 
 #[derive(Copy, Clone)]
 pub struct AbxApi;
@@ -40,6 +39,7 @@ impl LLMApi for AbxApi {
         response: Response,
         _stream: bool,
         _timeout_duration: Duration,
+        _in_flight: Option<Arc<InFlightState>>,
     ) -> Result<BTreeMap<String, String>, RequestError> {
         let mut result = BTreeMap::new();
 

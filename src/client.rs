@@ -14,7 +14,7 @@ use request_sim::{
     requester::{
         report_loop, spawn_request_loop_debug, spawn_request_loop_feedback,
         spawn_request_loop_random_process, spawn_request_loop_with_timestamp, ArrivalProcess,
-        RequestContext,
+        ControllerConfig, RequestContext,
     },
 };
 #[cfg(not(feature = "prompt-text-plain"))]
@@ -163,10 +163,31 @@ struct Args {
     #[clap(long)]
     rate: Option<f64>,
 
-    /// Target batch size (concurrent in-flight requests) for feedback mode.
-    /// BS=1 is queueing-theory closed-loop (send one, await, send next).
+    /// Maximum concurrent in-flight requests for feedback mode.
+    /// Without constraints, acts as a static semaphore. With constraints, the AIMD
+    /// controller probes upward toward this ceiling.
     #[clap(long, default_value_t = 1)]
-    target_bs: usize,
+    bs_limit: usize,
+
+    /// Controller tick interval in seconds (feedback mode with constraints).
+    #[clap(long, default_value_t = 0.2)]
+    controller_interval: f64,
+
+    /// Number of ticks to skip after each actuation before the next adjustment.
+    #[clap(long, default_value_t = 1)]
+    cooldown_ticks: u32,
+
+    /// TPOT upper bound in ms. Activates AIMD controller when set.
+    #[clap(long)]
+    tpot_limit: Option<f64>,
+
+    /// TPS lower bound (tokens/sec). Activates AIMD controller when set.
+    #[clap(long)]
+    tps_limit: Option<f64>,
+
+    /// Total context tokens upper bound. Activates AIMD controller when set.
+    #[clap(long)]
+    all_tokens_limit: Option<u64>,
 
     /// Safety cap on output tokens. Applied as max_tokens when the dataset does
     /// not specify an output length (e.g. plaintext dataset). Ignored when the
@@ -208,10 +229,20 @@ fn validate_config(args: &Args) {
         }
         "feedback" => {
             assert!(
-                args.target_bs >= 1,
-                "--target-bs must be >= 1, got {}",
-                args.target_bs
+                args.bs_limit >= 1,
+                "--bs-limit must be >= 1, got {}",
+                args.bs_limit
             );
+            assert!(
+                args.controller_interval > 0.0,
+                "--controller-interval must be positive"
+            );
+            if args.tpot_limit.is_some() || args.tps_limit.is_some() {
+                assert!(
+                    args.stream,
+                    "--tpot-limit and --tps-limit require --stream (real-time token observation)"
+                );
+            }
         }
         other => panic!(
             "Invalid --mode: '{other}'. Must be trace-replay, random-process, or feedback"
@@ -259,7 +290,12 @@ async fn async_main(args: Args) -> Result<(), i32> {
         mode,
         arrival,
         rate,
-        target_bs,
+        bs_limit,
+        controller_interval,
+        cooldown_ticks,
+        tpot_limit,
+        tps_limit,
+        all_tokens_limit,
         max_tokens,
         rid_source,
     } = args;
@@ -451,8 +487,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
         }
         "feedback" => {
             tracing::info!(
-                "feedback mode: target_bs={}, will terminate when dataset ({} entries) exhausted or {}s timeout",
-                target_bs,
+                "feedback mode: bs_limit={}, will terminate when dataset ({} entries) exhausted or {}s timeout",
+                bs_limit,
                 dataset.len(),
                 time_in_secs
             );
@@ -506,7 +542,14 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "feedback" => spawn_request_loop_feedback::<TgiApi>(
                 endpoint,
                 ctx,
-                target_bs,
+                ControllerConfig {
+                    bs_limit,
+                    interval_secs: controller_interval,
+                    cooldown_ticks,
+                    tpot_limit_ms: tpot_limit,
+                    tps_limit,
+                    all_tokens_limit,
+                },
                 tx,
                 interrupt_flag.clone(),
                 ttft_slo,
@@ -547,7 +590,14 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "feedback" => spawn_request_loop_feedback::<OaiApi>(
                 endpoint,
                 ctx,
-                target_bs,
+                ControllerConfig {
+                    bs_limit,
+                    interval_secs: controller_interval,
+                    cooldown_ticks,
+                    tpot_limit_ms: tpot_limit,
+                    tps_limit,
+                    all_tokens_limit,
+                },
                 tx,
                 interrupt_flag.clone(),
                 ttft_slo,
@@ -588,7 +638,14 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "feedback" => spawn_request_loop_feedback::<OaiApi>(
                 endpoint,
                 ctx,
-                target_bs,
+                ControllerConfig {
+                    bs_limit,
+                    interval_secs: controller_interval,
+                    cooldown_ticks,
+                    tpot_limit_ms: tpot_limit,
+                    tps_limit,
+                    all_tokens_limit,
+                },
                 tx,
                 interrupt_flag.clone(),
                 ttft_slo,
@@ -629,7 +686,14 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "feedback" => spawn_request_loop_feedback::<SglApi>(
                 endpoint,
                 ctx,
-                target_bs,
+                ControllerConfig {
+                    bs_limit,
+                    interval_secs: controller_interval,
+                    cooldown_ticks,
+                    tpot_limit_ms: tpot_limit,
+                    tps_limit,
+                    all_tokens_limit,
+                },
                 tx,
                 interrupt_flag.clone(),
                 ttft_slo,

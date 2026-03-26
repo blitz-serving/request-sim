@@ -29,7 +29,7 @@ while using only **~30 CPU threads**, which is sufficient for stress testing a
 - **Three request dispatch modes**:
   - **Trace replay**: replay anonymous production traces at recorded timestamps
   - **Random process**: stochastic arrival times (Poisson or uniform distribution)
-  - **Feedback**: control-theory closed-loop with configurable batch size
+  - **Feedback**: AIMD closed-loop controller with configurable concurrency and constraint limits
 - Construct prompts based on block hashes (preserving KVCache hit patterns)
 - Plain text dataset support for meaningful prompts (`--dataset plaintext`)
 - End-to-end request replay using OpenAI, TGI, SGLang, and AIBrix compatible APIs
@@ -93,23 +93,28 @@ request-sim --mode random-process \
 
 ### feedback
 
-Control-theory closed-loop. Maintains `--target-bs` concurrent in-flight requests using a semaphore. When a request completes, the next one is sent immediately (if dataset entries remain).
+AIMD closed-loop controller. Starts at 1 concurrent request and probes upward toward `--bs-limit`, retreating when constraints are violated. Constraint args (`--tpot-limit`, `--tps-limit`, `--all-tokens-limit`) are optional — without them, the controller simply ramps to `--bs-limit` and holds steady.
 
 ```bash
-# Closed-loop, one-at-a-time (BS=1)
+# Ramp to 30 concurrent requests (no constraints, ramps quickly)
 request-sim --mode feedback \
-  --target-bs 1 \
+  --bs-limit 30 \
   --dataset bailian --dataset-path trace.jsonl \
   --api tgi --endpoint http://localhost:8080/generate \
   --time-in-secs 600
 
-# Maintain 4 concurrent in-flight requests
+# AIMD with TPOT constraint: probe up to 64, retreat if TPOT > 50ms
 request-sim --mode feedback \
-  --target-bs 4 \
-  ...
+  --bs-limit 64 --tpot-limit 50 \
+  --controller-interval 0.2 --cooldown-ticks 1 \
+  --stream \
+  --dataset minimax --dataset-path trace.jsonl \
+  --api sgl --endpoint http://localhost:8080/v1/chat/completions \
+  --model-name Qwen2.5-7B-Instruct \
+  --time-in-secs 300
 ```
 
-**Optional**: `--target-bs` (default 1). BS=1 is the queueing-theory closed-loop special case. Terminates when all dataset entries are consumed.
+**Optional**: `--bs-limit` (default 1), `--tpot-limit` (ms, upper bound), `--tps-limit` (tokens/sec, lower bound), `--all-tokens-limit` (total context tokens, upper bound), `--controller-interval` (seconds, default 0.2), `--cooldown-ticks` (default 1). `--tpot-limit` and `--tps-limit` require `--stream`.
 
 
 ## Prompt Text Modes
@@ -140,7 +145,7 @@ The `plaintext` dataset reads a raw text file (one prompt per line):
 
 ```bash
 request-sim --mode feedback \
-  --target-bs 4 \
+  --bs-limit 4 \
   --dataset plaintext --dataset-path prompts.txt \
   --api sgl --endpoint http://localhost:8080/v1/chat/completions \
   --model-name Qwen2.5-7B-Instruct \
