@@ -41,6 +41,7 @@ tracing = "^0.1"
 tracing-subscriber = "0.3"
 crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
 request-sim-macros = { path = "request-sim-macros" }
+sha2 = "0.10"
 
 
 [features]

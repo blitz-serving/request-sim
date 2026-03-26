@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use clap::Parser;
-use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, MAX_TOKENS_CAP, METRIC_PERCENTILES};
+use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, MAX_TOKENS_CAP, METRIC_PERCENTILES, RID_SOURCE, RidSource};
 use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TgiApi, MODEL_NAME},
@@ -173,6 +173,12 @@ struct Args {
     /// trace provides an explicit output_length.
     #[clap(long)]
     max_tokens: Option<u64>,
+
+    /// Source for request rid (content identity).
+    ///   none         — no rid in request body (default)
+    ///   content-hash — SHA256 of serialized messages, truncated to 16 hex chars
+    #[clap(long, default_value = "none")]
+    rid_source: String,
 }
 
 fn validate_config(args: &Args) {
@@ -255,6 +261,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         rate,
         target_bs,
         max_tokens,
+        rid_source,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -271,6 +278,11 @@ async fn async_main(args: Args) -> Result<(), i32> {
     }
     METRIC_PERCENTILES.get_or_init(|| metric_percentile);
     MAX_TOKENS_CAP.get_or_init(|| max_tokens);
+    RID_SOURCE.get_or_init(|| match rid_source.as_str() {
+        "none" => RidSource::None,
+        "content-hash" => RidSource::ContentHash,
+        other => panic!("Invalid --rid-source: '{other}'. Must be 'none' or 'content-hash'"),
+    });
 
     let output_file = tokio::fs::OpenOptions::new()
         .create(true)

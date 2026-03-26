@@ -1,4 +1,4 @@
-use super::{LLMApi, RequestError, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME};
+use super::{LLMApi, RequestError, MAX_TOKENS_CAP, METRIC_PERCENTILES, MODEL_NAME, RID_SOURCE, RidSource, compute_content_hash_rid};
 use crate::dataset::PromptPayload;
 use futures_util::TryStreamExt;
 use reqwest::Response;
@@ -35,6 +35,10 @@ impl LLMApi for SglApi {
             body["max_tokens"] = json!(output_length);
         } else if let Some(Some(cap)) = MAX_TOKENS_CAP.get() {
             body["max_tokens"] = json!(cap);
+        }
+
+        if RID_SOURCE.get() == Some(&RidSource::ContentHash) {
+            body["rid"] = json!(compute_content_hash_rid(&body["messages"]));
         }
 
         body.to_string()
