@@ -877,7 +877,6 @@ fn spawn_controller_loop(
     spawn(async move {
         let interval = Duration::from_secs_f64(interval_secs);
         let mut step_size: usize = 1;
-        let mut prev_token_count: u64 = 0;
         let mut cooldown_remaining: u32 = 0;
 
         loop {
@@ -889,15 +888,13 @@ fn spawn_controller_loop(
 
             // ── 1. Observe ──────────────────────────────────────────────
             let bs_active = state.bs_active.load(Ordering::Relaxed);
-            let cur_token_count = state.global_token_counter.load(Ordering::Relaxed);
-            let delta_tokens = cur_token_count.saturating_sub(prev_token_count);
-            prev_token_count = cur_token_count;
-            let tps = delta_tokens as f64 / interval_secs;
 
-            // Compute avg TPOT and all_tokens from in-flight snapshot
-            let (avg_tpot, all_tokens) = {
+            // Compute per-user TPS (arithmetic mean of 1000/TPOT_i), avg TPOT,
+            // and all_tokens from in-flight snapshot
+            let (avg_tps, avg_tpot, all_tokens) = {
                 let map = state.in_flight.lock().unwrap();
                 let now_ms = get_timestamp();
+                let mut tps_sum = 0.0;
                 let mut tpot_sum = 0.0;
                 let mut tpot_count = 0u64;
                 let mut total_tokens: u64 = 0;
@@ -912,16 +909,22 @@ fn spawn_controller_loop(
                         if decode_elapsed > 0.0 {
                             let tpot_i = decode_elapsed / (out - 1) as f64;
                             tpot_sum += tpot_i;
+                            tps_sum += 1000.0 / tpot_i;
                             tpot_count += 1;
                         }
                     }
                 }
-                let avg = if tpot_count > 0 {
+                let avg_tpot = if tpot_count > 0 {
                     tpot_sum / tpot_count as f64
                 } else {
                     0.0
                 };
-                (avg, total_tokens)
+                let avg_tps = if tpot_count > 0 {
+                    tps_sum / tpot_count as f64
+                } else {
+                    0.0
+                };
+                (avg_tps, avg_tpot, total_tokens)
             };
 
             // ── 2. Evaluate constraints ─────────────────────────────────
@@ -929,7 +932,7 @@ fn spawn_controller_loop(
                 .map(|limit| avg_tpot > limit && avg_tpot > 0.0)
                 .unwrap_or(false);
             let tps_violated = tps_limit
-                .map(|limit| tps < limit && bs_active > 0 && cur_token_count > 0)
+                .map(|limit| avg_tps < limit && avg_tps > 0.0)
                 .unwrap_or(false);
             let all_tokens_violated = all_tokens_limit
                 .map(|limit| all_tokens > limit)
@@ -966,7 +969,7 @@ fn spawn_controller_loop(
             }
 
             tracing::info!(
-                "controller: bs_allowed={new_bs} bs_active={bs_active} tps={tps:.1} \
+                "controller: bs_allowed={new_bs} bs_active={bs_active} tps={avg_tps:.1} \
                  tpot={avg_tpot:.1}ms all_tokens={all_tokens} step={step_size} action={action}"
             );
         }
@@ -1216,6 +1219,7 @@ struct SummaryStats {
     max_e_time: Option<f64>,
     ttft_values: Vec<f64>,
     tpot_values: Vec<f64>,
+    tps_values: Vec<f64>,
     e2e_values: Vec<f64>,
 }
 
@@ -1229,6 +1233,7 @@ impl SummaryStats {
             max_e_time: None,
             ttft_values: Vec::new(),
             tpot_values: Vec::new(),
+            tps_values: Vec::new(),
             e2e_values: Vec::new(),
         }
     }
@@ -1263,6 +1268,9 @@ impl SummaryStats {
         if let Some(normalized_e2e) = metrics.get("normalized_e2e").and_then(|v| v.parse::<f64>().ok()) {
             // Non-streaming: E2E span_time / output_length (includes TTFT, not true TPOT)
             self.tpot_values.push(normalized_e2e);
+            if normalized_e2e > 0.0 {
+                self.tps_values.push(1000.0 / normalized_e2e);
+            }
         } else if let (Some(total_time), Some(token_count)) = (
             metrics.get("total_time").and_then(|v| v.parse::<f64>().ok()),
             metrics
@@ -1272,7 +1280,11 @@ impl SummaryStats {
             // Streaming: TPOT = decode_time / (actual_token_count - 1)
             // total_time = last_token - first_token spans (N-1) inter-token gaps
             if token_count > 1.0 {
-                self.tpot_values.push(total_time / (token_count - 1.0));
+                let tpot = total_time / (token_count - 1.0);
+                self.tpot_values.push(tpot);
+                if tpot > 0.0 {
+                    self.tps_values.push(1000.0 / tpot);
+                }
             }
         }
         if let Some(e2e) = metrics.get("span_time").and_then(|v| v.parse().ok()) {
@@ -1341,6 +1353,10 @@ impl SummaryStats {
         summary.insert(
             "tpot_mean_ms".to_string(),
             format_ms(mean(&self.tpot_values)),
+        );
+        summary.insert(
+            "tps_mean".to_string(),
+            format!("{:.3}", mean(&self.tps_values)),
         );
         summary.insert(
             "e2e_mean_ms".to_string(),

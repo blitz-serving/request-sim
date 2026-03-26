@@ -7,9 +7,11 @@ Usage:
         --bs 30 50 70 90 \
         --output bs_tps.png
 
-TPS (tokens per second) is the per-user token generation rate: TPS = 1000 / TPOT_mean.
-This is the inverse of TPOT (time per output token in ms), measuring how fast each
-user receives tokens — NOT aggregate system throughput.
+TPS (tokens per second) is the per-user token generation rate: arithmetic mean of
+per-request TPS_i = 1000 / TPOT_i. Read from `tps_mean` in the summary JSON.
+
+Note: `tps_mean` (arithmetic mean of TPS_i) >= 1000 / `tpot_mean_ms` (harmonic mean
+of TPS_i). The gap reflects TPOT variance across requests.
 """
 
 import argparse
@@ -49,7 +51,7 @@ def main():
         with open(summary_path) as f:
             summary = json.load(f)
         tpot = float(summary["tpot_mean_ms"])
-        tps = 1000.0 / tpot if tpot > 0 else 0.0
+        tps = float(summary["tps_mean"])
 
         bs_values.append(bs)
         tps_values.append(tps)
