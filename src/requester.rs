@@ -724,7 +724,6 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
         // so inflate() and spawn overhead do not accumulate into the interval.
         let loop_start = TokioInstant::now();
         let loop_start_ms = get_timestamp();
-        let mut next_deadline = loop_start;
 
         while !interrupt_flag.load(Ordering::Relaxed) {
             let data_index = index % dataset_len;
@@ -741,19 +740,17 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
                 }
             }
 
-            // Inter-arrival delay: deadline-based for both uniform and Poisson to prevent drift
+            // Inter-arrival delay: deadline-based for uniform, sleep-based for Poisson
             let intended_ms = match &arrival {
                 ArrivalProcess::Uniform => {
                     // Absolute deadline: loop_start + index/rate. Index 0 dispatches immediately.
-                    next_deadline = loop_start + Duration::from_secs_f64(index as f64 / rate);
-                    sleep_until(next_deadline).await;
+                    let deadline = loop_start + Duration::from_secs_f64(index as f64 / rate);
+                    sleep_until(deadline).await;
                     loop_start_ms + index as f64 * 1000.0 / rate
                 }
                 ArrivalProcess::Poisson => {
-                    let interarrival = next_interarrival(&arrival, rate);
-                    next_deadline += interarrival;
-                    sleep_until(next_deadline).await;
-                    loop_start_ms + next_deadline.duration_since(loop_start).as_secs_f64() * 1000.0
+                    sleep(next_interarrival(&arrival, rate)).await;
+                    get_timestamp()
                 }
             };
 

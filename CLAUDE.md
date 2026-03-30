@@ -105,3 +105,17 @@ Build with plain mode: `cargo build --release --features prompt-text-plain`
 | 0 (e.g. plaintext) | unset | omit | omit (EOS only) |
 
 Stored as `MAX_TOKENS_CAP: OnceLock<Option<u64>>` in `apis/mod.rs`, read by all API backends in `request_json_body()`.
+
+### `--context-length` guard
+
+When `input_length + output_length` exceeds `--context-length`, `min_tokens` is **omitted** from the request body (while `max_tokens` is kept). This prevents SGLang from rejecting requests with HTTP 400 when `min_tokens` is unachievable within the serving engine's context window.
+
+**How to determine the value**: default to the model's `max_position_embeddings` from its `config.json` (e.g. both Qwen3.5-35B-A3B-FP8 and Qwen3.5-122B-A10B-FP8 in `/nvme2/models/` have `max_position_embeddings: 262144`). If the SGLang engine was launched with an explicit `--context-length` override, use the engine's value instead.
+
+| `output_length` | `--context-length` | `input + output > ctx` | `min_tokens` | `max_tokens` |
+|---|---|---|---|---|
+| > 0 | set | no | `output_length` | `output_length` |
+| > 0 | set | yes | omit | `output_length` |
+| > 0 | unset | n/a | `output_length` | `output_length` |
+
+Stored as `CONTEXT_LENGTH: OnceLock<Option<u64>>` in `apis/mod.rs`.
