@@ -14,7 +14,7 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
     spawn,
     task::JoinHandle,
-    time::sleep,
+    time::{sleep, sleep_until, Instant as TokioInstant},
 };
 
 use crate::apis::METRIC_PERCENTILES;
@@ -719,9 +719,15 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
         let dataset_len = ctx.dataset.len();
         let mut index: usize = 0;
 
+        // Deadline-based scheduling: anchor to absolute time to prevent drift.
+        // For uniform arrival, each request i dispatches at loop_start + i/rate,
+        // so inflate() and spawn overhead do not accumulate into the interval.
+        let loop_start = TokioInstant::now();
+        let loop_start_ms = get_timestamp();
+        let mut next_deadline = loop_start;
+
         while !interrupt_flag.load(Ordering::Relaxed) {
             let data_index = index % dataset_len;
-            index += 1;
 
             let error_count = Arc::clone(&error_count);
             if let Some(threshold) = early_stop_error_threshold {
@@ -735,8 +741,23 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
                 }
             }
 
-            // Inter-arrival delay
-            sleep(next_interarrival(&arrival, rate)).await;
+            // Inter-arrival delay: deadline-based for both uniform and Poisson to prevent drift
+            let intended_ms = match &arrival {
+                ArrivalProcess::Uniform => {
+                    // Absolute deadline: loop_start + index/rate. Index 0 dispatches immediately.
+                    next_deadline = loop_start + Duration::from_secs_f64(index as f64 / rate);
+                    sleep_until(next_deadline).await;
+                    loop_start_ms + index as f64 * 1000.0 / rate
+                }
+                ArrivalProcess::Poisson => {
+                    let interarrival = next_interarrival(&arrival, rate);
+                    next_deadline += interarrival;
+                    sleep_until(next_deadline).await;
+                    loop_start_ms + next_deadline.duration_since(loop_start).as_secs_f64() * 1000.0
+                }
+            };
+
+            index += 1;
 
             let client = http_client.clone();
             let endpoint = endpoint.clone();
@@ -747,6 +768,7 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
+                let s_time_drift = s_time - intended_ms;
                 match post_with_timeout::<A>(
                     client,
                     endpoint.as_str(),
@@ -760,7 +782,7 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
                     Ok(mut metrics) => {
                         let e_time = get_timestamp();
                         metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
-                        metrics.insert("s_time_drift".to_string(), "0.000".to_string());
+                        metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
                         metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
                         metrics.insert("input_length".to_string(), input_length.to_string());
                         metrics.insert("output_length".to_string(), output_length.to_string());
@@ -780,7 +802,7 @@ pub fn spawn_request_loop_random_process<A: 'static + LLMApi + Send>(
                             "status".to_owned(), "timeout".to_owned(),
                         )]);
                         metrics.insert("s_time".to_string(), format!("{s_time:.3}"));
-                        metrics.insert("s_time_drift".to_string(), "0.000".to_string());
+                        metrics.insert("s_time_drift".to_string(), format!("{s_time_drift:.3}"));
                         metrics.insert("e_time".to_string(), format!("{e_time:.3}"));
                         metrics.insert("input_length".to_string(), input_length.to_string());
                         metrics.insert("output_length".to_string(), output_length.to_string());

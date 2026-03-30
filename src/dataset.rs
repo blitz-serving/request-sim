@@ -420,12 +420,16 @@ impl LLMTrace for MiniMaxDataset {
                 serde_json::from_str(&raw.dialogue_input)
                     .unwrap_or_else(|e| panic!("Failed to parse dialogue_input: {e}"));
 
-            // Build structured messages array, preserving roles
+            // Build structured messages array, mapping MiniMax roles to OpenAI roles
             let messages: Vec<serde_json::Value> = dialogue
                 .data
                 .iter()
                 .map(|msg| {
-                    let role = if msg.role.is_empty() { "user" } else { &msg.role };
+                    let role = match msg.role.as_str() {
+                        "" => "user",
+                        "ai" => "assistant",
+                        other => other,
+                    };
                     json!({"role": role, "content": msg.text})
                 })
                 .collect();
