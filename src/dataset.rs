@@ -314,6 +314,105 @@ impl LLMTrace for MooncakeDataset {
 }
 
 //
+// ============== OpenAIDataset ==============
+//
+
+/// Raw JSONL line from OpenAI Chat Completions format.
+/// Extra fields (model, stream, temperature, tools, metadata, etc.) are ignored.
+#[derive(Debug, Deserialize)]
+struct OpenAIRawItem {
+    messages: serde_json::Value,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+/// OpenAI dataset stores the actual messages and sends them directly.
+/// Unlike mooncake/bailian (which only have token counts and need TokenSampler
+/// to generate synthetic text), OpenAI format already contains the real prompt.
+struct OpenAIItem {
+    messages: serde_json::Value,
+    input_length: u64,
+    output_length: u64,
+    timestamp: f64,
+}
+
+pub struct OpenAIDataset {
+    items: Vec<OpenAIItem>,
+}
+
+impl OpenAIDataset {
+    pub fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+}
+
+unsafe impl Send for OpenAIDataset {}
+unsafe impl Sync for OpenAIDataset {}
+
+impl LLMTrace for OpenAIDataset {
+    fn load(&mut self, path: &str) {
+        let file = File::open(path).unwrap();
+        for (lineno, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.unwrap();
+            if line.trim().is_empty() {
+                continue;
+            }
+            let raw: OpenAIRawItem = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("Failed to parse OpenAI JSONL line {}: {e}", lineno + 1));
+            self.items.push(OpenAIItem {
+                messages: raw.messages,
+                input_length: raw.prompt_tokens,
+                output_length: raw.completion_tokens,
+                timestamp: lineno as f64 * 0.5,
+            });
+        }
+        tracing::info!("Loaded OpenAI dataset: {} items", self.items.len());
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn iter(&self) -> DataIter {
+        DataIter { size: self.items.len(), index: AtomicUsize::new(0) }
+    }
+
+    fn rps(&self) -> f64 {
+        if self.items.len() < 2 {
+            return 1.0;
+        }
+        self.items.len() as f64
+            / (self.items.last().unwrap().timestamp - self.items.first().unwrap().timestamp)
+    }
+
+    fn timestamp(&self, index: usize) -> u64 {
+        (self.items[index].timestamp * 1000.) as u64
+    }
+
+    // inflate for hashed mode — has TokenSampler param but we don't use it
+    #[cfg(not(feature = "prompt-text-plain"))]
+    fn inflate(&self, index: usize, _ts: &TokenSampler) -> (PromptPayload, u64, u64) {
+        let item = &self.items[index];
+        (
+            PromptPayload::Messages(item.messages.clone()),
+            item.input_length,
+            item.output_length,
+        )
+    }
+
+    // inflate for plain mode — no TokenSampler param
+    #[cfg(feature = "prompt-text-plain")]
+    fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
+        let item = &self.items[index];
+        (
+            PromptPayload::Messages(item.messages.clone()),
+            item.input_length,
+            item.output_length,
+        )
+    }
+}
+
+//
 // ============== MiniMaxDataset ==============
 //
 

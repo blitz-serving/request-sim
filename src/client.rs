@@ -19,7 +19,7 @@ use request_sim::{
 };
 #[cfg(not(feature = "prompt-text-plain"))]
 use request_sim::{
-    dataset::{BailianDataset, MooncakeDataset},
+    dataset::{BailianDataset, MooncakeDataset, OpenAIDataset},
     token_sampler::TokenSampler,
 };
 #[cfg(feature = "prompt-text-plain")]
@@ -388,6 +388,17 @@ async fn async_main(args: Args) -> Result<(), i32> {
             dataset.load(
                 dataset_path
                     .expect("--dataset-path is required for plaintext dataset")
+                    .as_str(),
+            );
+            dataset
+        }
+        "openai" => {
+            let mut dataset = Box::pin(OpenAIDataset::new());
+            #[cfg(not(feature = "prompt-text-plain"))]
+            { block_size = 512; }  // not used by OpenAI dataset, but variable must be set
+            dataset.load(
+                dataset_path
+                    .expect("A dataset path must be provided for openai dataset!")
                     .as_str(),
             );
             dataset
