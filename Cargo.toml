@@ -45,7 +45,6 @@ sha2 = "0.10"
 
 
 [features]
-default = []
-bypass_router = []
+default = ["prompt-text-hashed"]
 prompt-text-plain = []
 prompt-text-hashed = []

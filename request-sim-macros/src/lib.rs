@@ -7,7 +7,7 @@ use syn::{parse_macro_input, Ident, Item};
 ///
 /// Both struct and impl items are gated behind the appropriate `#[cfg]`:
 ///
-/// - `#[prompt_text(hashed)]` → `#[cfg(not(feature = "prompt-text-plain"))]`
+/// - `#[prompt_text(hashed)]` → `#[cfg(feature = "prompt-text-hashed")]`
 /// - `#[prompt_text(plain)]`  → `#[cfg(feature = "prompt-text-plain")]`
 #[proc_macro_attribute]
 pub fn prompt_text(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -33,20 +33,20 @@ pub fn prompt_text(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// `#[prompt_text(hashed)]`
 ///
-/// - struct  → gated with `#[cfg(not(feature = "prompt-text-plain"))]`
-/// - impl   → gated with `#[cfg(not(feature = "prompt-text-plain"))]`
+/// - struct  → gated with `#[cfg(feature = "prompt-text-hashed")]`
+/// - impl   → gated with `#[cfg(feature = "prompt-text-hashed")]`
 fn emit_hashed(item: Item) -> TokenStream {
     match item {
         Item::Struct(s) => {
             quote! {
-                #[cfg(not(feature = "prompt-text-plain"))]
+                #[cfg(feature = "prompt-text-hashed")]
                 #s
             }
             .into()
         }
         Item::Impl(i) => {
             quote! {
-                #[cfg(not(feature = "prompt-text-plain"))]
+                #[cfg(feature = "prompt-text-hashed")]
                 #i
             }
             .into()

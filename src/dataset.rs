@@ -3,19 +3,17 @@ use std::{
     io::{BufRead, BufReader},
     sync::atomic::{AtomicUsize, Ordering},
 };
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 use std::{cell::UnsafeCell, collections::HashMap};
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 use crate::token_sampler::TokenSampler;
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 use crate::SpinRwLock;
 use chrono::NaiveDateTime;
 use request_sim_macros::prompt_text;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "prompt-text-plain")]
-use serde_json::json;
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 use tracing::{instrument, Level};
 
 /// Describes the format of the prompt returned by `inflate()`.
@@ -29,7 +27,7 @@ pub enum PromptPayload {
 }
 
 /// jsonl of Bailian
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct BailianDataItem {
     pub chat_id: i64,
@@ -43,7 +41,7 @@ pub(crate) struct BailianDataItem {
 }
 
 /// jsonl of Mooncake
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MooncakeDataItem {
     pub timestamp: f32,
@@ -101,7 +99,7 @@ pub trait LLMTrace: Send + Sync {
     fn len(&self) -> usize;
     fn timestamp(&self, index: usize) -> u64;
 
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     fn inflate(&self, index: usize, ts: &TokenSampler) -> (PromptPayload, u64, u64);
 
     #[cfg(feature = "prompt-text-plain")]
@@ -121,7 +119,7 @@ pub struct BailianDataset {
     rwlock: SpinRwLock,
 }
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 impl BailianDataset {
     pub fn new() -> Self {
         Self {
@@ -132,9 +130,9 @@ impl BailianDataset {
     }
 }
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 unsafe impl Send for BailianDataset {}
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 unsafe impl Sync for BailianDataset {}
 
 #[prompt_text(hashed)]
@@ -222,7 +220,7 @@ pub struct MooncakeDataset {
     rwlock: SpinRwLock,
 }
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 impl MooncakeDataset {
     pub fn new() -> Self {
         Self {
@@ -233,9 +231,9 @@ impl MooncakeDataset {
     }
 }
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 unsafe impl Send for MooncakeDataset {}
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 unsafe impl Sync for MooncakeDataset {}
 
 #[prompt_text(hashed)]
@@ -319,8 +317,9 @@ impl LLMTrace for MooncakeDataset {
 
 /// Raw JSONL line from OpenAI Chat Completions format.
 /// Extra fields (model, stream, temperature, tools, metadata, etc.) are ignored.
+#[cfg(feature = "prompt-text-plain")]
 #[derive(Debug, Deserialize)]
-struct OpenAIRawItem {
+struct OpenaiRawItem {
     messages: serde_json::Value,
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -329,27 +328,27 @@ struct OpenAIRawItem {
 /// OpenAI dataset stores the actual messages and sends them directly.
 /// Unlike mooncake/bailian (which only have token counts and need TokenSampler
 /// to generate synthetic text), OpenAI format already contains the real prompt.
-struct OpenAIItem {
+#[cfg(feature = "prompt-text-plain")]
+struct OpenaiItem {
     messages: serde_json::Value,
     input_length: u64,
     output_length: u64,
-    timestamp: f64,
 }
 
-pub struct OpenAIDataset {
-    items: Vec<OpenAIItem>,
+#[prompt_text(plain)]
+pub struct OpenaiDataset {
+    items: Vec<OpenaiItem>,
 }
 
-impl OpenAIDataset {
+#[cfg(feature = "prompt-text-plain")]
+impl OpenaiDataset {
     pub fn new() -> Self {
         Self { items: Vec::new() }
     }
 }
 
-unsafe impl Send for OpenAIDataset {}
-unsafe impl Sync for OpenAIDataset {}
-
-impl LLMTrace for OpenAIDataset {
+#[prompt_text(plain)]
+impl LLMTrace for OpenaiDataset {
     fn load(&mut self, path: &str) {
         let file = File::open(path).unwrap();
         for (lineno, line) in BufReader::new(file).lines().enumerate() {
@@ -357,13 +356,12 @@ impl LLMTrace for OpenAIDataset {
             if line.trim().is_empty() {
                 continue;
             }
-            let raw: OpenAIRawItem = serde_json::from_str(&line)
+            let raw: OpenaiRawItem = serde_json::from_str(&line)
                 .unwrap_or_else(|e| panic!("Failed to parse OpenAI JSONL line {}: {e}", lineno + 1));
-            self.items.push(OpenAIItem {
+            self.items.push(OpenaiItem {
                 messages: raw.messages,
                 input_length: raw.prompt_tokens,
                 output_length: raw.completion_tokens,
-                timestamp: lineno as f64 * 0.5,
             });
         }
         tracing::info!("Loaded OpenAI dataset: {} items", self.items.len());
@@ -378,30 +376,13 @@ impl LLMTrace for OpenAIDataset {
     }
 
     fn rps(&self) -> f64 {
-        if self.items.len() < 2 {
-            return 1.0;
-        }
-        self.items.len() as f64
-            / (self.items.last().unwrap().timestamp - self.items.first().unwrap().timestamp)
+        1.0
     }
 
     fn timestamp(&self, index: usize) -> u64 {
-        (self.items[index].timestamp * 1000.) as u64
+        index as u64
     }
 
-    // inflate for hashed mode — has TokenSampler param but we don't use it
-    #[cfg(not(feature = "prompt-text-plain"))]
-    fn inflate(&self, index: usize, _ts: &TokenSampler) -> (PromptPayload, u64, u64) {
-        let item = &self.items[index];
-        (
-            PromptPayload::Messages(item.messages.clone()),
-            item.input_length,
-            item.output_length,
-        )
-    }
-
-    // inflate for plain mode — no TokenSampler param
-    #[cfg(feature = "prompt-text-plain")]
     fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
         let item = &self.items[index];
         (
@@ -409,179 +390,6 @@ impl LLMTrace for OpenAIDataset {
             item.input_length,
             item.output_length,
         )
-    }
-}
-
-//
-// ============== MiniMaxDataset ==============
-//
-
-/// Raw JSONL line from MiniMax traces.
-#[cfg(feature = "prompt-text-plain")]
-#[derive(Debug, Deserialize)]
-struct MiniMaxRawItem {
-    server_timestamp: u64,
-    dialogue_input: String,
-    dialogue_outputs: Option<String>,
-}
-
-/// A single message entry inside `dialogue_input.data[]`.
-#[cfg(feature = "prompt-text-plain")]
-#[derive(Debug, Deserialize)]
-struct MiniMaxDialogueMessage {
-    #[serde(default)]
-    role: String,
-    #[serde(default)]
-    text: String,
-}
-
-/// Wrapper for `dialogue_input` JSON (we only need the `data` array).
-#[cfg(feature = "prompt-text-plain")]
-#[derive(Debug, Deserialize)]
-struct MiniMaxDialogueInput {
-    data: Vec<MiniMaxDialogueMessage>,
-}
-
-/// A single output entry inside the `dialogue_outputs` JSON array.
-#[cfg(feature = "prompt-text-plain")]
-#[derive(Debug, Deserialize)]
-struct MiniMaxOutputEntry {
-    model_input_tokens_count: u64,
-    output_tokens_count: Vec<u64>,
-}
-
-/// Processed item ready for replay.
-#[cfg(feature = "prompt-text-plain")]
-struct MiniMaxParsedItem {
-    timestamp_ms: u64,
-    prompt: PromptPayload,
-    input_length: u64,
-    output_length: u64,
-}
-
-#[prompt_text(plain)]
-pub struct MiniMaxDataset {
-    items: Vec<MiniMaxParsedItem>,
-}
-
-#[cfg(feature = "prompt-text-plain")]
-impl MiniMaxDataset {
-    pub fn new() -> Self {
-        Self { items: Vec::new() }
-    }
-}
-
-#[cfg(feature = "prompt-text-plain")]
-unsafe impl Send for MiniMaxDataset {}
-#[cfg(feature = "prompt-text-plain")]
-unsafe impl Sync for MiniMaxDataset {}
-
-#[prompt_text(plain)]
-impl LLMTrace for MiniMaxDataset {
-    fn load(&mut self, path: &str) {
-        let file = File::open(path).unwrap();
-        let mut raw_items: Vec<MiniMaxRawItem> = Vec::new();
-
-        for line in BufReader::new(file).lines() {
-            let line = line.unwrap();
-            if line.trim().is_empty() {
-                continue;
-            }
-            let item: MiniMaxRawItem = serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("Failed to parse MiniMax JSONL line: {e}"));
-            raw_items.push(item);
-        }
-
-        // Sort by timestamp
-        raw_items.sort_by_key(|item| item.server_timestamp);
-
-        let base_ts = raw_items.first().map(|i| i.server_timestamp).unwrap_or(0);
-
-        for raw in &raw_items {
-            // Skip entries with null dialogue_outputs
-            let dialogue_outputs = match &raw.dialogue_outputs {
-                Some(s) => s,
-                None => continue,
-            };
-            // Parse dialogue_outputs: JSON array of output entries
-            let outputs: Vec<MiniMaxOutputEntry> =
-                serde_json::from_str(dialogue_outputs)
-                    .unwrap_or_else(|e| panic!("Failed to parse dialogue_outputs: {e}"));
-            let first_output = outputs.first().expect("dialogue_outputs array is empty");
-            let input_length = first_output.model_input_tokens_count;
-            let output_length = *first_output
-                .output_tokens_count
-                .first()
-                .expect("output_tokens_count array is empty");
-
-            // Parse dialogue_input: JSON object with `data` array of messages
-            let dialogue: MiniMaxDialogueInput =
-                serde_json::from_str(&raw.dialogue_input)
-                    .unwrap_or_else(|e| panic!("Failed to parse dialogue_input: {e}"));
-
-            // Build structured messages array, mapping MiniMax roles to OpenAI roles
-            let messages: Vec<serde_json::Value> = dialogue
-                .data
-                .iter()
-                .map(|msg| {
-                    let role = match msg.role.as_str() {
-                        "" => "user",
-                        "ai" => "assistant",
-                        other => other,
-                    };
-                    json!({"role": role, "content": msg.text})
-                })
-                .collect();
-
-            // Convert nanoseconds to relative milliseconds
-            let timestamp_ms = (raw.server_timestamp - base_ts) / 1_000_000;
-
-            self.items.push(MiniMaxParsedItem {
-                timestamp_ms,
-                prompt: PromptPayload::Messages(json!(messages)),
-                input_length,
-                output_length,
-            });
-        }
-
-        tracing::info!(
-            "Loaded MiniMax dataset: {} items, time span {:.1}s",
-            self.items.len(),
-            self.items.last().map(|i| i.timestamp_ms as f64 / 1000.0).unwrap_or(0.0),
-        );
-    }
-
-    fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    fn iter(&self) -> DataIter {
-        DataIter {
-            size: self.items.len(),
-            index: AtomicUsize::new(0),
-        }
-    }
-
-    fn rps(&self) -> f64 {
-        if self.items.len() < 2 {
-            return 1.0;
-        }
-        let duration_s = (self.items.last().unwrap().timestamp_ms
-            - self.items.first().unwrap().timestamp_ms) as f64
-            / 1000.0;
-        if duration_s <= 0.0 {
-            return 1.0;
-        }
-        self.items.len() as f64 / duration_s
-    }
-
-    fn timestamp(&self, index: usize) -> u64 {
-        self.items[index].timestamp_ms
-    }
-
-    fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
-        let item = &self.items[index];
-        (item.prompt.clone(), item.input_length, item.output_length)
     }
 }
 

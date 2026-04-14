@@ -3,12 +3,17 @@ pub mod cache;
 pub mod dataset;
 pub mod requester;
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 pub mod token_sampler;
 
 #[cfg(all(feature = "prompt-text-plain", feature = "prompt-text-hashed"))]
 compile_error!(
     "Features `prompt-text-plain` and `prompt-text-hashed` are mutually exclusive. Choose one."
+);
+
+#[cfg(not(any(feature = "prompt-text-plain", feature = "prompt-text-hashed")))]
+compile_error!(
+    "Either `prompt-text-plain` or `prompt-text-hashed` must be enabled."
 );
 
 use core::hint::spin_loop;

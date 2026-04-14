@@ -25,7 +25,7 @@ use crate::{
     dataset::LLMTrace,
     get_timestamp, init_basetime, timeout_secs_upon_slo,
 };
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 use crate::token_sampler::TokenSampler;
 
 // ── Module-level statics ─────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ static RETURNCODE: AtomicI32 = AtomicI32::new(0);
 #[derive(Clone)]
 pub struct RequestContext {
     pub dataset: Arc<Pin<Box<dyn LLMTrace>>>,
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     pub token_sampler: Arc<TokenSampler>,
     pub prompt_cache: Option<Arc<PromptCache>>,
 }
@@ -50,7 +50,7 @@ impl RequestContext {
             let entry = cache.get(index);
             (entry.prompt.clone(), entry.input_length, entry.output_length)
         } else {
-            #[cfg(not(feature = "prompt-text-plain"))]
+            #[cfg(feature = "prompt-text-hashed")]
             {
                 self.dataset.inflate(index, self.token_sampler.as_ref())
             }
@@ -131,7 +131,7 @@ async fn wait_all(handle_rx: flume::Receiver<JoinHandle<()>>, interrupt_flag: Ar
     }
 }
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     endpoint: String,
     dataset: Arc<Pin<Box<dyn LLMTrace>>>,
@@ -483,7 +483,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     handle
 }
 
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 pub fn spawn_request_loop_debug<A: 'static + LLMApi + Send>(
     _endpoint: String,
     dataset: Arc<Pin<Box<dyn LLMTrace>>>,
@@ -1415,7 +1415,7 @@ fn format_ms(value: f64) -> String {
 }
 
 #[cfg(test)]
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 mod tests {
     use super::*;
     use crate::{

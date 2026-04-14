@@ -17,14 +17,14 @@ use request_sim::{
         ControllerConfig, RequestContext,
     },
 };
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 use request_sim::{
-    dataset::{BailianDataset, MooncakeDataset, OpenAIDataset},
+    dataset::{BailianDataset, MooncakeDataset},
     token_sampler::TokenSampler,
 };
 #[cfg(feature = "prompt-text-plain")]
-use request_sim::dataset::{MiniMaxDataset, PlainTextDataset};
-#[cfg(not(feature = "prompt-text-plain"))]
+use request_sim::dataset::{OpenaiDataset, PlainTextDataset};
+#[cfg(feature = "prompt-text-hashed")]
 use tokenizers::Tokenizer;
 use tokio::spawn;
 use tracing::level_filters::LevelFilter;
@@ -36,21 +36,21 @@ use tracing_subscriber::{prelude::*, Layer, Registry};
 #[command(rename_all = "kebab-case")]
 struct Args {
     /// Path to tokenizer file.
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     #[clap(long, required = true)]
     tokenizer: String,
 
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     #[clap(long, required = true)]
     tokenizer_config: String,
 
     /// Number of producer threads in TokenSampler.
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     #[clap(long)]
     num_producer: Option<usize>,
 
     /// Capacity of the channel between producers and consumers in TokenSampler.
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     #[clap(long)]
     channel_capacity: Option<usize>,
 
@@ -265,13 +265,13 @@ async fn async_main(args: Args) -> Result<(), i32> {
     validate_config(&args);
 
     let Args {
-        #[cfg(not(feature = "prompt-text-plain"))]
+        #[cfg(feature = "prompt-text-hashed")]
         tokenizer,
-        #[cfg(not(feature = "prompt-text-plain"))]
+        #[cfg(feature = "prompt-text-hashed")]
         tokenizer_config,
-        #[cfg(not(feature = "prompt-text-plain"))]
+        #[cfg(feature = "prompt-text-hashed")]
         num_producer,
-        #[cfg(not(feature = "prompt-text-plain"))]
+        #[cfg(feature = "prompt-text-hashed")]
         channel_capacity,
         threads: _,
         endpoint,
@@ -346,11 +346,11 @@ async fn async_main(args: Args) -> Result<(), i32> {
         .unwrap();
 
     // --- Dataset dispatch ---
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     let block_size;
 
     let dataset: Pin<Box<dyn LLMTrace>> = match dataset.to_lowercase().as_str() {
-        #[cfg(not(feature = "prompt-text-plain"))]
+        #[cfg(feature = "prompt-text-hashed")]
         "mooncake" => {
             let mut dataset: Pin<Box<MooncakeDataset>> = Box::pin(MooncakeDataset::new());
             block_size = 512;
@@ -361,23 +361,13 @@ async fn async_main(args: Args) -> Result<(), i32> {
             );
             dataset
         }
-        #[cfg(not(feature = "prompt-text-plain"))]
+        #[cfg(feature = "prompt-text-hashed")]
         "bailian" => {
             let mut dataset = Box::pin(BailianDataset::new());
             block_size = 16;
             dataset.load(
                 dataset_path
                     .expect("A dataset path must be provided in replay mode!")
-                    .as_str(),
-            );
-            dataset
-        }
-        #[cfg(feature = "prompt-text-plain")]
-        "minimax" => {
-            let mut dataset = Box::pin(MiniMaxDataset::new());
-            dataset.load(
-                dataset_path
-                    .expect("A dataset path must be provided for minimax dataset!")
                     .as_str(),
             );
             dataset
@@ -392,10 +382,9 @@ async fn async_main(args: Args) -> Result<(), i32> {
             );
             dataset
         }
+        #[cfg(feature = "prompt-text-plain")]
         "openai" => {
-            let mut dataset = Box::pin(OpenAIDataset::new());
-            #[cfg(not(feature = "prompt-text-plain"))]
-            { block_size = 512; }  // not used by OpenAI dataset, but variable must be set
+            let mut dataset = Box::pin(OpenaiDataset::new());
             dataset.load(
                 dataset_path
                     .expect("A dataset path must be provided for openai dataset!")
@@ -410,7 +399,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
     let interrupt_flag = Arc::new(AtomicBool::new(false));
 
     // Create token sampler (hashed mode only)
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     let token_sampler = Arc::new(TokenSampler::new(
         Tokenizer::from_file(tokenizer).unwrap(),
         tokenizer_config,
@@ -427,7 +416,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             let path = cache_path
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/dev/shm/request-sim-cache.bin"));
-            #[cfg(not(feature = "prompt-text-plain"))]
+            #[cfg(feature = "prompt-text-hashed")]
             let cache = PromptCache::load_or_generate(
                 dataset.as_ref().get_ref(),
                 token_sampler.as_ref(),
@@ -444,7 +433,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             let path = cache_path
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./request-sim-cache.bin"));
-            #[cfg(not(feature = "prompt-text-plain"))]
+            #[cfg(feature = "prompt-text-hashed")]
             let cache = PromptCache::load_or_generate(
                 dataset.as_ref().get_ref(),
                 token_sampler.as_ref(),
@@ -465,7 +454,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
     // Build RequestContext for new mode functions
     let ctx = RequestContext {
         dataset: dataset.clone(),
-        #[cfg(not(feature = "prompt-text-plain"))]
+        #[cfg(feature = "prompt-text-hashed")]
         token_sampler: token_sampler.clone(),
         prompt_cache: prompt_cache.clone(),
     };
@@ -523,7 +512,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         "release-with-debug" => spawn_request_loop_debug::<TgiApi>(
             endpoint,
             dataset,
-            #[cfg(not(feature = "prompt-text-plain"))]
+            #[cfg(feature = "prompt-text-hashed")]
             token_sampler,
             scale_factor.unwrap(),
             tx,
@@ -535,7 +524,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "trace-replay" => spawn_request_loop_with_timestamp::<TgiApi>(
                 endpoint,
                 dataset,
-                #[cfg(not(feature = "prompt-text-plain"))]
+                #[cfg(feature = "prompt-text-hashed")]
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,
@@ -583,7 +572,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "trace-replay" => spawn_request_loop_with_timestamp::<OaiApi>(
                 endpoint,
                 dataset,
-                #[cfg(not(feature = "prompt-text-plain"))]
+                #[cfg(feature = "prompt-text-hashed")]
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,
@@ -631,7 +620,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "trace-replay" => spawn_request_loop_with_timestamp::<OaiApi>(
                 endpoint,
                 dataset,
-                #[cfg(not(feature = "prompt-text-plain"))]
+                #[cfg(feature = "prompt-text-hashed")]
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,
@@ -679,7 +668,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
             "trace-replay" => spawn_request_loop_with_timestamp::<SglApi>(
                 endpoint,
                 dataset,
-                #[cfg(not(feature = "prompt-text-plain"))]
+                #[cfg(feature = "prompt-text-hashed")]
                 token_sampler,
                 scale_factor.unwrap(),
                 tx,

@@ -3,7 +3,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::dataset::{LLMTrace, PromptPayload};
-#[cfg(not(feature = "prompt-text-plain"))]
+#[cfg(feature = "prompt-text-hashed")]
 use crate::token_sampler::TokenSampler;
 
 /// A single pre-generated prompt with its metadata.
@@ -39,7 +39,7 @@ impl PromptCache {
 
     /// Load cache from file if it exists and has the expected count,
     /// otherwise generate from dataset and write to file.
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     pub fn load_or_generate(
         dataset: &dyn LLMTrace,
         token_sampler: &TokenSampler,
@@ -129,7 +129,7 @@ impl PromptCache {
     }
 
     /// Generate all prompts by iterating the dataset.
-    #[cfg(not(feature = "prompt-text-plain"))]
+    #[cfg(feature = "prompt-text-hashed")]
     fn generate(dataset: &dyn LLMTrace, token_sampler: &TokenSampler) -> Self {
         let n = dataset.len();
         tracing::info!("Pre-generating {n} prompts...");
