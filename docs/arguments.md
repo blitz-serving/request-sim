@@ -1,81 +1,128 @@
-
 # Command-line Arguments
 
-This document describes all command-line arguments supported by **Trace-Replayer**.
+Complete CLI reference for **request-sim**. All arguments use `--kebab-case`.
 
+## Core (always required)
 
-## Required Arguments
+| Argument | Type | Description |
+|----------|------|-------------|
+| `--endpoint` | `String` | Target HTTP endpoint (e.g. `http://localhost:8080/v1/chat/completions`) |
+| `--api`, `-a` | `String` | API backend: `openai`, `sgl`, `tgi`, `aibrix`, `release-with-debug` |
+| `--dataset`, `-d` | `String` | Dataset type (see [Datasets](#datasets)) |
+| `--dataset-path` | `String` | Path to dataset file |
 
-| Argument             | Type             | Description                                                                                              |
-| -------------------- | ---------------- | -------------------------------------------------------------------------------------------------------- |
-| `--tokenizer`        | `String`         | Path to `tokenizer.json` used for tokenization.                                                          |
-| `--tokenizer-config` | `String`         | Path to `tokenizer_config.json`.                                                                         |
-| `--endpoint`         | `String`         | Target HTTP endpoint. See **Supported APIs** for examples (e.g., TGI: `http://localhost:8000/generate`). |
-| `--api`, `-a`        | `String`         | LLM API type: `tgi`, `openai`, or `aibrix`.                                                              |
-| `--dataset`, `-d`    | `String`         | Dataset type: `bailian`, `mooncake`, `azure`.                                                            |
-| `--dataset-path`     | `Option<String>` | Path to the dataset file.                                                                                |
+### Datasets
 
+Available datasets depend on the compile-time feature flag:
 
-## Request Rate Control
+| Build | Feature flag | Datasets |
+|-------|-------------|----------|
+| Default (hashed) | *(none)* | `bailian`, `mooncake` |
+| Plain text | `--features prompt-text-plain` | `plaintext`, `openai` |
 
-| Argument         | Type          | Default | Description                                                                                                                                                                                  |
-| ---------------- | ------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--scale-factor` | `Option<f64>` | None    | Request rate scaling factor. For example, `2.0` maps **logical time** in the trace to **physical (wall-clock) time** at 2× speed, issuing more requests within the same wall-clock duration. |
+## Mode Selection
 
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--mode` | `String` | `trace-replay` | Dispatch mode: `trace-replay`, `random-process`, `feedback` |
 
-## Concurrency & Runtime
+### trace-replay mode
 
-| Argument             | Type            | Default   | Description                                                              |
-| -------------------- | --------------- | --------- | ------------------------------------------------------------------------ |
-| `--num-producer`     | `Option<usize>` | None      | Number of producer threads in `TokenSampler` (recommended: 16).          |
-| `--channel-capacity` | `Option<usize>` | None      | Channel capacity between producers and consumers (recommended: 10240).   |
-| `--threads`          | `Option<usize>` | CPU cores | Number of Tokio runtime worker threads. ~30 threads can achieve 100 QPS. |
+Replays requests at original trace timestamps, scaled by `--scale-factor`.
 
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--scale-factor` | `f64` | *(required)* | Time scaling. `2.0` = 2x speed (more requests per wall-clock second) |
+| `--begin-time` | `u64` | None | Filter: only replay requests with trace timestamp >= this (ms) |
+| `--end-time` | `u64` | None | Filter: only replay requests with trace timestamp <= this (ms) |
 
-## Output & Logging
+### random-process mode
 
-| Argument              | Type     | Default              | Description       |
-| --------------------- | -------- | -------------------- | ----------------- |
-| `--output-path`, `-o` | `String` | `./log/output.jsonl` | Output file path. |
-| `--summary-path` | `Option<String>` | `<output-path>.summary.json` | Summary output file path (JSON). |
-| `--metric-percentile` | `Vec<u32>` | `90,95,99` | Percentiles (comma-separated) to report for latency metrics. |
+Stochastic arrival times. Cycles through dataset indefinitely until `--time-in-secs`.
 
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--arrival` | `String` | *(required)* | Arrival process: `poisson` or `uniform` |
+| `--rate` | `f64` | *(required)* | Request rate in req/s (must be > 0) |
 
-## Runtime Duration
+### feedback mode
 
-| Argument               | Type  | Default | Description                           |
-| ---------------------- | ----- | ------- | ------------------------------------- |
-| `--time-in-secs`, `-t` | `u64` | `60`    | Replayer runtime duration in seconds. |
-| `--early-stop-error-threshold` | Option<u32> | None    | Early stop when timeout requests exceed threshold |
+AIMD closed-loop controller. Probes concurrency from 1 toward `--bs-limit`, retreating when constraints are violated.
 
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--bs-limit` | `usize` | `1` | Max concurrent in-flight requests (concurrency ceiling) |
+| `--controller-interval` | `f64` | `0.2` | AIMD tick interval in seconds |
+| `--cooldown-ticks` | `u32` | `1` | Ticks to skip after each actuation before next adjustment |
+| `--tpot-limit` | `f64` | None | TPOT upper bound in ms. Activates AIMD. Requires `--stream` |
+| `--tps-limit` | `f64` | None | TPS lower bound (tokens/sec). Activates AIMD. Requires `--stream` |
+| `--all-tokens-limit` | `u64` | None | Total context tokens upper bound. Activates AIMD |
 
-## Platform-specific Arguments
+Without any constraint args (`--tpot-limit`, `--tps-limit`, `--all-tokens-limit`), the controller simply ramps to `--bs-limit` and holds steady (static concurrency).
 
-| Argument         | Type             | Description                                        |
-| ---------------- | ---------------- | -------------------------------------------------- |
-| `--model-name`   | `Option<String>` | Model name used by the target inference framework. |
-| `--aibrix-route` | `Option<String>` | AIBrix routing strategy name.                      |
+## Token Control
 
-
-## SLO Parameters
-
-| Argument     | Type  | Default | Description          |
-| ------------ | ----- | ------- | -------------------- |
-| `--ttft-slo` | `f32` | `5.0`   | TTFT SLO in seconds. |
-| `--tpot-slo` | `f32` | `0.06`  | TPOT SLO in seconds. |
-
-If a request does not complete within:
-
-```
-
-max(15, TTFT_SLO + TPOT_SLO * output_length)
-
-```
-
-the connection will be aborted and a timeout will be recorded.
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--max-tokens` | `u64` | None | Safety cap on output tokens. Applied only when the dataset has no `output_length` (e.g. `plaintext`). Ignored when trace provides explicit `output_length` |
+| `--context-length` | `u64` | None | Model context window (tokens). When `input_length + output_length` exceeds this, `min_tokens` is omitted from request body to avoid server-side 400 errors |
 
 ## Streaming
 
-| Argument     |  Type   | Description          |
-| ------------ |  ------ | -------------------- |
-| `--stream` |  `bool` | If send streaming request |
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--stream` | `bool` | `false` | Enable SSE streaming. Required for `--tpot-limit` and `--tps-limit` |
+
+## SLO & Timeout
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--ttft-slo` | `f32` | `5.0` | TTFT SLO in seconds |
+| `--tpot-slo` | `f32` | `0.06` | TPOT SLO in seconds |
+| `--early-stop-error-threshold` | `u32` | None | Early stop when timeout request count exceeds this threshold |
+
+Per-request timeout is computed as: `max(15, ttft_slo + tpot_slo * output_length)` seconds. If a request does not complete within this window, it is aborted and recorded as a timeout.
+
+## Runtime
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--time-in-secs`, `-t` | `u64` | `60` | Maximum runtime duration in seconds |
+| `--threads` | `usize` | `55` | Tokio worker threads |
+
+## Output
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--output-path`, `-o` | `String` | `./log/output.jsonl` | Per-request output file (JSONL) |
+| `--summary-path` | `String` | `<output-path>.summary.json` | Aggregate summary file (JSON) |
+| `--metric-percentile` | `Vec<u32>` | `90,95,99` | Comma-separated percentiles to report for latency metrics |
+| `--tracing-path` | `String` | None | Detailed tracing output file (only with `release-with-debug` API) |
+
+## Platform / API-specific
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--model-name` | `String` | None | Model name. Required for `openai`, `sgl`, `aibrix` APIs |
+| `--aibrix-route` | `String` | None | AIBrix routing strategy: `prefix-cache`, `prefix-cache-preble`, `throughput` |
+| `--rid-source` | `String` | `none` | Request ID source: `none` (no rid) or `content-hash` (SHA256 of messages) |
+
+## Cache (hashed mode only)
+
+Pre-generate all prompts to avoid runtime `TokenSampler` latency.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--cache` | `String` | `none` | Cache mode: `none`, `tmpfs`, `file` |
+| `--cache-path` | `String` | *(mode-dependent)* | Custom cache file path. Defaults: tmpfs → `/dev/shm/request-sim-cache.bin`, file → `./request-sim-cache.bin` |
+
+## Hashed Mode Only
+
+These arguments are only available when built **without** `--features prompt-text-plain` (the default hashed build).
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--tokenizer` | `String` | *(required)* | Path to `tokenizer.json` |
+| `--tokenizer-config` | `String` | *(required)* | Path to `tokenizer_config.json` |
+| `--num-producer` | `usize` | `1` | Producer threads in `TokenSampler` (recommended: 16) |
+| `--channel-capacity` | `usize` | `128` | Channel capacity between producers and consumers (recommended: 10240) |

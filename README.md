@@ -1,261 +1,131 @@
-# LLM anonymous Trace-Replayer
+# request-sim
 
-**Trace-Replayer** is a Rust-based tool for replaying **anonymous traces** (e.g., https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon) containing block hashes on backend serving systems (e.g., vLLM, a cluster of vLLM, etc), making it easier for developers to conduct **debugging and performance benchmarking** of LLM serving systems.
+Rust benchmark client for LLM inference endpoints. Replays production traces, generates stochastic workloads, or runs closed-loop concurrency sweeps — measuring TTFT, TPOT, and throughput.
 
-At a high-level, it reconstructs **prompts** based on **prompt length + block hashes** recorded in the trace (preserving the same KVCache hit patterns) on-the-fly,
-sends requests to specified API endpoints, and records responses for further analysis
-and evaluation.
+Can achieve **100+ QPS and 500,000+ tokens/s** with ~30 CPU threads, sufficient for stress testing a 16/32-instance Qwen3-30B-A3B deployment.
 
-**Trace-Replayer** can achieve **100+ QPS and 500,000+ tokens/s**
-while using only **~30 CPU threads**, which is sufficient for stress testing a
-**16/32-instance Qwen3-30B-A3B deployment**.
+> **Note**: In hashed mode (default), generated prompts are semantically meaningless — reconstructed from block hashes for KVCache hit pattern preservation. Only suitable for performance testing, not semantic evaluation.
 
-> **Note**:  
-> The generated prompts are semantically meaningless. Since the original prompt text
-> or token list is not available (for privacy protection), there is insufficient
-> information to reconstruct the original prompt content.
-> Therefore, the constructed prompts are **only suitable for performance testing**,
-> not for semantic correctness or model capability evaluation.
-
-> **Strongly recommended**:  
-> Use the same `tokenizers` library version as the inference framework to ensure
-> identical token counts after encoding.  
-> You may align versions by updating the `transformers` dependency in `Cargo.toml`
-> to match the inference framework.
+> **Recommended**: Use the same `tokenizers` library version as the inference framework to ensure identical token counts.
 
 
 ## Features
 
-- **Three request dispatch modes**:
-  - **Trace replay**: replay anonymous production traces at recorded timestamps
-  - **Random process**: stochastic arrival times (Poisson or uniform distribution)
-  - **Feedback**: AIMD closed-loop controller with configurable concurrency and constraint limits
-- Construct prompts based on block hashes (preserving KVCache hit patterns)
-- Plain text dataset support for meaningful prompts (`--dataset plaintext`)
-- End-to-end request replay using OpenAI, TGI, SGLang, and AIBrix compatible APIs
-- Exports results in **JSONL** format for post-processing
-- High throughput with low resource usage:
-  - ~30 CPU threads can saturate a 16-instance model cluster
-  - Request timestamp drift < 5 ms
-- Highly extensible:
-  - Easy to add new APIs, trace formats, and metrics
+- **Three request dispatch modes**: trace replay, stochastic arrival (Poisson/uniform), AIMD feedback controller
+- Construct prompts from block hashes (preserving KVCache hit patterns) or plain text
+- OpenAI, TGI, SGLang, and AIBrix API support
+- SSE streaming with per-token latency tracking
+- JSONL output with percentile summary
+- High throughput, low resource usage (request timestamp drift < 5ms)
+
+For the full CLI reference, see [`docs/arguments.md`](docs/arguments.md).
 
 
-## Supported backend APIs
+## Quick Start
 
-As long as the backend supports these APIs, we can use the trace replayer to replay the traces. The current supported APIs are:
-
-- **OpenAI API**: `http://endpoint:port/v1/chat/completions`
-- **TGI (Text Generation Inference)**: `http://endpoint:port/generate`
-- **SGLang**: `http://endpoint:port/v1/chat/completions` (OpenAI-compatible, extracts usage/cached_tokens)
-- **AIBrix**
-
-
-## Request Modes
-
-Controlled by `--mode` (default: `trace-replay`).
-
-### trace-replay (default)
-
-Replays requests at the original trace timestamps, scaled by `--scale-factor`.
+### Build
 
 ```bash
-request-sim --mode trace-replay \
+# Hashed mode (default) — synthetic prompts from block hashes
+cargo build --release -j64
+
+# Plain text mode — meaningful prompts
+cargo build --release --features prompt-text-plain -j64
+```
+
+### Run
+
+```bash
+# Trace replay (default mode)
+./target/release/request-sim \
+  --mode trace-replay \
   --scale-factor 1.5 \
   --dataset bailian --dataset-path trace.jsonl \
+  --tokenizer tokenizer.json --tokenizer-config tokenizer_config.json \
   --api openai --endpoint http://localhost:8080/v1/chat/completions \
   --model-name Qwen2.5-7B-Instruct \
   --time-in-secs 600
-```
 
-**Required**: `--scale-factor`. **Optional**: `--begin-time`, `--end-time` (filter trace window).
-
-### random-process
-
-Arrival times drawn from a stochastic process. Cycles through dataset entries indefinitely until `--time-in-secs` elapses.
-
-```bash
 # Poisson arrivals at 10 req/s
-request-sim --mode random-process \
+./target/release/request-sim \
+  --mode random-process \
   --arrival poisson --rate 10.0 \
   --dataset bailian --dataset-path trace.jsonl \
+  --tokenizer tokenizer.json --tokenizer-config tokenizer_config.json \
   --api openai --endpoint http://localhost:8080/v1/chat/completions \
   --model-name Qwen2.5-7B-Instruct \
   --time-in-secs 120
 
-# Fixed-interval (uniform) arrivals at 5 req/s
-request-sim --mode random-process \
-  --arrival uniform --rate 5.0 \
-  ...
-```
-
-**Required**: `--arrival` (poisson | uniform), `--rate` (req/s, must be > 0).
-
-### feedback
-
-AIMD closed-loop controller. Starts at 1 concurrent request and probes upward toward `--bs-limit`, retreating when constraints are violated. Constraint args (`--tpot-limit`, `--tps-limit`, `--all-tokens-limit`) are optional — without them, the controller simply ramps to `--bs-limit` and holds steady.
-
-```bash
-# Ramp to 30 concurrent requests (no constraints, ramps quickly)
-request-sim --mode feedback \
-  --bs-limit 30 \
-  --dataset bailian --dataset-path trace.jsonl \
-  --api tgi --endpoint http://localhost:8080/generate \
-  --time-in-secs 600
-
-# AIMD with TPOT constraint: probe up to 64, retreat if TPOT > 50ms
-request-sim --mode feedback \
+# AIMD feedback: probe up to 64 concurrent, retreat if TPOT > 50ms
+./target/release/request-sim \
+  --mode feedback \
   --bs-limit 64 --tpot-limit 50 \
-  --controller-interval 0.2 --cooldown-ticks 1 \
   --stream \
-  --dataset minimax --dataset-path trace.jsonl \
+  --dataset bailian --dataset-path trace.jsonl \
+  --tokenizer tokenizer.json --tokenizer-config tokenizer_config.json \
   --api sgl --endpoint http://localhost:8080/v1/chat/completions \
   --model-name Qwen2.5-7B-Instruct \
   --time-in-secs 300
+
+# Plain text mode (requires --features prompt-text-plain build)
+./target/release/request-sim \
+  --mode feedback --bs-limit 4 \
+  --dataset plaintext --dataset-path prompts.txt \
+  --api sgl --endpoint http://localhost:8080/v1/chat/completions \
+  --model-name Qwen2.5-7B-Instruct \
+  --max-tokens 4096 --stream \
+  --time-in-secs 300
 ```
 
-**Optional**: `--bs-limit` (default 1), `--tpot-limit` (ms, upper bound), `--tps-limit` (tokens/sec, lower bound), `--all-tokens-limit` (total context tokens, upper bound), `--controller-interval` (seconds, default 0.2), `--cooldown-ticks` (default 1). `--tpot-limit` and `--tps-limit` require `--stream`.
+
+## Request Modes
+
+- **trace-replay** (default): replays at original trace timestamps scaled by `--scale-factor`. Terminates when dataset is exhausted or `--time-in-secs`.
+- **random-process**: stochastic inter-arrival times (`--arrival poisson|uniform`, `--rate` req/s). Cycles dataset indefinitely; terminates on `--time-in-secs` only.
+- **feedback**: AIMD closed-loop controller probes concurrency from 1 toward `--bs-limit`, retreating when constraints (`--tpot-limit`, `--tps-limit`, `--all-tokens-limit`) are violated.
 
 
 ## Prompt Text Modes
 
-Two compile-time modes control how prompts are constructed:
+Two compile-time modes control prompt construction:
 
-### Hashed mode (default)
+| Build | Datasets | Prompt content |
+|-------|----------|---------------|
+| Default (hashed) | `bailian`, `mooncake` | Synthetic noise from block hashes via `TokenSampler` |
+| `--features prompt-text-plain` | `plaintext`, `openai` | Meaningful real text; model generates to EOS |
 
-Prompts are **synthetic noise** reconstructed from block hashes in the trace via `TokenSampler`. Content is semantically meaningless — suitable only for performance testing. `output_length` is always specified by the trace data (`min_tokens = max_tokens = output_length`).
-
-```bash
-cargo build --release          # hashed mode (default)
-```
-
-Datasets: `bailian`, `mooncake`
-
-### Plain text mode (`prompt-text-plain`)
-
-Prompts are **meaningful real text**. The model generates until EOS naturally, unless capped by `--max-tokens`.
-
-```bash
-cargo build --release --features prompt-text-plain
-```
-
-Datasets: `minimax`, `plaintext`
-
-The `plaintext` dataset reads a raw text file (one prompt per line):
-
-```bash
-request-sim --mode feedback \
-  --bs-limit 4 \
-  --dataset plaintext --dataset-path prompts.txt \
-  --api sgl --endpoint http://localhost:8080/v1/chat/completions \
-  --model-name Qwen2.5-7B-Instruct \
-  --max-tokens 4096 \
-  --stream \
-  --time-in-secs 300
-```
-
-### `--max-tokens` safety cap
-
-When the dataset does not provide `output_length` (e.g. `plaintext`), `--max-tokens` sets a ceiling on generated tokens. It is ignored when the trace provides an explicit `output_length`.
-
-| `output_length` | `--max-tokens` | Request body |
-|---|---|---|
-| > 0 (from trace) | any | `min_tokens = max_tokens = output_length` |
-| 0 (plaintext) | set | `max_tokens = --max-tokens` (no `min_tokens`) |
-| 0 (plaintext) | unset | no token limit (model EOS only) |
+Use `--max-tokens` to cap output length when the dataset doesn't specify one (e.g. `plaintext`).
 
 
-## Getting Started
+## Supported APIs
 
-### 1. Install Rust
-
-Ensure Rust is installed (recommended via `rustup`):
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-````
-
-Verify installation:
-
-```bash
-rustc --version
-cargo --version
-```
+| API | Flag | Endpoint format |
+|-----|------|-----------------|
+| OpenAI | `--api openai` | `/v1/chat/completions` |
+| SGLang | `--api sgl` | `/v1/chat/completions` (+ usage/cached_tokens extraction) |
+| TGI | `--api tgi` | `/generate` |
+| AIBrix | `--api aibrix` | `/v1/chat/completions` (+ routing strategy header) |
 
 
-### 2. Build
+## Output Format
 
-Build in release mode from the repository root:
+Results are written to the JSONL file specified by `--output-path`. Each line contains:
 
-```bash
-cargo build \
-  -p request-sim \
-  --bin request-sim \
-  --release \
-  -j64
-```
+| Field | Description |
+|-------|-------------|
+| `status` | HTTP status code |
+| `s_time_drift` | Deviation between scheduled and actual send time (ms, expect < 5ms) |
+| `s_time` / `e_time` | Send and end timestamps |
+| `input_length` / `output_length` | Token counts |
+| `span_time` | End-to-end latency (ms) |
 
-The executable will be generated at:
-
-```
-path/to/your/repo/target/release/request-sim
-```
+Additional fields vary by API (TTFT, TPOT, etc.). A percentile summary is written to `--summary-path`.
 
 
-### 3. Init backend and trace-replayer
+## Documentation
 
-```bash
-# Example
-# Init vLLM as target
-vllm serve /path/to/Qwen2.5-7B-Instruct --port 8080
-
-# Now init trace-replayer
-path/to/your/repo/target/release/request-sim \
-  --mode trace-replay \
-  --tokenizer /path/to/Qwen2.5-7B-Instruct/tokenizer.json \
-  --tokenizer-config /path/to/Qwen2.5-7B-Instruct/tokenizer_config.json \
-  --endpoint http://localhost:8080/v1/chat/completions \
-  --api openai \
-  --dataset bailian \
-  --dataset-path /path/to/qwen_traceA_blksz_16.jsonl \
-  --scale-factor 1.5 \
-  --time-in-secs 1200 \
-  --num-producer 32 \
-  --channel-capacity 40960 \
-  --output-path /path/to/output.jsonl \
-  --model-name <MODEL_NAME IN VLLM>
-```
-
-For a complete list of command-line arguments, please refer to  
-👉 [`docs/arguments.md`](docs/arguments.md)
-
-### 4.Check Results
-
-After execution:
-
-* All results are written to the specified output file
-* Each request produces one line in the **`.jsonl`** file
-
-Each line in the `.jsonl` file corresponds to one request and may include:
-
-* `status`: HTTP status code
-* `s_time_drift`: Deviation between actual and scheduled send time (ms, expected < 5 ms)
-
-  * If too large, consider increasing `num_threads`
-* `s_time`: Request send timestamp
-* `e_time`: Request end timestamp
-* `input_length`, `output_length`: Input and output token lengths
-* Additional metrics:
-
-  * OpenAI API: `span_time` (end-to-end latency in ms)
-  * TGI API: TTFT, TPOT, etc.
-
-(Field availability depends on the API implementation.)
-
-
-## Contributing
-We welcome and value any contributions and feedback, please check
-👉 [`docs/extending.md`](docs/extending.md) for how to extend API
+- [`docs/arguments.md`](docs/arguments.md) — Complete CLI reference
+- [`docs/extending.md`](docs/extending.md) — How to add new API backends
 
 
 ## Sponsor
@@ -263,7 +133,8 @@ We welcome and value any contributions and feedback, please check
 This project is sponsored by **Alibaba Tongyi Lab**.
 
 ## Contact
+
 For technical questions, bug reports, and feature requests, please use
 GitHub [Issues](https://github.com/blitz-serving/trace-replayer/issues).
 
-For other inquiries, you may contact the maintainers via GitHub.([Healthcliff-Ding](https://github.com/Healthcliff-Ding))
+For other inquiries, you may contact the maintainers via GitHub ([Healthcliff-Ding](https://github.com/Healthcliff-Ding)).
