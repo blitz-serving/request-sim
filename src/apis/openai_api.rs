@@ -20,12 +20,11 @@ const DEFAULT_PERCENTILES: [u32; 3] = [90, 95, 99];
 
 #[async_trait::async_trait]
 impl LLMApi for OaiApi {
-    const AIBRIX_PRIVATE_HEADER: bool = false;
-
     fn request_json_body(prompt: PromptPayload, input_length: u64, output_length: u64, stream: bool) -> String {
         let messages = match prompt {
             PromptPayload::Content(text) => json!([{"role": "user", "content": text}]),
             PromptPayload::Messages(val) => val,
+            PromptPayload::Body(_) => panic!("Body payload not supported for OpenAI API"),
         };
         let mut body = json!({
             "model": MODEL_NAME.get().unwrap().as_str(),

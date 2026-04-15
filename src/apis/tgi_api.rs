@@ -27,12 +27,11 @@ fn normalize_ms(value: &str) -> String {
 
 #[async_trait::async_trait]
 impl LLMApi for TgiApi {
-    const AIBRIX_PRIVATE_HEADER: bool = false;
-
     fn request_json_body(prompt: PromptPayload, _input_length: u64, output_length: u64, _stream: bool) -> String {
         let inputs = match prompt {
             PromptPayload::Content(text) => serde_json::Value::String(text),
             PromptPayload::Messages(val) => val,
+            PromptPayload::Body(_) => panic!("Body payload not supported for TGI API"),
         };
         let mut body = serde_json::json!({"inputs": inputs, "parameters": {}});
         if output_length > 0 {

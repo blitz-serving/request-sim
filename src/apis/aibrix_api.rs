@@ -13,12 +13,11 @@ pub static AIBRIX_ROUTE_STRATEGY: OnceLock<String> = OnceLock::new();
 
 #[async_trait::async_trait]
 impl LLMApi for AbxApi {
-    const AIBRIX_PRIVATE_HEADER: bool = true;
-
     fn request_json_body(prompt: PromptPayload, input_length: u64, output_length: u64, stream: bool) -> String {
         let messages = match prompt {
             PromptPayload::Content(text) => json!([{"role": "user", "content": text}]),
             PromptPayload::Messages(val) => val,
+            PromptPayload::Body(_) => panic!("Body payload not supported for AIBrix API"),
         };
         let mut body = json!({
             "model": MODEL_NAME.get().unwrap().as_str(),
@@ -38,6 +37,10 @@ impl LLMApi for AbxApi {
         }
 
         body.to_string()
+    }
+
+    fn extra_headers(_body: &str) -> Vec<(&'static str, String)> {
+        vec![("routing-strategy", AIBRIX_ROUTE_STRATEGY.get().unwrap().clone())]
     }
 
     async fn parse_response(

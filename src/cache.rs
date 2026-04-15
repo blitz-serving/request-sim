@@ -254,6 +254,7 @@ impl PromptCache {
             let (tag, bytes): (u8, Vec<u8>) = match &entry.prompt {
                 PromptPayload::Content(s) => (0, s.as_bytes().to_vec()),
                 PromptPayload::Messages(v) => (1, serde_json::to_vec(v).unwrap()),
+                PromptPayload::Body(_) => unreachable!("Body payload cannot be cached"),
             };
             writer.write_all(&[tag])?;
             writer.write_all(&(bytes.len() as u64).to_le_bytes())?;

@@ -20,10 +20,12 @@ use tracing::{instrument, Level};
 ///
 /// - `Content`: raw text to be wrapped in `[{"role":"user","content":...}]` by the API layer.
 /// - `Messages`: pre-structured messages array, used directly as the `"messages"` value.
+/// - `Body`: pre-structured request body for backends with proprietary formats (e.g. Amadeus).
 #[derive(Clone, Debug)]
 pub enum PromptPayload {
     Content(String),
     Messages(serde_json::Value),
+    Body(serde_json::Value),
 }
 
 /// jsonl of Bailian
@@ -455,5 +457,140 @@ impl LLMTrace for PlainTextDataset {
 
     fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
         (PromptPayload::Content(self.items[index].clone()), 0, 0)
+    }
+}
+
+//
+// ============== AmadeusDataset ==============
+//
+
+/// Internal storage for a single amadeus-replay JSONL line.
+/// The `body` field preserves the original dict (quest_code, data, model_control, etc.)
+/// so the AmadeusApi backend can send it with minimal transformation.
+#[cfg(feature = "prompt-text-plain")]
+struct AmadeusItem {
+    body: serde_json::Value,
+    input_length: u64,
+    output_length: u64,
+    timestamp_ms: u64,
+}
+
+#[prompt_text(plain)]
+pub struct AmadeusDataset {
+    items: Vec<AmadeusItem>,
+}
+
+#[cfg(feature = "prompt-text-plain")]
+impl AmadeusDataset {
+    pub fn new() -> Self {
+        Self { items: Vec::new() }
+    }
+}
+
+#[prompt_text(plain)]
+impl LLMTrace for AmadeusDataset {
+    fn load(&mut self, path: &str) {
+        let file = File::open(path).unwrap();
+        for (lineno, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.unwrap();
+            if line.trim().is_empty() {
+                continue;
+            }
+            let raw: serde_json::Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("Failed to parse amadeus-replay JSONL line {}: {e}", lineno + 1));
+
+            // Extract conversation data for input length estimation
+            let conversation = raw.get("data").and_then(|v| v.as_array());
+            let total_chars: usize = conversation
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|turn| turn.get("text").and_then(|t| t.as_str()))
+                        .map(|s| s.len())
+                        .sum()
+                })
+                .unwrap_or(0);
+            let input_length = (total_chars / 3) as u64; // conservative char-to-token estimate
+
+            // Extract output length from model_control.tokens_to_generate (default 256)
+            let output_length = raw
+                .get("model_control")
+                .and_then(|mc| mc.get("tokens_to_generate"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(256);
+
+            // Extract timestamp (milliseconds), support both string and integer
+            let timestamp_ms = raw
+                .get("timestamp")
+                .map(|v| match v {
+                    serde_json::Value::Number(n) => n.as_u64().unwrap_or(0),
+                    serde_json::Value::String(s) => s.parse::<u64>().unwrap_or(0),
+                    _ => 0,
+                })
+                .unwrap_or(lineno as u64); // fallback: use line index
+
+            // Build the body to preserve for the API backend.
+            // Keep: data, quest_code, model_control, system_data, functions, function_call, tools
+            let mut body = serde_json::Map::new();
+            if let Some(data) = raw.get("data") {
+                body.insert("data".into(), data.clone());
+            }
+            let quest_code = raw
+                .get("quest_code")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("talkie_abab55");
+            body.insert("quest_code".into(), serde_json::Value::String(quest_code.to_string()));
+            if let Some(mc) = raw.get("model_control") {
+                body.insert("model_control".into(), mc.clone());
+            }
+            for key in &["system_data", "functions", "function_call", "tools"] {
+                if let Some(v) = raw.get(*key) {
+                    body.insert((*key).to_string(), v.clone());
+                }
+            }
+
+            self.items.push(AmadeusItem {
+                body: serde_json::Value::Object(body),
+                input_length,
+                output_length,
+                timestamp_ms,
+            });
+        }
+        tracing::info!("Loaded AmadeusDataset: {} items", self.items.len());
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn iter(&self) -> DataIter {
+        DataIter { size: self.items.len(), index: AtomicUsize::new(0) }
+    }
+
+    fn rps(&self) -> f64 {
+        if self.items.len() < 2 {
+            return 1.0;
+        }
+        let first = self.items.first().unwrap().timestamp_ms as f64 / 1000.0;
+        let last = self.items.last().unwrap().timestamp_ms as f64 / 1000.0;
+        let span = last - first;
+        if span <= 0.0 {
+            1.0
+        } else {
+            self.items.len() as f64 / span
+        }
+    }
+
+    fn timestamp(&self, index: usize) -> u64 {
+        self.items[index].timestamp_ms
+    }
+
+    fn inflate(&self, index: usize) -> (PromptPayload, u64, u64) {
+        let item = &self.items[index];
+        (
+            PromptPayload::Body(item.body.clone()),
+            item.input_length,
+            item.output_length,
+        )
     }
 }

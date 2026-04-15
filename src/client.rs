@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use clap::Parser;
-use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, CONTEXT_LENGTH, MAX_TOKENS_CAP, METRIC_PERCENTILES, RID_SOURCE, RidSource};
+use request_sim::apis::{OaiApi, SglApi, AIBRIX_ROUTE_STRATEGY, AMADEUS_ID, CONTEXT_LENGTH, MAX_TOKENS_CAP, METRIC_PERCENTILES, RID_SOURCE, RidSource};
 use request_sim::cache::PromptCache;
 use request_sim::{
     apis::{TgiApi, MODEL_NAME},
@@ -17,13 +17,14 @@ use request_sim::{
         ControllerConfig, RequestContext,
     },
 };
+use request_sim::apis::AmadeusApi;
 #[cfg(feature = "prompt-text-hashed")]
 use request_sim::{
     dataset::{BailianDataset, MooncakeDataset},
     token_sampler::TokenSampler,
 };
 #[cfg(feature = "prompt-text-plain")]
-use request_sim::dataset::{OpenaiDataset, PlainTextDataset};
+use request_sim::dataset::{OpenaiDataset, PlainTextDataset, AmadeusDataset};
 #[cfg(feature = "prompt-text-hashed")]
 use tokenizers::Tokenizer;
 use tokio::spawn;
@@ -207,6 +208,10 @@ struct Args {
     ///   content-hash — SHA256 of serialized messages, truncated to 16 hex chars
     #[clap(long, default_value = "none")]
     rid_source: String,
+
+    /// Amadeus ID for the meta.amadeus_id field in amadeus API requests.
+    #[clap(long)]
+    amadeus_id: Option<i64>,
 }
 
 fn validate_config(args: &Args) {
@@ -306,6 +311,7 @@ async fn async_main(args: Args) -> Result<(), i32> {
         max_tokens,
         context_length,
         rid_source,
+        amadeus_id,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -388,6 +394,16 @@ async fn async_main(args: Args) -> Result<(), i32> {
             dataset.load(
                 dataset_path
                     .expect("A dataset path must be provided for openai dataset!")
+                    .as_str(),
+            );
+            dataset
+        }
+        #[cfg(feature = "prompt-text-plain")]
+        "amadeus-replay" => {
+            let mut dataset = Box::pin(AmadeusDataset::new());
+            dataset.load(
+                dataset_path
+                    .expect("--dataset-path is required for amadeus-replay dataset")
                     .as_str(),
             );
             dataset
@@ -482,6 +498,9 @@ async fn async_main(args: Args) -> Result<(), i32> {
             );
             route_strategy
         });
+    }
+    if api_lower == "amadeus" {
+        AMADEUS_ID.get_or_init(|| amadeus_id);
     }
 
     tracing::info!("Client start");
@@ -693,6 +712,54 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
             ),
             "feedback" => spawn_request_loop_feedback::<SglApi>(
+                endpoint,
+                ctx,
+                ControllerConfig {
+                    bs_limit,
+                    interval_secs: controller_interval,
+                    cooldown_ticks,
+                    tpot_limit_ms: tpot_limit,
+                    tps_limit,
+                    all_tokens_limit,
+                },
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            _ => unreachable!(),
+        },
+        "amadeus" => match mode.as_str() {
+            "trace-replay" => spawn_request_loop_with_timestamp::<AmadeusApi>(
+                endpoint,
+                dataset,
+                #[cfg(feature = "prompt-text-hashed")]
+                token_sampler,
+                scale_factor.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+                prompt_cache,
+                time_range,
+            ),
+            "random-process" => spawn_request_loop_random_process::<AmadeusApi>(
+                endpoint,
+                ctx,
+                arrival_process.unwrap(),
+                rate.unwrap(),
+                tx,
+                interrupt_flag.clone(),
+                ttft_slo,
+                tpot_slo,
+                stream,
+                early_stop_error_threshold,
+            ),
+            "feedback" => spawn_request_loop_feedback::<AmadeusApi>(
                 endpoint,
                 ctx,
                 ControllerConfig {

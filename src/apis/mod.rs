@@ -36,11 +36,13 @@ pub fn compute_content_hash_rid(messages: &serde_json::Value) -> String {
 }
 
 pub mod aibrix_api;
+pub mod amadeus_api;
 pub mod openai_api;
 pub mod sgl_api;
 pub mod tgi_api;
 
 pub use aibrix_api::{AbxApi, AIBRIX_ROUTE_STRATEGY};
+pub use amadeus_api::{AmadeusApi, AMADEUS_ID};
 pub use openai_api::OaiApi;
 pub use sgl_api::SglApi;
 pub use tgi_api::TgiApi;
@@ -55,8 +57,14 @@ pub enum RequestError {
 
 #[async_trait::async_trait]
 pub trait LLMApi: Copy + Clone + Send + Sync {
-    const AIBRIX_PRIVATE_HEADER: bool;
     fn request_json_body(prompt: PromptPayload, input_length: u64, output_length: u64, stream: bool) -> String;
+
+    /// Per-request extra HTTP headers. Called with the serialized JSON body.
+    /// AIBrix uses this for static routing-strategy; Amadeus for per-request trace-id.
+    fn extra_headers(_body: &str) -> Vec<(&'static str, String)> {
+        vec![]
+    }
+
     async fn parse_response(
         response: Response,
         stream: bool,

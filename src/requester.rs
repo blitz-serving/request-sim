@@ -21,7 +21,7 @@ use crate::apis::METRIC_PERCENTILES;
 use crate::cache::PromptCache;
 use crate::dataset::PromptPayload;
 use crate::{
-    apis::{InFlightState, LLMApi, RequestError, AIBRIX_ROUTE_STRATEGY},
+    apis::{InFlightState, LLMApi, RequestError},
     dataset::LLMTrace,
     get_timestamp, init_basetime, timeout_secs_upon_slo,
 };
@@ -104,17 +104,14 @@ async fn post_with_timeout<A: 'static + LLMApi + Send>(
 ) -> Result<BTreeMap<String, String>, RequestError> {
     let mut req = client
         .post(endpoint)
-        .body(json_body)
+        .body(json_body.clone())
         .header("Content-Type", "application/json");
 
     if !stream {
         req = req.timeout(timeout);
     }
-    if A::AIBRIX_PRIVATE_HEADER {
-        req = req.header(
-            "routing-strategy",
-            AIBRIX_ROUTE_STRATEGY.get().unwrap().as_str(),
-        );
+    for (name, value) in A::extra_headers(&json_body) {
+        req = req.header(name, value);
     }
 
     let response = req.send().await.map_err(|e| RequestError::Other(e))?;
