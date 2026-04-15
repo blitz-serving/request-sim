@@ -1,3 +1,0 @@
-[submodule "scripts/viz"]
-	path = scripts/viz
-	url = https://github.com/blitz-serving/BlitzViz
