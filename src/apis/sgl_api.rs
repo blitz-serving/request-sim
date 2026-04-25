@@ -63,6 +63,17 @@ impl LLMApi for SglApi {
             if response.status().is_success() {
                 if let Ok(body) = response.text().await {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        // Extract output text from non-streaming response
+                        if let Some(content) = v
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            result.insert("output_text".to_string(), content.to_string());
+                        }
+
                         // Extract usage info
                         if let Some(usage) = v.get("usage") {
                             if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64())
@@ -104,6 +115,9 @@ impl LLMApi for SglApi {
         let mut tbt_except_first: Vec<f64> = Vec::new();
         let start_time = TokioInstant::now();
 
+        // Accumulate generated text for output tracking
+        let mut output_text = String::new();
+
         // Track the last SSE data line for final-chunk usage extraction
         let mut last_data_line = String::new();
 
@@ -134,6 +148,19 @@ impl LLMApi for SglApi {
                         last_data_line.push_str(data_str);
 
                         if data_str.contains(r#""delta""#) {
+                            // Extract delta.content for output text accumulation
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                if let Some(content) = v
+                                    .get("choices")
+                                    .and_then(|c| c.get(0))
+                                    .and_then(|c| c.get("delta"))
+                                    .and_then(|d| d.get("content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    output_text.push_str(content);
+                                }
+                            }
+
                             let now = TokioInstant::now();
                             token_count += 1;
 
@@ -202,6 +229,10 @@ impl LLMApi for SglApi {
             }
         }
         result.insert("token_count".to_string(), token_count.to_string());
+
+        if !output_text.is_empty() {
+            result.insert("output_text".to_string(), output_text);
+        }
 
         if !tbt_except_first.is_empty() {
             let max_tbt_except_first = tbt_except_first

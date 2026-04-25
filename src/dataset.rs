@@ -4,7 +4,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 #[cfg(feature = "prompt-text-hashed")]
-use std::{cell::UnsafeCell, collections::HashMap};
+use std::{cell::UnsafeCell, collections::HashMap, collections::HashSet};
 
 #[cfg(feature = "prompt-text-hashed")]
 use crate::token_sampler::TokenSampler;
@@ -109,6 +109,29 @@ pub trait LLMTrace: Send + Sync {
 
     fn iter(&self) -> DataIter;
     fn rps(&self) -> f64;
+
+    /// Build a ConversationGraph from the loaded dataset.
+    /// Returns None for datasets that don't support multi-turn tracking.
+    #[cfg(feature = "prompt-text-hashed")]
+    fn build_conversation_graph(&self) -> Option<ConversationGraph> {
+        None
+    }
+
+    /// Inflate a multi-turn entry as a Messages array with proper role structure.
+    /// `ancestor_chain`: ordered data_indices from root to parent [root, ..., parent].
+    /// `ancestor_outputs`: captured output text for each ancestor, same order.
+    /// Returns None if the dataset doesn't support multi-turn Messages.
+    #[cfg(feature = "prompt-text-hashed")]
+    fn inflate_as_messages(
+        &self,
+        _index: usize,
+        _ts: &TokenSampler,
+        _graph: &ConversationGraph,
+        _ancestor_chain: &[usize],
+        _ancestor_outputs: &[String],
+    ) -> Option<(PromptPayload, u64, u64)> {
+        None
+    }
 }
 
 //
@@ -129,6 +152,68 @@ impl BailianDataset {
             user_prompts: UnsafeCell::new(HashMap::new()),
             rwlock: SpinRwLock::new(),
         }
+    }
+
+    /// Inflate an arbitrary slice of hash_ids into a string.
+    /// Reuses `user_prompts` for congruence (same hash → same text).
+    /// Each block is BOS/EOS-framed by TokenSampler, so enc distributes over app.
+    pub(crate) fn inflate_hashes(
+        &self,
+        hash_ids: &[u64],
+        total_tokens: usize,
+        ts: &TokenSampler,
+    ) -> String {
+        const BLOCK_SIZE: usize = 16;
+        if hash_ids.is_empty() {
+            return String::new();
+        }
+        let last_block_len = total_tokens.saturating_sub((hash_ids.len() - 1) * BLOCK_SIZE);
+        let last_block_len = last_block_len.min(BLOCK_SIZE).max(1);
+
+        let x = if last_block_len == BLOCK_SIZE { 0 } else { 1 };
+        let mut prompt = String::with_capacity(total_tokens * 4);
+
+        unsafe {
+            for &hash_id in hash_ids.iter().take(hash_ids.len() - x) {
+                self.rwlock.read_lock();
+                if let Some(s) = (&*self.user_prompts.get()).get(&hash_id) {
+                    prompt.push_str(s);
+                    self.rwlock.read_unlock();
+                } else {
+                    self.rwlock.read_unlock();
+                    let s = ts.gen_string(BLOCK_SIZE);
+                    self.rwlock.write_lock();
+                    if let Some(s0) = (*self.user_prompts.get()).get(&hash_id) {
+                        prompt.push_str(s0);
+                    } else {
+                        prompt.push_str(&s);
+                        (&mut *self.user_prompts.get()).insert(hash_id, s);
+                    }
+                    self.rwlock.write_unlock();
+                }
+            }
+
+            if x == 1 {
+                let last_hash = *hash_ids.last().unwrap();
+                self.rwlock.read_lock();
+                if let Some(s) = (&*self.user_prompts.get()).get(&last_hash) {
+                    prompt.push_str(s);
+                    self.rwlock.read_unlock();
+                } else {
+                    self.rwlock.read_unlock();
+                    let s = ts.gen_string(last_block_len);
+                    self.rwlock.write_lock();
+                    if let Some(s0) = (*self.user_prompts.get()).get(&last_hash) {
+                        prompt.push_str(s0);
+                    } else {
+                        prompt.push_str(&s);
+                        (&mut *self.user_prompts.get()).insert(last_hash, s);
+                    }
+                    self.rwlock.write_unlock();
+                }
+            }
+        }
+        prompt
     }
 }
 
@@ -209,6 +294,149 @@ impl LLMTrace for BailianDataset {
 
             (PromptPayload::Content(prompt), (*data_item).input_length, (*data_item).output_length)
         }
+    }
+
+    fn build_conversation_graph(&self) -> Option<ConversationGraph> {
+        Some(ConversationGraph::build(&self.items, 16))
+    }
+
+    fn inflate_as_messages(
+        &self,
+        index: usize,
+        ts: &TokenSampler,
+        graph: &ConversationGraph,
+        ancestor_chain: &[usize],
+        ancestor_outputs: &[String],
+    ) -> Option<(PromptPayload, u64, u64)> {
+        if ancestor_chain.is_empty() {
+            return None;
+        }
+
+        let item = &self.items[index];
+        let mut messages = Vec::new();
+
+        // Root turn: user message from all its hash_ids
+        let root_idx = ancestor_chain[0];
+        let root_item = &self.items[root_idx];
+        let root_text =
+            self.inflate_hashes(&root_item.hash_ids, root_item.input_length as usize, ts);
+        messages.push(serde_json::json!({"role": "user", "content": root_text}));
+
+        // Each subsequent ancestor: assistant output + user remaining delta
+        for (i, &anc_idx) in ancestor_chain.iter().enumerate() {
+            // Assistant message: captured output from this ancestor
+            if i < ancestor_outputs.len() {
+                messages.push(
+                    serde_json::json!({"role": "assistant", "content": ancestor_outputs[i]}),
+                );
+            }
+
+            // User message: remaining delta for the NEXT turn in the chain
+            let next_idx = if i + 1 < ancestor_chain.len() {
+                ancestor_chain[i + 1]
+            } else {
+                index // current item
+            };
+
+            let next_item = &self.items[next_idx];
+            let delta = &graph.delta_hashes[next_idx];
+            let output_blocks = graph.parent_output_blocks[next_idx];
+            let remaining_hashes: Vec<u64> = delta
+                .iter()
+                .skip(output_blocks)
+                .copied()
+                .collect();
+
+            if !remaining_hashes.is_empty() {
+                let anc_item = &self.items[anc_idx];
+                let remaining_tokens = (next_item.input_length as usize)
+                    .saturating_sub(anc_item.input_length as usize)
+                    .saturating_sub(anc_item.output_length as usize);
+                let remaining_tokens = remaining_tokens.max(remaining_hashes.len()); // at least 1 per hash
+
+                let remaining_text =
+                    self.inflate_hashes(&remaining_hashes, remaining_tokens, ts);
+                messages.push(serde_json::json!({"role": "user", "content": remaining_text}));
+            }
+        }
+
+        Some((
+            PromptPayload::Messages(serde_json::Value::Array(messages)),
+            item.input_length,
+            item.output_length,
+        ))
+    }
+}
+
+// ── Conversation graph for multi-turn output tracking ──────────────────────
+
+/// Per-item metadata linking turns in a multi-turn conversation.
+/// Built from `chat_id` / `parent_chat_id` after dataset load.
+#[cfg(feature = "prompt-text-hashed")]
+pub struct ConversationGraph {
+    /// data_index of the parent turn (None for first turns or orphans).
+    pub parent_index: Vec<Option<usize>>,
+    /// Hash IDs in this item that do NOT appear in the parent item (ordered).
+    pub delta_hashes: Vec<Vec<u64>>,
+    /// Number of output blocks from the parent turn: ceil(parent.output_length / BLOCK_SIZE).
+    pub parent_output_blocks: Vec<usize>,
+}
+
+#[cfg(feature = "prompt-text-hashed")]
+impl ConversationGraph {
+    /// Build the conversation graph from a loaded BailianDataset.
+    pub(crate) fn build(items: &[BailianDataItem], block_size: usize) -> Self {
+        let n = items.len();
+        let mut parent_index = vec![None; n];
+        let mut delta_hashes = vec![Vec::new(); n];
+        let mut parent_output_blocks = vec![0usize; n];
+
+        // Map chat_id → data_index for parent lookup
+        let mut chat_to_index: HashMap<i64, usize> = HashMap::with_capacity(n);
+        for (i, item) in items.iter().enumerate() {
+            chat_to_index.insert(item.chat_id, i);
+        }
+
+        for (i, item) in items.iter().enumerate() {
+            if let Some(&pi) = chat_to_index.get(&item.parent_chat_id) {
+                // Skip self-referencing entries (turn 1 where parent_chat_id == chat_id)
+                if pi == i {
+                    continue;
+                }
+                parent_index[i] = Some(pi);
+
+                let parent = &items[pi];
+                let parent_hash_set: HashSet<u64> = parent.hash_ids.iter().copied().collect();
+                delta_hashes[i] = item
+                    .hash_ids
+                    .iter()
+                    .copied()
+                    .filter(|h| !parent_hash_set.contains(h))
+                    .collect();
+                parent_output_blocks[i] =
+                    (parent.output_length as usize + block_size - 1) / block_size;
+            }
+        }
+
+        let linked = parent_index.iter().filter(|p| p.is_some()).count();
+        tracing::info!(
+            "ConversationGraph: {n} items, {linked} linked turns, block_size={block_size}"
+        );
+
+        Self { parent_index, delta_hashes, parent_output_blocks }
+    }
+
+    /// Returns the ordered ancestor chain for a given data_index.
+    /// Returns [root, ..., parent] (not including the item itself).
+    pub fn get_chain(&self, index: usize) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut cur = index;
+        while let Some(pi) = self.parent_index[cur] {
+            chain.push(pi);
+            cur = pi;
+        }
+        chain.reverse();
+        chain
     }
 }
 

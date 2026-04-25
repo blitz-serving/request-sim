@@ -43,6 +43,7 @@ crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
 request-sim-macros = { path = "request-sim-macros" }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
+dashmap = "6.1.0"
 
 
 [features]

@@ -26,6 +26,8 @@ use crate::{
     get_timestamp, init_basetime, timeout_secs_upon_slo,
 };
 #[cfg(feature = "prompt-text-hashed")]
+use crate::dataset::ConversationGraph;
+#[cfg(feature = "prompt-text-hashed")]
 use crate::token_sampler::TokenSampler;
 
 // ── Module-level statics ─────────────────────────────────────────────────────
@@ -63,6 +65,83 @@ impl RequestContext {
 }
 
 // ── Arrival process for random-process mode ─────────────────────────────────
+
+// ── Output tracking for multi-turn KV cache consistency ─────────────────────
+
+/// Shared state for tracking engine output across multi-turn conversations.
+/// When enabled, the dispatch loop waits for ancestor turns to complete,
+/// then constructs a Messages prompt with actual output as assistant messages.
+#[cfg(feature = "prompt-text-hashed")]
+#[derive(Clone)]
+pub struct TrackOutputState {
+    pub graph: Arc<ConversationGraph>,
+    pub tokenizer: Arc<tokenizers::Tokenizer>,
+    completions: Arc<dashmap::DashMap<usize, tokio::sync::watch::Sender<Option<String>>>>,
+}
+
+#[cfg(feature = "prompt-text-hashed")]
+impl TrackOutputState {
+    pub fn new(graph: ConversationGraph, tokenizer: tokenizers::Tokenizer, dataset_len: usize) -> Self {
+        let completions = Arc::new(dashmap::DashMap::with_capacity(dataset_len));
+        for i in 0..dataset_len {
+            let (tx, _rx) = tokio::sync::watch::channel(None);
+            completions.insert(i, tx);
+        }
+        Self {
+            graph: Arc::new(graph),
+            tokenizer: Arc::new(tokenizer),
+            completions,
+        }
+    }
+
+    /// Store the output text for a completed request and notify waiters.
+    pub fn complete(&self, data_index: usize, output_text: String) {
+        if let Some(tx) = self.completions.get(&data_index) {
+            let _ = tx.send(Some(output_text));
+        }
+    }
+
+    /// Get the stored output text for a data_index (non-blocking).
+    pub fn get_output(&self, data_index: usize) -> Option<String> {
+        self.completions
+            .get(&data_index)
+            .and_then(|tx| tx.borrow().clone())
+    }
+
+    /// Wait for ALL ancestor outputs to be available.
+    pub async fn wait_for_ancestors(&self, data_index: usize) {
+        let chain = self.graph.get_chain(data_index);
+        for &ancestor_idx in &chain {
+            let mut rx = {
+                let Some(entry) = self.completions.get(&ancestor_idx) else {
+                    continue;
+                };
+                entry.subscribe()
+            };
+            loop {
+                if rx.borrow().is_some() {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get the ancestor chain and their captured outputs.
+    /// Returns (chain, outputs) where chain = [root, ..., parent] and outputs[i] = output of chain[i].
+    pub fn get_chain_with_outputs(&self, data_index: usize) -> (Vec<usize>, Vec<String>) {
+        let chain = self.graph.get_chain(data_index);
+        let outputs: Vec<String> = chain
+            .iter()
+            .filter_map(|&idx| self.get_output(idx))
+            .collect();
+        (chain, outputs)
+    }
+}
+
+// ── Arrival process (continued) ─────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum ArrivalProcess {
@@ -142,6 +221,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     early_stop_error_threshold: Option<u32>,
     prompt_cache: Option<Arc<PromptCache>>,
     time_range: (Option<u64>, Option<u64>),
+    track_output: Option<TrackOutputState>,
 ) -> JoinHandle<Result<(), i32>> {
     init_basetime();
 
@@ -205,6 +285,18 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
 
+            // Output tracking: wait for all ancestor outputs, then inflate as Messages
+            let use_messages = if let Some(ref tos) = track_output {
+                if tos.graph.parent_index[data_index].is_some() {
+                    tos.wait_for_ancestors(data_index).await;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             let curr_timestamp = get_timestamp() as u64;
             let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
 
@@ -212,15 +304,27 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                 sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
             }
 
-            // Use pre-generated cache when available, otherwise inflate inline
-            let (prompt, input_length, output_length) =
-                if let Some(ref cache) = prompt_cache {
-                    let entry = cache.get(data_index);
-                    (entry.prompt.clone(), entry.input_length, entry.output_length)
-                } else {
-                    dataset.inflate(data_index, token_sampler.as_ref())
-                };
+            // Inflate: use Messages for multi-turn with tracked output, Content otherwise
+            let (prompt, input_length, output_length) = if use_messages {
+                let tos = track_output.as_ref().unwrap();
+                let (chain, outputs) = tos.get_chain_with_outputs(data_index);
+                dataset
+                    .inflate_as_messages(
+                        data_index,
+                        token_sampler.as_ref(),
+                        &tos.graph,
+                        &chain,
+                        &outputs,
+                    )
+                    .unwrap_or_else(|| dataset.inflate(data_index, token_sampler.as_ref()))
+            } else if let Some(ref cache) = prompt_cache {
+                let entry = cache.get(data_index);
+                (entry.prompt.clone(), entry.input_length, entry.output_length)
+            } else {
+                dataset.inflate(data_index, token_sampler.as_ref())
+            };
 
+            let track_output_clone = track_output.clone();
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
@@ -258,6 +362,13 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                         {
                             let normalized_e2e = span_time / output_length as f64;
                             metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
+                        }
+
+                        // Store output text for output tracking
+                        if let Some(ref tos) = track_output_clone {
+                            if let Some(text) = metrics.remove("output_text") {
+                                tos.complete(data_index, text);
+                            }
                         }
 
                         response_sender.send(metrics).unwrap();

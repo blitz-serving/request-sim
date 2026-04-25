@@ -178,6 +178,9 @@ impl LLMApi for AmadeusApi {
         let mut tbt_except_first: Vec<f64> = Vec::new();
         let start_time = TokioInstant::now();
 
+        // Accumulate generated text for output tracking
+        let mut output_text = String::new();
+
         // Track cumulative output_tokens_count from chunks
         let mut last_output_tokens: u64 = 0;
 
@@ -254,6 +257,9 @@ impl LLMApi for AmadeusApi {
                                         .unwrap_or("");
 
                                     if !text.is_empty() || !reasoning.is_empty() {
+                                        output_text.push_str(text);
+                                        output_text.push_str(reasoning);
+
                                         let now = TokioInstant::now();
                                         token_count += 1;
 
@@ -322,6 +328,10 @@ impl LLMApi for AmadeusApi {
             }
         }
         result.insert("token_count".to_string(), token_count.to_string());
+
+        if !output_text.is_empty() {
+            result.insert("output_text".to_string(), output_text);
+        }
 
         // TBT statistics (same pattern as sgl_api.rs)
         if !tbt_except_first.is_empty() {

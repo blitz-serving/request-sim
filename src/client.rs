@@ -212,6 +212,13 @@ struct Args {
     /// Amadeus ID for the meta.amadeus_id field in amadeus API requests.
     #[clap(long)]
     amadeus_id: Option<i64>,
+
+    /// Track engine output text and inject into subsequent turns' prompts.
+    /// Fixes multi-turn KV cache mismatch in hashed mode (bailian dataset).
+    /// Only applies to trace-replay mode. Incompatible with --cache.
+    #[cfg(feature = "prompt-text-hashed")]
+    #[clap(long, default_value_t = false)]
+    track_output: bool,
 }
 
 fn validate_config(args: &Args) {
@@ -264,6 +271,22 @@ fn validate_config(args: &Args) {
     if args.api.to_lowercase() == "release-with-debug" && args.mode != "trace-replay" {
         panic!("--api release-with-debug only supports --mode trace-replay");
     }
+
+    #[cfg(feature = "prompt-text-hashed")]
+    if args.track_output {
+        assert!(
+            args.mode == "trace-replay",
+            "--track-output only supports --mode trace-replay (multi-turn replay). \
+             random-process and feedback modes do not maintain conversation state."
+        );
+        if args.cache != "none" {
+            tracing::warn!(
+                "--track-output is incompatible with --cache (cache pre-generates all prompts \
+                 before requests are sent, so runtime output injection cannot work). \
+                 Cache will be disabled."
+            );
+        }
+    }
 }
 
 async fn async_main(args: Args) -> Result<(), i32> {
@@ -312,6 +335,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
         context_length,
         rid_source,
         amadeus_id,
+        #[cfg(feature = "prompt-text-hashed")]
+        track_output,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -467,6 +492,28 @@ async fn async_main(args: Args) -> Result<(), i32> {
 
     let dataset: Arc<Pin<Box<dyn LLMTrace>>> = Arc::new(dataset);
 
+    // Build output tracking state (hashed mode, bailian only)
+    #[cfg(feature = "prompt-text-hashed")]
+    let track_output_state: Option<request_sim::requester::TrackOutputState> = if track_output {
+        let graph = dataset
+            .build_conversation_graph()
+            .expect(
+                "--track-output requires a dataset with multi-turn conversation support \
+                 (bailian). Other datasets (mooncake, plaintext, openai) do not have \
+                 chat_id/parent_chat_id fields needed for conversation graph construction."
+            );
+        let tokenizer = token_sampler.get_tokenizer();
+        let state = request_sim::requester::TrackOutputState::new(
+            graph,
+            tokenizer,
+            dataset.len(),
+        );
+        // Disable cache when tracking output
+        Some(state)
+    } else {
+        None
+    };
+
     // Build RequestContext for new mode functions
     let ctx = RequestContext {
         dataset: dataset.clone(),
@@ -554,6 +601,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
                 prompt_cache,
                 time_range,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             "random-process" => spawn_request_loop_random_process::<TgiApi>(
                 endpoint,
@@ -602,6 +651,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
                 prompt_cache,
                 time_range,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             "random-process" => spawn_request_loop_random_process::<OaiApi>(
                 endpoint,
@@ -650,6 +701,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
                 prompt_cache,
                 time_range,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             "random-process" => spawn_request_loop_random_process::<OaiApi>(
                 endpoint,
@@ -698,6 +751,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
                 prompt_cache,
                 time_range,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             "random-process" => spawn_request_loop_random_process::<SglApi>(
                 endpoint,
@@ -746,6 +801,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 early_stop_error_threshold,
                 prompt_cache,
                 time_range,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             "random-process" => spawn_request_loop_random_process::<AmadeusApi>(
                 endpoint,
