@@ -285,50 +285,81 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
 
-            // Output tracking: wait for all ancestor outputs, then inflate as Messages
-            let use_messages = if let Some(ref tos) = track_output {
-                if tos.graph.parent_index[data_index].is_some() {
-                    tos.wait_for_ancestors(data_index).await;
-                    true
-                } else {
-                    false
+            // Determine if this is a multi-turn child (has a parent in the conversation graph).
+            // Child turns are dispatched inside the spawned task to avoid head-of-line blocking.
+            let is_child_turn = track_output
+                .as_ref()
+                .map(|tos| tos.graph.parent_index[data_index].is_some())
+                .unwrap_or(false);
+
+            // Root turns: pace dispatch via scaled timestamp sleep in the dispatch loop.
+            // Child turns: pacing is handled inside the spawned task (wait for ancestors + original gap).
+            let scheduled_ts: f64 = if !is_child_turn {
+                let curr_timestamp = get_timestamp() as u64;
+                let next_timestamp =
+                    ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
+                if next_timestamp > curr_timestamp + 1 {
+                    sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
                 }
+                next_timestamp as f64
             } else {
-                false
+                0.0
             };
 
-            let curr_timestamp = get_timestamp() as u64;
-            let next_timestamp = ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
-
-            if next_timestamp > curr_timestamp + 1 {
-                sleep(Duration::from_millis(next_timestamp - curr_timestamp)).await;
-            }
-
-            // Inflate: use Messages for multi-turn with tracked output, Content otherwise
-            let (prompt, input_length, output_length) = if use_messages {
-                let tos = track_output.as_ref().unwrap();
-                let (chain, outputs) = tos.get_chain_with_outputs(data_index);
-                dataset
-                    .inflate_as_messages(
-                        data_index,
-                        token_sampler.as_ref(),
-                        &tos.graph,
-                        &chain,
-                        &outputs,
-                    )
-                    .unwrap_or_else(|| dataset.inflate(data_index, token_sampler.as_ref()))
-            } else if let Some(ref cache) = prompt_cache {
-                let entry = cache.get(data_index);
-                (entry.prompt.clone(), entry.input_length, entry.output_length)
+            // Root turns: inflate prompt in the dispatch loop (no causal dependencies).
+            // Child turns: must inflate inside the task after ancestors complete.
+            let precomputed_prompt = if !is_child_turn {
+                Some(if let Some(ref cache) = prompt_cache {
+                    let entry = cache.get(data_index);
+                    (entry.prompt.clone(), entry.input_length, entry.output_length)
+                } else {
+                    dataset.inflate(data_index, token_sampler.as_ref())
+                })
             } else {
-                dataset.inflate(data_index, token_sampler.as_ref())
+                None
             };
 
             let track_output_clone = track_output.clone();
+            let dataset_clone = dataset.clone();
+            let token_sampler_clone = token_sampler.clone();
             let request_handle = spawn(async move {
+                // Resolve prompt: precomputed for root turns, wait-then-inflate for child turns.
+                let (prompt, input_length, output_length, s_time_base) =
+                    if let Some(pre) = precomputed_prompt {
+                        (pre.0, pre.1, pre.2, scheduled_ts)
+                    } else {
+                        // Child turn: wait for all ancestor turns to complete first.
+                        let tos = track_output_clone.as_ref().unwrap();
+                        tos.wait_for_ancestors(data_index).await;
+
+                        // Preserve the original (unscaled) inter-turn gap from the trace.
+                        let parent_idx = tos.graph.parent_index[data_index].unwrap();
+                        let parent_ts = dataset_clone.timestamp(parent_idx);
+                        let my_ts = dataset_clone.timestamp(data_index);
+                        let gap_ms = my_ts.saturating_sub(parent_ts);
+                        if gap_ms > 1 {
+                            sleep(Duration::from_millis(gap_ms)).await;
+                        }
+
+                        // Inflate as Messages with ancestor outputs.
+                        let (chain, outputs) = tos.get_chain_with_outputs(data_index);
+                        let (p, il, ol) = dataset_clone
+                            .inflate_as_messages(
+                                data_index,
+                                token_sampler_clone.as_ref(),
+                                &tos.graph,
+                                &chain,
+                                &outputs,
+                            )
+                            .unwrap_or_else(|| {
+                                dataset_clone.inflate(data_index, token_sampler_clone.as_ref())
+                            });
+                        (p, il, ol, get_timestamp())
+                    };
+
                 let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
-                let s_time_drift = s_time - next_timestamp as f64;
+                let s_time_drift = s_time - s_time_base;
                 match post_with_timeout::<A>(
                     client,
                     endpoint.as_str(),
@@ -364,11 +395,10 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             metrics.insert("normalized_e2e".to_string(), format!("{normalized_e2e:.3}"));
                         }
 
-                        // Store output text for output tracking
+                        // Always complete for output tracking (unblocks downstream turns).
                         if let Some(ref tos) = track_output_clone {
-                            if let Some(text) = metrics.remove("output_text") {
-                                tos.complete(data_index, text);
-                            }
+                            let text = metrics.remove("output_text").unwrap_or_default();
+                            tos.complete(data_index, text);
                         }
 
                         response_sender.send(metrics).unwrap();
@@ -391,6 +421,10 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                             "span_time".to_string(),
                             format!("{span_time:.3}"),
                         );
+                        // Unblock downstream turns even on timeout.
+                        if let Some(ref tos) = track_output_clone {
+                            tos.complete(data_index, String::new());
+                        }
                         response_sender.send(metrics).unwrap();
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -398,12 +432,18 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                         tracing::error!(
                             "Request#{data_index}::({input_length}|{output_length}) error: {error}",
                         );
+                        if let Some(ref tos) = track_output_clone {
+                            tos.complete(data_index, String::new());
+                        }
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(RequestError::StreamErr(error)) => {
                         tracing::error!(
                             "Request#{data_index}::({input_length}|{output_length}) stream error: {error}",
                         );
+                        if let Some(ref tos) = track_output_clone {
+                            tos.complete(data_index, String::new());
+                        }
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
