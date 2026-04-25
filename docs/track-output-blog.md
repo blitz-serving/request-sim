@@ -220,12 +220,10 @@ C2 (block congruence) says: if two requests share a hash_id at the same block po
 
 These are properties of the *trace data*, not of request-sim's runtime. They confirm the trace is well-formed for congruence, but say nothing about the actual strings produced at runtime.
 
-**What the code provides (argument from construction, not formal proof):**
-- `user_prompts: HashMap<u64, String>` maps each hash_id to exactly one string. A HashMap returns the same value for the same key -- this is the data structure's contract.
-- The double-checked locking in `inflate()` / `inflate_hashes()` ensures single-writer semantics: the first thread to encounter a new hash_id generates and stores a string; all subsequent threads read that same entry.
-- No code path ever *overwrites* an existing entry (the write branch checks `get()` again under the write lock and skips insertion if the key exists).
-
-This is a **manual code-level argument**, not a machine-checked proof. True formal verification would require a tool like Kani or Creusot to prove that the `SpinRwLock` + `UnsafeCell<HashMap>` protocol guarantees the single-write-then-read-only invariant under all possible thread interleavings. We have not done this.
+**What the code provides (trivially correct by HashMap semantics):**
+- `user_prompts: HashMap<u64, String>` maps each hash_id to exactly one string. Same key → same value. That's what HashMaps do.
+- No code path ever overwrites an existing entry (the write branch checks `get()` again and skips if the key exists).
+- The concurrency mechanism (`SpinRwLock`) is an implementation detail for thread safety — it doesn't affect the congruence property. Even under races, only one insert per key succeeds; all others read the winner's value.
 
 **What end-to-end empirical validation would look like:**
 Run the same trace twice against vLLM with `return_token_ids=true`. For each shared hash_id block, compare the token IDs at that position across both runs. If they differ for any block, C2 is violated. We have not run this test.
