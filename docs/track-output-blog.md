@@ -192,6 +192,44 @@ Three invariants ensure correctness. We state them here; the full proofs are in 
 
 **Output matching.** `enc(dec(output_tokens)) == output_tokens` for canonical BPE, because template tokens create pre-tokenization barriers around the assistant message. The `<|im_end|>` after the assistant content and `<|im_start|>` before the next user content isolate the output text from adjacent content during re-tokenization. Within the assistant message boundary, BPE `encode` is deterministic and canonical tokens are roundtrip-stable.
 
+## Explaining the Gap: Template Overhead and Block Alignment
+
+The block-level simulator predicts 42.9% but vLLM measures 38.4%. The gap comes from two factors the block-level simulator ignores.
+
+**1. Template overhead tokens.** The engine processes `template(message(text))`, adding ~8 tokens per message boundary (`<|im_start|>user\n` = 3 tokens, `<|im_end|>\n<|im_start|>assistant\n` = 5 tokens). These increase the total token count without corresponding to hash_id blocks.
+
+- Block-level denominator: 14 hash_id blocks = 224 tokens
+- Actual denominator: 250 tokens (including template)
+
+**2. Block alignment.** vLLM only caches *full* 16-token blocks. A 104-token prefix match yields 6 full blocks (96 reusable tokens). The remaining 8 tokens in the partial 7th block are computed but not reusable.
+
+**Token-level computation:**
+- Turn 1: 3 + 64 + 5 = 72 input tokens. Generates 33 output tokens (32 + EOS). Total cached: 105.
+- Turn 2 (Messages): 3 + 64 + 5 + 32 + 5 + 64 + 5 = 178 input tokens. Prefix match: 104 tokens → 6 full blocks = 96 aligned tokens.
+- Hit rate: 96 / (72 + 178) = 96/250 = 38.4% -- exact match with vLLM.
+
+The block-level simulator counts reusable hash_id blocks (6 shared out of 14 total = 42.9%), which is correct at the block abstraction but misses the template tokens that dilute the denominator and the alignment loss that shrinks the numerator. Both factors push in the same direction, explaining the 4.5 percentage point gap.
+
+## Congruence: What We Can and Cannot Claim
+
+C2 (block congruence) says: if two requests share a hash_id at the same block position, the token content at that position must be identical. How confident are we that this holds?
+
+**What the simulator checks (necessary condition on the trace):**
+- Shared hash_ids between parent and child form a contiguous prefix.
+- Every hash_id appearing in multiple requests occupies the same block position.
+
+These are properties of the *trace data*, not of request-sim's runtime. They confirm the trace is well-formed for congruence, but say nothing about the actual strings produced at runtime.
+
+**What the code provides (argument from construction, not formal proof):**
+- `user_prompts: HashMap<u64, String>` maps each hash_id to exactly one string. A HashMap returns the same value for the same key -- this is the data structure's contract.
+- The double-checked locking in `inflate()` / `inflate_hashes()` ensures single-writer semantics: the first thread to encounter a new hash_id generates and stores a string; all subsequent threads read that same entry.
+- No code path ever *overwrites* an existing entry (the write branch checks `get()` again under the write lock and skips insertion if the key exists).
+
+This is a **manual code-level argument**, not a machine-checked proof. True formal verification would require a tool like Kani or Creusot to prove that the `SpinRwLock` + `UnsafeCell<HashMap>` protocol guarantees the single-write-then-read-only invariant under all possible thread interleavings. We have not done this.
+
+**What end-to-end empirical validation would look like:**
+Run the same trace twice against vLLM with `return_token_ids=true`. For each shared hash_id block, compare the token IDs at that position across both runs. If they differ for any block, C2 is violated. We have not run this test.
+
 ## Takeaway
 
 If your benchmark tool generates synthetic prompts for multi-turn conversations, the question isn't whether prefix caching works -- it's whether your tool is constructing prompts in a way that *allows* prefix caching to work. The template suffix barrier means that stuffing everything into a single message will silently defeat prefix matching at every turn boundary, no matter how carefully you match the content.

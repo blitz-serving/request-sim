@@ -232,6 +232,141 @@ def simulate_messages_mode(items: list[dict], cache_blocks: int, block_size: int
     return cache.hit_rate
 
 
+def verify_congruence(items: list[dict]):
+    """
+    Verify C2 (block congruence): every hash_id that appears in multiple requests
+    always occupies the same block position(s) within those requests' hash_id lists.
+
+    Also verify that shared hash_ids between parent and child are a contiguous prefix.
+    """
+    parent_index = build_conversation_graph(items)
+
+    # Map hash_id → set of (request_index, position_in_hash_ids)
+    hash_positions: dict[int, list[tuple[int, int]]] = {}
+    for i, item in enumerate(items):
+        for pos, hid in enumerate(item["hash_ids"]):
+            hash_positions.setdefault(hid, []).append((i, pos))
+
+    # Check 1: shared hash_ids between parent and child form a contiguous prefix
+    prefix_ok = 0
+    prefix_fail = 0
+    for i, item in enumerate(items):
+        if parent_index[i] is None:
+            continue
+        parent = items[parent_index[i]]
+        parent_hids = parent["hash_ids"]
+        child_hids = item["hash_ids"]
+
+        # Find the shared prefix length
+        shared_len = 0
+        for j in range(min(len(parent_hids), len(child_hids))):
+            if parent_hids[j] == child_hids[j]:
+                shared_len += 1
+            else:
+                break
+
+        # Check no parent hash_id appears AFTER the prefix in the child
+        parent_set = set(parent_hids)
+        stray = [h for h in child_hids[shared_len:] if h in parent_set]
+        if stray:
+            prefix_fail += 1
+            print(f"  FAIL: request {i} has {len(stray)} parent hash_ids after prefix break")
+        else:
+            prefix_ok += 1
+
+    print(f"\n=== Congruence Check (trace-level necessary condition for C2) ===")
+    print(f"Shared-prefix property: {prefix_ok} OK, {prefix_fail} FAIL")
+
+    # Check 2: hash_ids appearing in multiple requests are at the same position
+    position_ok = 0
+    position_fail = 0
+    for hid, positions in hash_positions.items():
+        if len(positions) <= 1:
+            continue
+        pos_values = set(p for _, p in positions)
+        if len(pos_values) == 1:
+            position_ok += 1
+        else:
+            position_fail += 1
+            reqs = [(req, pos) for req, pos in positions]
+            print(f"  FAIL: hash_id {hid} at different positions: {reqs}")
+
+    print(f"Position-congruence: {position_ok} OK, {position_fail} FAIL")
+    total_shared = sum(1 for hid, pos in hash_positions.items() if len(pos) > 1)
+    print(f"Total shared hash_ids: {total_shared}")
+    print(f"  Note: this checks the TRACE structure, not runtime string equality.")
+    print(f"  Runtime C2 relies on HashMap single-write semantics (code argument, not formal proof).")
+
+    return prefix_fail == 0 and position_fail == 0
+
+
+def simulate_token_level(items: list[dict], block_size: int = 16):
+    """
+    Token-level simulation that accounts for template overhead and block alignment.
+    This should match vLLM's actual measured hit rate.
+    """
+    T_PREFIX = 3   # <|im_start|>user\n
+    T_SUFFIX = 5   # <|im_end|>\n<|im_start|>assistant\n
+    T_MID = 5      # <|im_end|>\n<|im_start|>user\n
+
+    parent_index = build_conversation_graph(items)
+    total_input_tokens = 0
+    total_hit_tokens = 0
+
+    print("\n=== Token-Level Simulation (with template overhead + block alignment) ===")
+    print(f"{'Req':>4} {'Turn':>4} {'Tokens':>7} {'Match':>6} {'Aligned':>8} {'HitRate':>8}")
+
+    # Track cached token count per request (input + output)
+    cached_per_request: dict[int, int] = {}
+
+    for i, item in enumerate(items):
+        hash_ids = item["hash_ids"]
+        parent_idx = parent_index[i]
+
+        if parent_idx is None:
+            # First turn: template([{user, text}])
+            input_tokens = T_PREFIX + item["input_length"] + T_SUFFIX
+            match_tokens = 0
+        else:
+            parent = items[parent_idx]
+            # Messages mode: template([{user, shared}, {asst, output}, {user, remaining}])
+            parent_set = set(parent["hash_ids"])
+            delta = [h for h in hash_ids if h not in parent_set]
+            output_blocks = (parent["output_length"] + block_size - 1) // block_size
+            remaining_blocks = len(delta) - output_blocks
+            remaining_tokens = max(remaining_blocks * block_size, 0)
+
+            # We captured output_text from the engine; when re-tokenized ≈ output_length tokens
+            output_text_tokens = parent["output_length"]
+
+            input_tokens = (T_PREFIX + parent["input_length"] + T_SUFFIX +
+                            output_text_tokens + T_MID +
+                            remaining_tokens + T_SUFFIX)
+
+            # Prefix match with parent's cached sequence
+            parent_cached = cached_per_request.get(parent_idx, 0)
+            # Match = min(parent_cached, our prefix up to end of output)
+            our_prefix = T_PREFIX + parent["input_length"] + T_SUFFIX + output_text_tokens
+            match_tokens = min(parent_cached, our_prefix)
+
+        # Block-align the match
+        aligned = (match_tokens // block_size) * block_size
+
+        # Cache this request's full sequence (input + output)
+        output_tokens = item["output_length"] + 1  # +1 for EOS
+        cached_per_request[i] = input_tokens + output_tokens
+
+        total_input_tokens += input_tokens
+        total_hit_tokens += aligned
+
+        hit_rate = aligned / input_tokens if input_tokens > 0 else 0
+        print(f"{i:4d} {item['turn']:4d} {input_tokens:7d} {match_tokens:6d} {aligned:8d} {hit_rate*100:7.1f}%")
+
+    overall = total_hit_tokens / total_input_tokens if total_input_tokens > 0 else 0
+    print(f"\nOverall token-level hit rate: {overall*100:.1f}%")
+    return overall
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prefix cache hit rate simulator")
     parser.add_argument("--trace", required=True, help="Path to Bailian JSONL trace")
@@ -246,13 +381,19 @@ def main():
     print(f"Cache: {args.cache_blocks} blocks x {args.block_size} tokens = "
           f"{args.cache_blocks * args.block_size:,} tokens capacity\n")
 
+    congruence_ok = verify_congruence(items)
+
     baseline_rate = simulate_content_mode(items, args.cache_blocks, args.block_size)
     tracked_rate = simulate_messages_mode(items, args.cache_blocks, args.block_size)
+    token_rate = simulate_token_level(items, args.block_size)
 
-    print(f"\n{'='*50}")
-    print(f"Content mode (baseline):     {baseline_rate*100:.1f}%")
-    print(f"Messages mode (track-output): {tracked_rate*100:.1f}%")
-    print(f"Improvement:                  +{(tracked_rate - baseline_rate)*100:.1f}pp")
+    print(f"\n{'='*60}")
+    print(f"{'Mode':<30} {'Block-level':>12} {'Token-level':>12}")
+    print(f"{'Content (baseline)':<30} {baseline_rate*100:>11.1f}% {'—':>12}")
+    print(f"{'Messages (track-output)':<30} {tracked_rate*100:>11.1f}% {token_rate*100:>11.1f}%")
+    print(f"{'Congruence C2':<30} {'PASS' if congruence_ok else 'FAIL':>12}")
+    print(f"\nThe token-level rate accounts for template overhead (~8 tokens/message)")
+    print(f"and block alignment (only full {args.block_size}-token blocks are reusable).")
 
 
 if __name__ == "__main__":
