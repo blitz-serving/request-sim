@@ -9,3 +9,4 @@ Cargo.lock
 *.pdf
 *.log
 /pic
+/docs/paper/
