@@ -160,33 +160,26 @@ Output text is captured from standard OpenAI API responses -- accumulated `choic
 
 ## 5. Validation
 
-### Production: vLLM v0.10.0, Qwen3-30B-A3B, TP4
+### Synthetic trace: vLLM v0.10.0, Qwen3-30B-A3B, TP4
 
-We ran an identical Bailian multi-turn trace against vLLM with automatic prefix caching enabled, comparing Content mode (baseline) against Messages mode (`--track-output`):
+On a minimal 2-turn synthetic trace, the Messages architecture shows a clear improvement in prefix cache hit rate:
 
 | Mode | Prefix Cache Hit Rate |
 |------|----------------------|
 | Content (baseline) | 26.7% |
-| Messages (`--track-output`) | **38.4%** |
+| Messages (`--track-output`) | 38.4% |
 
-An **+11.7 percentage point** improvement from accurately modeling the multi-turn conversation structure.
+A token-level simulator confirms these numbers exactly (`scripts/simulate_cache.py`). The gap between the block-level simulator (42.9%) and the actual measurement (38.4%) is fully explained by template overhead tokens and block alignment — see `scripts/explain_gap.py`.
 
-### Token-Level Prediction
+### Production trace: known bug
 
-A standalone Python simulator (`scripts/simulate_cache.py`) models the block-level prefix cache with LRU eviction:
+On a 500-entry production Bailian trace (`qwen_traceA_blksz_16.jsonl`), the current implementation shows a **regression**: baseline 37.0% → track-output 27.8%. The root cause: root turns use Content mode (full inflate text) while child turns use Messages mode (stripped text via `TemplateRegistry`). The token sequences at the shared prefix differ, breaking cache hits instead of improving them. Additionally, 79 of 500 requests hung due to unscaled inter-turn gap sleep.
 
-| Level | Content | Messages |
-|-------|---------|----------|
-| Block-level simulator | 28.6% | 42.9% |
-| Token-level (vLLM actual) | 26.7% | 38.4% |
+**Fix required**: all turns must use the same Σ\* → M → T\* pipeline when `--track-output` is enabled. See `.claude/plans/cheerful-kindling-shore.md` for the fix plan.
 
-The gap between the block-level simulator (42.9%) and the actual engine measurement (38.4%) is fully explained by two factors the simulator ignores:
+### Token-level analysis (synthetic trace)
 
-**Template overhead tokens.** The engine processes `template(message(text))`, adding ~8 tokens per message boundary (`<|im_start|>user\n` = 3 tokens, `<|im_end|>\n<|im_start|>assistant\n` = 5 tokens). These increase the total token count without corresponding to hash_id blocks, diluting the denominator.
-
-**Block alignment.** vLLM only caches *complete* 16-token blocks. A 104-token prefix match yields 6 full blocks (96 reusable tokens). The 8 remaining tokens in the partial 7th block are recomputed.
-
-Concrete calculation for a two-turn trace:
+The synthetic 2-turn calculation remains valid as a proof of concept:
 
 ```
 Turn 1:  3 (template) + 64 (input blocks) + 5 (template) = 72 input tokens
@@ -197,10 +190,10 @@ Turn 2 (Messages):
   Prefix match with Turn 1: 104 tokens
   Aligned to 16-token blocks: floor(104/16) * 16 = 96 tokens
 
-Hit rate = 96 / (72 + 178) = 96 / 250 = 38.4%  -- exact match with vLLM
+Hit rate = 96 / (72 + 178) = 96 / 250 = 38.4%
 ```
 
-The block-level simulator counts 6 shared blocks out of 14 total hash blocks = 42.9%, which is correct at its abstraction level but misses the template-token dilution and alignment loss.
+This confirms the Messages architecture is correct in principle. The production regression is an implementation bug (root-child mode mismatch), not a flaw in the approach.
 
 ## 6. Congruence: Levels of Assurance
 
