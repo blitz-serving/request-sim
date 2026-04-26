@@ -503,9 +503,11 @@ async fn async_main(args: Args) -> Result<(), i32> {
                  chat_id/parent_chat_id fields needed for conversation graph construction."
             );
         let tokenizer = token_sampler.get_tokenizer();
+        let template = request_sim::dataset::TemplateRegistry::for_tokenizer_class("Qwen2Tokenizer");
         let state = request_sim::requester::TrackOutputState::new(
             graph,
             tokenizer,
+            template,
             dataset.len(),
         );
         // Disable cache when tracking output

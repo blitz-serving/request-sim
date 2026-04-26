@@ -68,6 +68,9 @@ impl RequestContext {
 
 // ── Output tracking for multi-turn KV cache consistency ─────────────────────
 
+#[cfg(feature = "prompt-text-hashed")]
+use crate::dataset::TemplateRegistry;
+
 /// Shared state for tracking engine output across multi-turn conversations.
 /// When enabled, the dispatch loop waits for ancestor turns to complete,
 /// then constructs a Messages prompt with actual output as assistant messages.
@@ -76,12 +79,18 @@ impl RequestContext {
 pub struct TrackOutputState {
     pub graph: Arc<ConversationGraph>,
     pub tokenizer: Arc<tokenizers::Tokenizer>,
+    pub template: Arc<TemplateRegistry>,
     completions: Arc<dashmap::DashMap<usize, tokio::sync::watch::Sender<Option<String>>>>,
 }
 
 #[cfg(feature = "prompt-text-hashed")]
 impl TrackOutputState {
-    pub fn new(graph: ConversationGraph, tokenizer: tokenizers::Tokenizer, dataset_len: usize) -> Self {
+    pub fn new(
+        graph: ConversationGraph,
+        tokenizer: tokenizers::Tokenizer,
+        template: TemplateRegistry,
+        dataset_len: usize,
+    ) -> Self {
         let completions = Arc::new(dashmap::DashMap::with_capacity(dataset_len));
         for i in 0..dataset_len {
             let (tx, _rx) = tokio::sync::watch::channel(None);
@@ -90,6 +99,7 @@ impl TrackOutputState {
         Self {
             graph: Arc::new(graph),
             tokenizer: Arc::new(tokenizer),
+            template: Arc::new(template),
             completions,
         }
     }
@@ -350,6 +360,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                                 &tos.graph,
                                 &chain,
                                 &outputs,
+                                &tos.template,
                             )
                             .unwrap_or_else(|| {
                                 dataset_clone.inflate(data_index, token_sampler_clone.as_ref())

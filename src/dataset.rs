@@ -6,6 +6,60 @@ use std::{
 #[cfg(feature = "prompt-text-hashed")]
 use std::{cell::UnsafeCell, collections::HashMap, collections::HashSet};
 
+// ── Template registry for strict C1 ────────────────────────────────────────
+//
+// The production trace's hash_ids encode the FULL template-applied token
+// sequence. inflate() generates content for ALL positions, including those
+// that were template tokens in production. Before sending to the engine,
+// we strip the known template prefix/suffix strings so the engine's
+// exact-once template application fills those positions.
+//
+// Per-position strip patterns for Qwen2/3 chat template:
+//   Root user msg:      strip "<|im_start|>user\n" / "<|im_end|>\n<|im_start|>assistant\n"
+//   Remaining user msg: strip "<|im_end|>\n<|im_start|>user\n" / "<|im_end|>\n<|im_start|>assistant\n"
+//   Assistant msg:      no strip (captured output text, not from hash_ids)
+
+#[cfg(feature = "prompt-text-hashed")]
+pub struct TemplateRegistry {
+    /// Strip from the beginning of the root turn's inflate output.
+    pub root_prefix: &'static str,
+    /// Strip from the end of ANY turn's inflate output (last turn has generation prompt).
+    pub turn_suffix: &'static str,
+    /// Strip from the beginning of non-root turns' remaining delta inflate output.
+    pub inter_turn_prefix: &'static str,
+}
+
+#[cfg(feature = "prompt-text-hashed")]
+impl TemplateRegistry {
+    pub fn for_tokenizer_class(class: &str) -> Self {
+        match class {
+            "Qwen2Tokenizer" => Self {
+                root_prefix: "<|im_start|>user\n",
+                turn_suffix: "<|im_end|>\n<|im_start|>assistant\n",
+                inter_turn_prefix: "<|im_end|>\n<|im_start|>user\n",
+            },
+            other => unimplemented!(
+                "TemplateRegistry not implemented for tokenizer class '{other}'. \
+                 Currently only Qwen2/Qwen2.5/Qwen3 (Qwen2Tokenizer) is supported."
+            ),
+        }
+    }
+
+    /// Strip embedded template from root turn inflate output.
+    pub fn strip_root<'a>(&self, text: &'a str) -> &'a str {
+        text.strip_prefix(self.root_prefix)
+            .and_then(|t| t.strip_suffix(self.turn_suffix))
+            .unwrap_or(text)
+    }
+
+    /// Strip embedded template from non-root remaining delta inflate output.
+    pub fn strip_remaining<'a>(&self, text: &'a str) -> &'a str {
+        text.strip_prefix(self.inter_turn_prefix)
+            .and_then(|t| t.strip_suffix(self.turn_suffix))
+            .unwrap_or(text)
+    }
+}
+
 #[cfg(feature = "prompt-text-hashed")]
 use crate::token_sampler::TokenSampler;
 #[cfg(feature = "prompt-text-hashed")]
@@ -129,6 +183,7 @@ pub trait LLMTrace: Send + Sync {
         _graph: &ConversationGraph,
         _ancestor_chain: &[usize],
         _ancestor_outputs: &[String],
+        _template: &TemplateRegistry,
     ) -> Option<(PromptPayload, u64, u64)> {
         None
     }
@@ -307,6 +362,7 @@ impl LLMTrace for BailianDataset {
         graph: &ConversationGraph,
         ancestor_chain: &[usize],
         ancestor_outputs: &[String],
+        template: &TemplateRegistry,
     ) -> Option<(PromptPayload, u64, u64)> {
         if ancestor_chain.is_empty() {
             return None;
@@ -315,12 +371,13 @@ impl LLMTrace for BailianDataset {
         let item = &self.items[index];
         let mut messages = Vec::new();
 
-        // Root turn: user message from all its hash_ids
+        // Root turn: user message from all its hash_ids, strip embedded template
         let root_idx = ancestor_chain[0];
         let root_item = &self.items[root_idx];
         let root_text =
             self.inflate_hashes(&root_item.hash_ids, root_item.input_length as usize, ts);
-        messages.push(serde_json::json!({"role": "user", "content": root_text}));
+        let root_content = template.strip_root(&root_text);
+        messages.push(serde_json::json!({"role": "user", "content": root_content}));
 
         // Each subsequent ancestor: assistant output + user remaining delta
         for (i, &anc_idx) in ancestor_chain.iter().enumerate() {
@@ -367,7 +424,8 @@ impl LLMTrace for BailianDataset {
 
                 let remaining_text =
                     self.inflate_hashes(&remaining_hashes, remaining_tokens, ts);
-                messages.push(serde_json::json!({"role": "user", "content": remaining_text}));
+                let remaining_content = template.strip_remaining(&remaining_text);
+                messages.push(serde_json::json!({"role": "user", "content": remaining_content}));
             }
         }
 
