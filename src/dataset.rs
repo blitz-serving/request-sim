@@ -348,11 +348,22 @@ impl LLMTrace for BailianDataset {
                 .collect();
 
             if !remaining_hashes.is_empty() {
+                // Estimate remaining token count from block count.
+                // Each full block has BLOCK_SIZE tokens; the last may be partial.
+                // This is approximate because the trace's input_length includes
+                // production template overhead that differs from our Messages structure.
+                const BLOCK_SIZE: usize = 16;
                 let anc_item = &self.items[anc_idx];
-                let remaining_tokens = (next_item.input_length as usize)
+                let remaining_tokens_est = (next_item.input_length as usize)
                     .saturating_sub(anc_item.input_length as usize)
                     .saturating_sub(anc_item.output_length as usize);
-                let remaining_tokens = remaining_tokens.max(remaining_hashes.len()); // at least 1 per hash
+                // Use the block-count-based estimate if the arithmetic gives a sane value,
+                // otherwise fall back to full blocks.
+                let remaining_tokens = if remaining_tokens_est >= remaining_hashes.len() {
+                    remaining_tokens_est
+                } else {
+                    remaining_hashes.len() * BLOCK_SIZE
+                };
 
                 let remaining_text =
                     self.inflate_hashes(&remaining_hashes, remaining_tokens, ts);
