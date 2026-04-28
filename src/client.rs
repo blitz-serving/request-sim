@@ -219,6 +219,14 @@ struct Args {
     #[cfg(feature = "prompt-text-hashed")]
     #[clap(long, default_value_t = false)]
     track_output: bool,
+
+    /// Controls inter-turn timing when --track-output is enabled.
+    /// - preserve-gap: session start scaled, intra-session gaps preserved (default)
+    /// - scale-gap: all times scaled proportionally, causality preserved
+    /// - scale-all: all times scaled, no causality — most aggressive
+    #[cfg(feature = "prompt-text-hashed")]
+    #[clap(long, default_value = "preserve-gap")]
+    track_output_timing: String,
 }
 
 fn validate_config(args: &Args) {
@@ -275,9 +283,9 @@ fn validate_config(args: &Args) {
     #[cfg(feature = "prompt-text-hashed")]
     if args.track_output {
         assert!(
-            args.mode == "trace-replay",
-            "--track-output only supports --mode trace-replay (multi-turn replay). \
-             random-process and feedback modes do not maintain conversation state."
+            args.mode == "trace-replay" || args.mode == "feedback",
+            "--track-output only supports --mode trace-replay and --mode feedback. \
+             random-process mode does not maintain conversation state."
         );
         if args.cache != "none" {
             tracing::warn!(
@@ -337,6 +345,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
         amadeus_id,
         #[cfg(feature = "prompt-text-hashed")]
         track_output,
+        #[cfg(feature = "prompt-text-hashed")]
+        track_output_timing,
     } = args;
 
     let mut metric_percentile = metric_percentile;
@@ -516,6 +526,9 @@ async fn async_main(args: Args) -> Result<(), i32> {
         None
     };
 
+    #[cfg(feature = "prompt-text-hashed")]
+    let timing_mode = request_sim::requester::TrackOutputTiming::from_str(&track_output_timing);
+
     // Build RequestContext for new mode functions
     let ctx = RequestContext {
         dataset: dataset.clone(),
@@ -605,6 +618,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 time_range,
                 #[cfg(feature = "prompt-text-hashed")]
                 track_output_state.clone(),
+                #[cfg(feature = "prompt-text-hashed")]
+                timing_mode,
             ),
             "random-process" => spawn_request_loop_random_process::<TgiApi>(
                 endpoint,
@@ -635,6 +650,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 tpot_slo,
                 stream,
                 early_stop_error_threshold,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             _ => unreachable!(),
         },
@@ -655,6 +672,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 time_range,
                 #[cfg(feature = "prompt-text-hashed")]
                 track_output_state.clone(),
+                #[cfg(feature = "prompt-text-hashed")]
+                timing_mode,
             ),
             "random-process" => spawn_request_loop_random_process::<OaiApi>(
                 endpoint,
@@ -685,6 +704,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 tpot_slo,
                 stream,
                 early_stop_error_threshold,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             _ => unreachable!(),
         },
@@ -705,6 +726,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 time_range,
                 #[cfg(feature = "prompt-text-hashed")]
                 track_output_state.clone(),
+                #[cfg(feature = "prompt-text-hashed")]
+                timing_mode,
             ),
             "random-process" => spawn_request_loop_random_process::<OaiApi>(
                 endpoint,
@@ -735,6 +758,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 tpot_slo,
                 stream,
                 early_stop_error_threshold,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             _ => unreachable!(),
         },
@@ -755,6 +780,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 time_range,
                 #[cfg(feature = "prompt-text-hashed")]
                 track_output_state.clone(),
+                #[cfg(feature = "prompt-text-hashed")]
+                timing_mode,
             ),
             "random-process" => spawn_request_loop_random_process::<SglApi>(
                 endpoint,
@@ -785,6 +812,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 tpot_slo,
                 stream,
                 early_stop_error_threshold,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             _ => unreachable!(),
         },
@@ -805,6 +834,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 time_range,
                 #[cfg(feature = "prompt-text-hashed")]
                 track_output_state.clone(),
+                #[cfg(feature = "prompt-text-hashed")]
+                timing_mode,
             ),
             "random-process" => spawn_request_loop_random_process::<AmadeusApi>(
                 endpoint,
@@ -835,6 +866,8 @@ async fn async_main(args: Args) -> Result<(), i32> {
                 tpot_slo,
                 stream,
                 early_stop_error_threshold,
+                #[cfg(feature = "prompt-text-hashed")]
+                track_output_state.clone(),
             ),
             _ => unreachable!(),
         },

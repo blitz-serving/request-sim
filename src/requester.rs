@@ -151,6 +151,43 @@ impl TrackOutputState {
     }
 }
 
+/// Controls how inter-turn timing is handled for multi-turn track-output replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackOutputTiming {
+    /// (a) Session start time is scaled by scale-factor; intra-session parent→child
+    /// gaps are preserved at their original trace values (unscaled). This is the
+    /// least aggressive mode — the system sees child requests at natural pacing.
+    PreserveGap,
+
+    /// (b) Both session start time AND intra-session gaps are scaled by scale-factor,
+    /// but causality is preserved — child still waits for parent to complete before
+    /// sleeping the (scaled) gap. Under high SF, children arrive faster after parent
+    /// completes, stressing the decode pipeline more.
+    ScaleGap,
+
+    /// (c) All request timestamps are scaled uniformly by scale-factor, with no
+    /// causality enforcement. Children are dispatched at their scaled trace timestamp
+    /// regardless of whether ancestors have completed. Equivalent to treating all
+    /// requests as independent — the most aggressive mode. Prompt construction
+    /// still uses track-output (Messages with ancestor outputs), but if the ancestor
+    /// hasn't completed yet, falls back to Content mode.
+    ScaleAll,
+}
+
+impl TrackOutputTiming {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "preserve-gap" => Self::PreserveGap,
+            "scale-gap" => Self::ScaleGap,
+            "scale-all" => Self::ScaleAll,
+            _ => panic!(
+                "Invalid --track-output-timing value: '{s}'. \
+                 Valid: preserve-gap, scale-gap, scale-all"
+            ),
+        }
+    }
+}
+
 // ── Arrival process (continued) ─────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -232,6 +269,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
     prompt_cache: Option<Arc<PromptCache>>,
     time_range: (Option<u64>, Option<u64>),
     track_output: Option<TrackOutputState>,
+    track_output_timing: TrackOutputTiming,
 ) -> JoinHandle<Result<(), i32>> {
     init_basetime();
 
@@ -302,9 +340,10 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                 .map(|tos| tos.graph.parent_index[data_index].is_some())
                 .unwrap_or(false);
 
-            // Root turns: pace dispatch via scaled timestamp sleep in the dispatch loop.
-            // Child turns: pacing is handled inside the spawned task (wait for ancestors + original gap).
-            let scheduled_ts: f64 = if !is_child_turn {
+            // ScaleAll: all requests (root AND child) are paced via scaled timestamp in the dispatch loop.
+            // PreserveGap/ScaleGap: only root turns are paced here; child pacing is inside the spawned task.
+            let dispatch_in_loop = !is_child_turn || track_output_timing == TrackOutputTiming::ScaleAll;
+            let scheduled_ts: f64 = if dispatch_in_loop {
                 let curr_timestamp = get_timestamp() as u64;
                 let next_timestamp =
                     ((*dataset).timestamp(data_index) as f64 / scale_factor) as u64;
@@ -317,7 +356,8 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             };
 
             // Root turns: inflate prompt in the dispatch loop (no causal dependencies).
-            // Child turns: must inflate inside the task after ancestors complete.
+            // ScaleAll child turns: also inflate here — try Messages if ancestors are ready, else Content.
+            // PreserveGap/ScaleGap child turns: must inflate inside the task after ancestors complete.
             let precomputed_prompt = if !is_child_turn {
                 Some(if let Some(ref cache) = prompt_cache {
                     let entry = cache.get(data_index);
@@ -325,6 +365,26 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                 } else {
                     dataset.inflate(data_index, token_sampler.as_ref())
                 })
+            } else if track_output_timing == TrackOutputTiming::ScaleAll {
+                // ScaleAll: no causality enforcement. Try Messages if ancestors already completed.
+                let tos = track_output.as_ref().unwrap();
+                let (chain, outputs) = tos.get_chain_with_outputs(data_index);
+                let all_ready = chain.len() == outputs.len();
+                if all_ready {
+                    let result = dataset.inflate_as_messages(
+                        data_index,
+                        token_sampler.as_ref(),
+                        &tos.graph,
+                        &chain,
+                        &outputs,
+                        &tos.template,
+                    );
+                    Some(result.unwrap_or_else(|| {
+                        dataset.inflate(data_index, token_sampler.as_ref())
+                    }))
+                } else {
+                    Some(dataset.inflate(data_index, token_sampler.as_ref()))
+                }
             } else {
                 None
             };
@@ -332,23 +392,58 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
             let track_output_clone = track_output.clone();
             let dataset_clone = dataset.clone();
             let token_sampler_clone = token_sampler.clone();
+            // Clone for the drop guard — ensures complete() is called even if the task panics.
+            let tos_guard = track_output.clone();
             let request_handle = spawn(async move {
-                // Resolve prompt: precomputed for root turns, wait-then-inflate for child turns.
+                // Drop guard: if track_output is active, ensure complete() fires on all exit paths.
+                // This prevents downstream turns from deadlocking on wait_for_ancestors().
+                struct CompletionGuard {
+                    data_index: usize,
+                    completed: bool,
+                    #[cfg(feature = "prompt-text-hashed")]
+                    tos: Option<TrackOutputState>,
+                }
+                impl Drop for CompletionGuard {
+                    fn drop(&mut self) {
+                        #[cfg(feature = "prompt-text-hashed")]
+                        if !self.completed {
+                            if let Some(ref tos) = self.tos {
+                                tos.complete(self.data_index, String::new());
+                            }
+                        }
+                    }
+                }
+                let mut guard = CompletionGuard {
+                    data_index,
+                    completed: false,
+                    #[cfg(feature = "prompt-text-hashed")]
+                    tos: tos_guard,
+                };
+
+                // Resolve prompt: precomputed for root turns (and ScaleAll children),
+                // wait-then-inflate for PreserveGap/ScaleGap children.
                 let (prompt, input_length, output_length, s_time_base) =
                     if let Some(pre) = precomputed_prompt {
                         (pre.0, pre.1, pre.2, scheduled_ts)
                     } else {
-                        // Child turn: wait for all ancestor turns to complete first.
+                        // PreserveGap or ScaleGap: wait for all ancestor turns to complete first.
                         let tos = track_output_clone.as_ref().unwrap();
                         tos.wait_for_ancestors(data_index).await;
 
-                        // Preserve the original (unscaled) inter-turn gap from the trace.
+                        // Apply inter-turn gap based on timing mode.
                         let parent_idx = tos.graph.parent_index[data_index].unwrap();
                         let parent_ts = dataset_clone.timestamp(parent_idx);
                         let my_ts = dataset_clone.timestamp(data_index);
                         let gap_ms = my_ts.saturating_sub(parent_ts);
-                        if gap_ms > 1 {
-                            sleep(Duration::from_millis(gap_ms)).await;
+                        let actual_gap = match track_output_timing {
+                            TrackOutputTiming::PreserveGap => gap_ms,
+                            TrackOutputTiming::ScaleGap => {
+                                (gap_ms as f64 / scale_factor) as u64
+                            }
+                            TrackOutputTiming::ScaleAll => unreachable!(),
+                        };
+                        if actual_gap > 1 {
+                            sleep(Duration::from_millis(actual_gap)).await;
                         }
 
                         // Inflate as Messages with ancestor outputs.
@@ -410,6 +505,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                         if let Some(ref tos) = track_output_clone {
                             let text = metrics.remove("output_text").unwrap_or_default();
                             tos.complete(data_index, text);
+                            guard.completed = true;
                         }
 
                         response_sender.send(metrics).unwrap();
@@ -435,6 +531,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                         // Unblock downstream turns even on timeout.
                         if let Some(ref tos) = track_output_clone {
                             tos.complete(data_index, String::new());
+                            guard.completed = true;
                         }
                         response_sender.send(metrics).unwrap();
                         error_count.fetch_add(1, Ordering::Relaxed);
@@ -445,6 +542,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                         );
                         if let Some(ref tos) = track_output_clone {
                             tos.complete(data_index, String::new());
+                            guard.completed = true;
                         }
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -454,6 +552,7 @@ pub fn spawn_request_loop_with_timestamp<A: 'static + LLMApi + Send>(
                         );
                         if let Some(ref tos) = track_output_clone {
                             tos.complete(data_index, String::new());
+                            guard.completed = true;
                         }
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1164,6 +1263,8 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
     tpot_slo: f32,
     stream: bool,
     early_stop_error_threshold: Option<u32>,
+    #[cfg(feature = "prompt-text-hashed")]
+    track_output: Option<TrackOutputState>,
 ) -> JoinHandle<Result<(), i32>> {
     init_basetime();
 
@@ -1234,6 +1335,33 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
             let endpoint = endpoint.clone();
             let response_sender = response_sender.clone();
 
+            // Inflate: with track_output, child turns use Messages mode.
+            #[cfg(feature = "prompt-text-hashed")]
+            let is_child = track_output
+                .as_ref()
+                .map(|tos| tos.graph.parent_index[data_index].is_some())
+                .unwrap_or(false);
+
+            #[cfg(feature = "prompt-text-hashed")]
+            let (prompt, input_length, output_length) = if is_child {
+                let tos = track_output.as_ref().unwrap();
+                // With bs_limit=1, all ancestors completed before this iteration.
+                // No need to wait — outputs are already available.
+                let (chain, outputs) = tos.get_chain_with_outputs(data_index);
+                ctx.dataset
+                    .inflate_as_messages(
+                        data_index,
+                        ctx.token_sampler.as_ref(),
+                        &tos.graph,
+                        &chain,
+                        &outputs,
+                        &tos.template,
+                    )
+                    .unwrap_or_else(|| ctx.inflate(data_index))
+            } else {
+                ctx.inflate(data_index)
+            };
+            #[cfg(feature = "prompt-text-plain")]
             let (prompt, input_length, output_length) = ctx.inflate(data_index);
 
             let in_flight_state = Arc::new(InFlightState {
@@ -1249,6 +1377,8 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
             state.bs_active.fetch_add(1, Ordering::Relaxed);
 
             let task_state = Arc::clone(&state);
+            #[cfg(feature = "prompt-text-hashed")]
+            let track_output_clone = track_output.clone();
             let request_handle = spawn(async move {
                 let json_body = A::request_json_body(prompt, input_length, output_length, stream);
                 let s_time = get_timestamp();
@@ -1276,10 +1406,9 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
                     .global_token_counter
                     .fetch_add(out_tokens, Ordering::Relaxed);
 
-                // Remove from in-flight set, decrement counter, notify dispatch
+                // Remove from in-flight set, decrement counter
                 task_state.in_flight.lock().unwrap().remove(&request_id);
                 task_state.bs_active.fetch_sub(1, Ordering::Relaxed);
-                task_state.notify.notify_one();
 
                 match result {
                     Ok(mut metrics) => {
@@ -1307,6 +1436,11 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
                                 format!("{normalized_e2e:.3}"),
                             );
                         }
+                        #[cfg(feature = "prompt-text-hashed")]
+                        if let Some(ref tos) = track_output_clone {
+                            let text = metrics.remove("output_text").unwrap_or_default();
+                            tos.complete(data_index, text);
+                        }
                         response_sender.send(metrics).unwrap();
                     }
                     Err(RequestError::Timeout) => {
@@ -1326,6 +1460,10 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
                         let span_time = e_time - s_time;
                         metrics
                             .insert("span_time".to_string(), format!("{span_time:.3}"));
+                        #[cfg(feature = "prompt-text-hashed")]
+                        if let Some(ref tos) = track_output_clone {
+                            tos.complete(data_index, String::new());
+                        }
                         response_sender.send(metrics).unwrap();
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1333,15 +1471,27 @@ pub fn spawn_request_loop_feedback<A: 'static + LLMApi + Send>(
                         tracing::error!(
                             "Request#{data_index}::({input_length}|{output_length}) error: {error}",
                         );
+                        #[cfg(feature = "prompt-text-hashed")]
+                        if let Some(ref tos) = track_output_clone {
+                            tos.complete(data_index, String::new());
+                        }
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(RequestError::StreamErr(error)) => {
                         tracing::error!(
                             "Request#{data_index}::({input_length}|{output_length}) stream error: {error}",
                         );
+                        #[cfg(feature = "prompt-text-hashed")]
+                        if let Some(ref tos) = track_output_clone {
+                            tos.complete(data_index, String::new());
+                        }
                         error_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+
+                // Notify dispatch loop AFTER complete() — ensures child turns
+                // see parent output before concurrency gate releases.
+                task_state.notify.notify_one();
             });
 
             tx.send_async(request_handle).await.unwrap();

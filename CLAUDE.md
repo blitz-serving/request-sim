@@ -2,6 +2,47 @@
 
 Rust benchmark client for LLM inference endpoints. Supports three request dispatch modes: trace replay, stochastic arrival processes, and control-theory feedback loops. Measures TTFT, TPOT, and throughput against TGI / OpenAI / AIBrix APIs.
 
+## Validation Standard — NO Reward Hacking
+
+Cache hit validation MUST be **per-request exact match** against the Oracle (`scripts/simulate_cache.py`):
+
+```
+∀ request i:  Oracle.hit_blocks[i] × BLOCK_SIZE == vLLM.cached_tokens[i]
+```
+
+The following are **reward hacking** and do NOT constitute validation:
+- Aggregate hit rate comparison (Prometheus totals / total queries)
+- Approximate or "close enough" per-request matches
+- Matching only a subset of requests
+- Comparing against a non-vanilla vLLM (Oracle validates request-sim, not the serving engine)
+
+The Oracle's sole input is the trace JSONL. request-sim's trust-base is broader (tokenizer, model template, vLLM behavior). When they disagree, debug until they agree per-request — do not weaken the validation criterion.
+
+## Conceptual Model
+
+### Three-stage pipeline: Σ* → M → T*
+
+A request flows through three representations:
+- **Σ*** (text string): the raw text content, e.g. `"hello, world"`
+- **M** (message/JSON): the API payload, e.g. `{"role": "user", "content": "hello, world"}`
+- **T*** (token sequence): the actual token IDs the engine operates on, e.g. `[15339, 11, 1917]`
+
+The trace's `hash_ids` are block-level hashes of **T*** — the token sequence as seen by the inference engine's KV cache. The prefix cache operates entirely in T*-space. The Oracle simulates this by operating on `hash_ids` directly (each hash_id = one block of BLOCK_SIZE tokens in T*).
+
+### Oracle design
+
+The Oracle (`scripts/simulate_cache.py`) has exactly two inputs: **cache_size** and **trace JSONL**. It has no modes, no template knowledge, no model awareness. It is a pure LRU prefix cache simulator on `hash_ids`:
+1. Scan requests sequentially
+2. For each request: prefix-match its `hash_ids` against the LRU cache (stop at first miss)
+3. Insert all `hash_ids` into cache (LRU eviction if over capacity)
+4. Report `hit_blocks` per request
+
+### Template handling
+
+The trace's `input_length` includes production template tokens. `inflate()` generates `input_length` tokens of synthetic content, some of which occupy positions that were template tokens (e.g. `<|im_start|>user\n`) in production. Before sending to the engine via Messages mode, `TemplateRegistry` strips these known template substrings so the engine's template application fills those positions exactly once.
+
+When validating against vanilla vLLM, the vLLM instance MUST use a template that matches production — specifically no default system prompt injection (use a custom `--chat-template` that omits the `"You are Qwen..."` default). Extra template tokens shift block boundaries and break Oracle match.
+
 ## Build & Test
 
 ```bash

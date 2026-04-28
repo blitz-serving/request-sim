@@ -30,6 +30,7 @@ impl LLMApi for SglApi {
             "model": MODEL_NAME.get().unwrap().as_str(),
             "messages": messages,
             "stream": stream,
+            "stream_options": {"include_usage": stream},
         });
         if output_length > 0 {
             let exceeds_ctx = CONTEXT_LENGTH.get()
