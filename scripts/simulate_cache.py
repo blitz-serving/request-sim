@@ -35,27 +35,34 @@ class LRUPrefixCache:
         Mirrors vLLM's parent-dependent block hashing."""
         return hash((parent, block_hash))
 
-    def query_and_insert(self, hash_ids: list[int]) -> int:
+    def query_and_insert(self, hash_ids: list[int], full_blocks: int) -> int:
         """Prefix-match hash_ids against cache using chain hashing.
-        Returns number of contiguous hits from block 0."""
+        Returns number of contiguous hits from block 0.
+
+        Only the first `full_blocks` entries are cacheable (the last entry
+        may represent a partial block with < BLOCK_SIZE tokens, which vLLM
+        does not cache).
+        """
         hit = 0
         parent = 0  # initial chain state
 
-        # Phase 1: prefix match
+        # Phase 1: prefix match (only full blocks can be hits)
         chain_keys = []
-        for hid in hash_ids:
+        for i, hid in enumerate(hash_ids):
             ck = self.chain_hash(parent, hid)
             chain_keys.append(ck)
-            if ck in self.cache:
+            if i < full_blocks and ck in self.cache:
                 hit += 1
                 self.cache.move_to_end(ck)
                 parent = ck
             else:
                 break
 
-        # Phase 2: insert all blocks (with correct chain hashes)
+        # Phase 2: insert only full blocks into cache
         parent = 0
         for i, hid in enumerate(hash_ids):
+            if i >= full_blocks:
+                break
             ck = chain_keys[i] if i < len(chain_keys) else self.chain_hash(parent, hid)
             if ck in self.cache:
                 self.cache.move_to_end(ck)
@@ -95,7 +102,9 @@ def main():
 
     for i, item in enumerate(items):
         hash_ids = item["hash_ids"]
-        hit = cache.query_and_insert(hash_ids)
+        isl = item["input_length"]
+        full_blocks = isl // args.block_size
+        hit = cache.query_and_insert(hash_ids, full_blocks)
         hit_tokens = hit * args.block_size
         results.append({"index": i, "hit_blocks": hit, "hit_tokens": hit_tokens})
 
