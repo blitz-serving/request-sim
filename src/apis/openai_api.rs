@@ -121,20 +121,35 @@ impl LLMApi for OaiApi {
                         // axum's Sse Event omits the space; vLLM includes it.
                         // Accept both — strip the colon, then trim leading whitespace.
                         let data_str = rest.trim_start();
-
                         if data_str == "[DONE]" {
                             break;
                         }
                         if data_str.contains(r#""delta""#) {
+                            // Parse the delta object once: needed both for role-only
+                            // detection and for content text accumulation.
+                            let delta = serde_json::from_str::<serde_json::Value>(data_str)
+                                .ok()
+                                .and_then(|v| v.pointer("/choices/0/delta").cloned());
+
+                            // OAI chat-completion streams open with a role-announcement
+                            // chunk (typically `{"role":"assistant","content":""}`) that
+                            // carries no generated content. Counting it would inflate
+                            // token_count and pull first_token_time down to the
+                            // time-to-role-chunk (network + queue admission) rather than
+                            // time-to-first-decoded-token. Skip when `role` is present
+                            // and `content` is missing / null / empty.
+                            if let Some(d) = delta.as_ref() {
+                                let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                                let has_role = d.get("role").is_some();
+                                if has_role && content.is_empty() {
+                                    line.clear();
+                                    continue;
+                                }
+                            }
+
                             // Extract delta.content for output text accumulation
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data_str) {
-                                if let Some(content) = v
-                                    .get("choices")
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("delta"))
-                                    .and_then(|d| d.get("content"))
-                                    .and_then(|c| c.as_str())
-                                {
+                            if let Some(d) = delta.as_ref() {
+                                if let Some(content) = d.get("content").and_then(|c| c.as_str()) {
                                     output_text.push_str(content);
                                 }
                             }
