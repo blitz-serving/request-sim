@@ -116,8 +116,11 @@ impl LLMApi for OaiApi {
                         continue;
                     }
 
-                    if trimmed.starts_with("data: ") {
-                        let data_str = &trimmed[6..];
+                    if let Some(rest) = trimmed.strip_prefix("data:") {
+                        // SSE spec allows both "data: ..." and "data:..." (no space).
+                        // axum's Sse Event omits the space; vLLM includes it.
+                        // Accept both — strip the colon, then trim leading whitespace.
+                        let data_str = rest.trim_start();
 
                         if data_str == "[DONE]" {
                             break;
